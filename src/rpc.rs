@@ -38,7 +38,7 @@ use serde::Deserialize;
 /// but also accepts an explicit `api_key` argument.
 pub fn fetch_etherscan_abi(address: &str, chain: &str, api_key: &str) -> Result<serde_json::Value> {
     let base = etherscan_api_base(chain);
-    let url = format!("{base}?module=contract&action=getabi&address={address}&apikey={api_key}");
+    let url = format!("{base}&module=contract&action=getabi&address={address}&apikey={api_key}");
 
     let resp: EtherscanResponse = ureq::get(&url)
         .call()
@@ -67,15 +67,25 @@ struct EtherscanResponse {
     result: serde_json::Value,
 }
 
-fn etherscan_api_base(chain: &str) -> &'static str {
+/// Chain ID used for Etherscan V2 API routing.
+fn etherscan_chain_id(chain: &str) -> u64 {
     match chain.to_lowercase().as_str() {
-        "mainnet" | "ethereum" => "https://api.etherscan.io/api",
-        "polygon" => "https://api.polygonscan.com/api",
-        "arbitrum" | "arb" => "https://api.arbiscan.io/api",
-        "optimism" | "op" => "https://api-optimistic.etherscan.io/api",
-        "base" => "https://api.basescan.org/api",
-        _ => "https://api.etherscan.io/api",
+        "mainnet" | "ethereum" => 1,
+        "polygon" => 137,
+        "arbitrum" | "arb" => 42161,
+        "optimism" | "op" => 10,
+        "base" => 8453,
+        "bsc" | "bnb" => 56,
+        "avalanche" | "avax" => 43114,
+        "fantom" | "ftm" => 250,
+        _ => 1,
     }
+}
+
+fn etherscan_api_base(chain: &str) -> String {
+    // Etherscan V2 unified endpoint — works for all chains via chainid param.
+    let chain_id = etherscan_chain_id(chain);
+    format!("https://api.etherscan.io/v2/api?chainid={chain_id}")
 }
 
 // ---------------------------------------------------------------------------
@@ -406,12 +416,23 @@ pub fn fetch_fork_block_header_full(url: &str, block: Option<u64>) -> Result<For
 // Deployed-target preflight (enriched)
 // ---------------------------------------------------------------------------
 
+/// EIP-1967 implementation slot: keccak256("eip1967.proxy.implementation") - 1
+/// = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc
+pub const EIP1967_IMPL_SLOT: &str =
+    "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
+
+/// EIP-1967 beacon slot: keccak256("eip1967.proxy.beacon") - 1
+pub const EIP1967_BEACON_SLOT: &str =
+    "0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50";
+
 /// Heuristic classification of proxy-like runtime code (hints only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProxyBytecodeHint {
     None,
     /// EIP-1167 minimal proxy pattern (45-byte runtime).
     Eip1167MinimalProxy,
+    /// EIP-1967 transparent/UUPS proxy (implementation slot non-zero).
+    Eip1967Proxy,
 }
 
 /// Result of validating `eth_getCode` for a predeployed target.
@@ -437,6 +458,37 @@ pub fn proxy_bytecode_hint(code: &[u8]) -> ProxyBytecodeHint {
     ProxyBytecodeHint::None
 }
 
+/// Try to resolve an EIP-1967 proxy to its implementation address.
+///
+/// Reads the implementation storage slot via `eth_getStorageAt`.
+/// Returns `Some(impl_address)` when the slot is non-zero, `None` otherwise.
+pub fn resolve_eip1967_impl(
+    url: &str,
+    block: Option<u64>,
+    proxy: crate::types::Address,
+) -> Option<crate::types::Address> {
+    let proxy_str = format!("0x{}", hex::encode(proxy.as_slice()));
+    let slot_val = rpc_post(
+        url,
+        "eth_getStorageAt",
+        serde_json::json!([&proxy_str, EIP1967_IMPL_SLOT, fork_block_tag_json(block)]),
+    )
+    .ok()?;
+
+    let hex = slot_val.as_str()?;
+    let bytes = hex::decode(hex.trim_start_matches("0x")).ok()?;
+    if bytes.len() != 32 || bytes == [0u8; 32] {
+        return None;
+    }
+    // Address is in the lower 20 bytes.
+    let addr = crate::types::Address::from_slice(&bytes[12..]);
+    if addr.is_zero() {
+        None
+    } else {
+        Some(addr)
+    }
+}
+
 /// Decode `eth_getCode` hex string to bytes; empty is an error for predeploy checks.
 pub fn parse_runtime_code_hex(code_hex: &str) -> Result<Vec<u8>> {
     let bytes = hex::decode(code_hex.trim_start_matches("0x")).context("decode code hex")?;
@@ -449,6 +501,11 @@ pub fn parse_runtime_code_hex(code_hex: &str) -> Result<Vec<u8>> {
 }
 
 /// Fetch and validate runtime code; returns size and optional proxy hint.
+///
+/// Automatically follows EIP-1967 proxies: when the implementation slot is
+/// non-zero, returns the implementation's bytecode instead of the proxy shell.
+/// This ensures the mutator sees the real function selectors, not just the
+/// fallback dispatcher.
 pub fn preflight_deployed_target_enriched(
     url: &str,
     block: Option<u64>,
@@ -463,9 +520,40 @@ pub fn preflight_deployed_target_enriched(
     .as_str()
     .ok_or_else(|| anyhow!("eth_getCode: expected string"))?
     .to_string();
-    let code = parse_runtime_code_hex(&code_hex)?;
-    let proxy_hint = proxy_bytecode_hint(&code);
-    Ok(DeployedPreflightResult { code, proxy_hint })
+    let proxy_code = parse_runtime_code_hex(&code_hex)?;
+    let mut proxy_hint = proxy_bytecode_hint(&proxy_code);
+
+    // EIP-1967 proxy detection: check implementation slot regardless of bytecode size.
+    // Transparent proxies and UUPS proxies both use this slot.
+    if let Some(impl_addr) = resolve_eip1967_impl(url, block, address) {
+        proxy_hint = ProxyBytecodeHint::Eip1967Proxy;
+        let impl_str = format!("0x{}", hex::encode(impl_addr.as_slice()));
+        eprintln!(
+            "[preflight] EIP-1967 proxy detected at {addr_str} → impl {impl_str}"
+        );
+        // Fetch implementation bytecode for ABI-aware mutation.
+        if let Ok(impl_hex_val) = rpc_post(
+            url,
+            "eth_getCode",
+            serde_json::json!([&impl_str, fork_block_tag_json(block)]),
+        ) {
+            if let Some(impl_hex) = impl_hex_val.as_str() {
+                if let Ok(impl_code) = hex::decode(impl_hex.trim_start_matches("0x")) {
+                    if !impl_code.is_empty() {
+                        // Return implementation code (for ABI seed) but keep proxy address.
+                        // The campaign still calls the proxy — we just use impl bytecode
+                        // to extract push constants and get better mutation coverage.
+                        return Ok(DeployedPreflightResult {
+                            code: impl_code,
+                            proxy_hint,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(DeployedPreflightResult { code: proxy_code, proxy_hint })
 }
 
 fn rpc_post(url: &str, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
@@ -658,16 +746,23 @@ mod tests {
     use revm::primitives::{B256 as RevmB256, U256 as RevmU256};
 
     #[test]
-    fn etherscan_base_url_mainnet() {
+    fn etherscan_base_url_v2() {
         assert_eq!(
             etherscan_api_base("mainnet"),
-            "https://api.etherscan.io/api"
+            "https://api.etherscan.io/v2/api?chainid=1"
         );
         assert_eq!(
             etherscan_api_base("polygon"),
-            "https://api.polygonscan.com/api"
+            "https://api.etherscan.io/v2/api?chainid=137"
         );
-        assert_eq!(etherscan_api_base("base"), "https://api.basescan.org/api");
+        assert_eq!(
+            etherscan_api_base("base"),
+            "https://api.etherscan.io/v2/api?chainid=8453"
+        );
+        assert_eq!(
+            etherscan_api_base("arbitrum"),
+            "https://api.etherscan.io/v2/api?chainid=42161"
+        );
     }
 
     #[test]
