@@ -54,6 +54,7 @@ pub mod campaign;
 
 // ── Benchmark scoreboard ────────────────────────────────────────────────
 
+pub mod benchmark;
 pub mod scoreboard;
 
 // ── Foundry integration ─────────────────────────────────────────────────
@@ -67,9 +68,17 @@ pub mod cli;
 
 // ── Convenience re-exports ──────────────────────────────────────────────
 
+pub use benchmark::{
+    efcf_demo_plan, plan_for_foundry_project, run_benchmark_plan, write_benchmark_artifacts,
+    BenchmarkCase, BenchmarkPlanEntry, FindingMatcher,
+};
 pub use campaign::Campaign;
+pub use campaign::{CampaignFindingRecord, CampaignReport};
 pub use error::{Error, Result};
 pub use evm::EvmExecutor;
+pub use scoreboard::{
+    BenchmarkEngine, BenchmarkStatus, MultiSeedSummary, Scoreboard, ScorecardEntry,
+};
 pub use shrinker::SequenceShrinker;
 pub use types::{
     Address, Bytes, CampaignConfig, ContractInfo, CoverageMap, ExecutionResult, Finding, Log,

@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use serde::{Deserialize, Serialize};
 
 use crate::evm::EvmExecutor;
 use crate::feedback::CoverageFeedback;
@@ -39,6 +40,49 @@ pub struct Campaign {
     config: CampaignConfig,
 }
 
+/// One unique finding captured during a campaign run, along with benchmark-
+/// relevant metadata recorded before and after shrinking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CampaignFindingRecord {
+    /// The final stored finding. Its reproducer is the current shrunk sequence.
+    pub finding: Finding,
+    /// Reproducer length before deterministic shrinking.
+    pub raw_reproducer_len: usize,
+    /// Execution count when this unique finding was first observed.
+    pub first_observed_execs: u64,
+    /// Milliseconds elapsed when this unique finding was first observed.
+    pub first_observed_time_ms: u64,
+}
+
+/// Structured outcome of one campaign run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CampaignReport {
+    /// Unique stored findings and their benchmark metadata.
+    pub findings: Vec<CampaignFindingRecord>,
+    /// Total EVM executions completed during the run.
+    pub total_execs: u64,
+    /// Total wall-clock runtime in milliseconds.
+    pub elapsed_ms: u64,
+    /// Execution count for the first observed finding, if any.
+    pub first_hit_execs: Option<u64>,
+    /// Milliseconds to the first observed finding, if any.
+    pub first_hit_time_ms: Option<u64>,
+    /// Total number of finding events observed before deduplication.
+    pub finding_count: usize,
+    /// Total number of unique findings retained after deduplication.
+    pub deduped_finding_count: usize,
+}
+
+impl CampaignReport {
+    /// Discard benchmark metadata and return just the stored findings.
+    pub fn into_findings(self) -> Vec<Finding> {
+        self.findings
+            .into_iter()
+            .map(|record| record.finding)
+            .collect()
+    }
+}
+
 impl Campaign {
     /// Create a campaign from the given configuration.
     pub fn new(config: CampaignConfig) -> Self {
@@ -48,6 +92,11 @@ impl Campaign {
     /// Run the fuzzing loop until timeout or the transaction budget is
     /// exhausted.  Returns all findings discovered.
     pub fn run(&mut self) -> anyhow::Result<Vec<Finding>> {
+        Ok(self.run_with_report()?.into_findings())
+    }
+
+    /// Run the fuzzing loop and return both findings and execution metrics.
+    pub fn run_with_report(&mut self) -> anyhow::Result<CampaignReport> {
         let mut rng = StdRng::seed_from_u64(self.config.seed);
         let mut executor = EvmExecutor::new();
         let mut feedback = CoverageFeedback::new();
@@ -202,8 +251,11 @@ impl Campaign {
         // --- Main fuzzing loop ---------------------------------------------
         let start = Instant::now();
         let mut total_execs: u64 = 0;
-        let mut findings: Vec<Finding> = Vec::new();
+        let mut findings: Vec<CampaignFindingRecord> = Vec::new();
         let mut seen_finding_hashes: HashSet<u64> = HashSet::new();
+        let mut finding_count: usize = 0;
+        let mut first_hit_execs: Option<u64> = None;
+        let mut first_hit_time_ms: Option<u64> = None;
         let mut successful_state_changes: u64 = 0;
         let mut snapshots_saved: u64 = 0;
         // Diagnostic counters for stateful property debugging.
@@ -223,6 +275,12 @@ impl Campaign {
             if start.elapsed() >= self.config.timeout {
                 tracing::info!(total_execs, "timeout reached");
                 break;
+            }
+            if let Some(max_execs) = self.config.max_execs {
+                if total_execs >= max_execs {
+                    tracing::info!(total_execs, max_execs, "execution budget reached");
+                    break;
+                }
             }
 
             // Pick a snapshot to fuzz from.  30% of the time we force the
@@ -255,6 +313,7 @@ impl Campaign {
 
             // Save the executor state so we can roll back after the sequence.
             let db_snapshot = executor.snapshot();
+            let mut reached_exec_budget = false;
 
             for _ in 0..seq_len {
                 let tx = if sequence.is_empty() || rng.gen_bool(0.3) {
@@ -303,9 +362,15 @@ impl Campaign {
                 let new_findings = oracle.check(&result, &sequence);
                 if !new_findings.is_empty() {
                     for mut f in new_findings {
+                        finding_count += 1;
+                        if first_hit_execs.is_none() {
+                            first_hit_execs = Some(total_execs);
+                            first_hit_time_ms = Some(start.elapsed().as_millis() as u64);
+                        }
                         // Attach the reproducer sequence.
                         let mut repro = sequence.clone();
                         repro.push(tx.clone());
+                        let raw_reproducer_len = repro.len();
                         f.reproducer = shrink_reproducer(
                             &mut executor,
                             &db_snapshot,
@@ -322,7 +387,12 @@ impl Campaign {
                         );
                         let hash = f.dedup_hash();
                         if seen_finding_hashes.insert(hash) {
-                            findings.push(f);
+                            findings.push(CampaignFindingRecord {
+                                finding: f,
+                                raw_reproducer_len,
+                                first_observed_execs: total_execs,
+                                first_observed_time_ms: start.elapsed().as_millis() as u64,
+                            });
                         }
                     }
                 }
@@ -362,6 +432,13 @@ impl Campaign {
                 }
 
                 sequence.push(tx);
+
+                if let Some(max_execs) = self.config.max_execs {
+                    if total_execs >= max_execs {
+                        reached_exec_budget = true;
+                        break;
+                    }
+                }
             }
 
             // DIAGNOSTIC: log first tx of every 100th sequence
@@ -411,6 +488,12 @@ impl Campaign {
                     );
                 }
                 for mut f in prop_findings {
+                    finding_count += 1;
+                    if first_hit_execs.is_none() {
+                        first_hit_execs = Some(total_execs);
+                        first_hit_time_ms = Some(start.elapsed().as_millis() as u64);
+                    }
+                    let raw_reproducer_len = sequence.len();
                     f.reproducer = shrink_reproducer(
                         &mut executor,
                         &db_snapshot,
@@ -427,7 +510,12 @@ impl Campaign {
                     );
                     let hash = f.dedup_hash();
                     if seen_finding_hashes.insert(hash) {
-                        findings.push(f);
+                        findings.push(CampaignFindingRecord {
+                            finding: f,
+                            raw_reproducer_len,
+                            first_observed_execs: total_execs,
+                            first_observed_time_ms: start.elapsed().as_millis() as u64,
+                        });
                     }
                 }
             }
@@ -441,7 +529,7 @@ impl Campaign {
                 let elapsed = start.elapsed().as_secs_f64();
                 let prop_count: usize = findings
                     .iter()
-                    .filter(|f| f.title.contains("echidna"))
+                    .filter(|record| record.finding.title.contains("echidna"))
                     .count();
                 eprintln!(
                     "[campaign] execs={total_execs} speed={:.0}/s state_chg={successful_state_changes} snaps_saved={snapshots_saved} cov={} snaps={} findings={} prop_findings={prop_count} deposits={diag_funded_deposits} withdraws={diag_withdraws_ok} dep+wdr={diag_deposit_then_withdraw}",
@@ -461,6 +549,11 @@ impl Campaign {
                     "progress",
                 );
             }
+
+            if reached_exec_budget {
+                tracing::info!(total_execs, "sequence stopped at execution budget");
+                break;
+            }
         }
 
         // Final summary.
@@ -473,7 +566,15 @@ impl Campaign {
             "campaign finished",
         );
 
-        Ok(findings)
+        Ok(CampaignReport {
+            deduped_finding_count: findings.len(),
+            elapsed_ms: elapsed.as_millis() as u64,
+            finding_count,
+            findings,
+            first_hit_execs,
+            first_hit_time_ms,
+            total_execs,
+        })
     }
 }
 
@@ -557,6 +658,7 @@ mod tests {
     fn empty_campaign_completes() {
         let config = CampaignConfig {
             timeout: Duration::from_millis(200),
+            max_execs: None,
             max_depth: 4,
             max_snapshots: 64,
             workers: 1,

@@ -44,6 +44,18 @@ pub struct Cli {
 /// Available subcommands
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    /// Run a repeatable benchmark / comparison pipeline
+    #[command(
+        name = "benchmark",
+        about = "Run structured benchmark cases and emit evidence artifacts",
+        long_about = r#"
+Run repeatable benchmark cases across one or more engines and seeds.
+Outputs machine-readable CSV / JSON artifacts for internal iteration and
+comparison scaffolding.
+"#
+    )]
+    Benchmark(BenchmarkArgs),
+
     /// Fuzz a Foundry project
     #[command(
         name = "forge",
@@ -159,6 +171,54 @@ pub struct ForgeArgs {
     /// Fail on critical findings
     #[arg(long)]
     pub fail_on_critical: bool,
+}
+
+/// Arguments for the `benchmark` subcommand
+#[derive(Parser, Debug)]
+pub struct BenchmarkArgs {
+    /// Built-in benchmark preset
+    #[arg(long, default_value = "efcf-demo")]
+    pub preset: String,
+
+    /// Optional Foundry project root for project benchmarks
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+
+    /// Optional target contract name for project benchmarks
+    #[arg(long)]
+    pub target: Option<String>,
+
+    /// Property label to record in result rows
+    #[arg(long, default_value = "campaign")]
+    pub property: String,
+
+    /// Bug class / category label to record in result rows
+    #[arg(long, default_value = "Campaign")]
+    pub category: String,
+
+    /// Engines to include, comma-separated
+    #[arg(long, value_delimiter = ',', default_values_t = vec![BenchmarkEngineArg::SciFuzz, BenchmarkEngineArg::Echidna, BenchmarkEngineArg::Forge])]
+    pub engines: Vec<BenchmarkEngineArg>,
+
+    /// Seeds to run, comma-separated
+    #[arg(long, value_delimiter = ',', default_values_t = vec![1_u64, 2, 3])]
+    pub seeds: Vec<u64>,
+
+    /// Deterministic execution budget per run
+    #[arg(long, default_value = "5000")]
+    pub max_execs: u64,
+
+    /// Maximum wall-clock timeout per run in seconds
+    #[arg(long, default_value = "10")]
+    pub timeout: u64,
+
+    /// Maximum transaction sequence depth
+    #[arg(long, default_value = "8")]
+    pub depth: u32,
+
+    /// Output directory for benchmark artifacts
+    #[arg(long, default_value = "target/benchmark")]
+    pub output_dir: PathBuf,
 }
 
 /// Arguments for the `audit` subcommand
@@ -321,6 +381,24 @@ pub enum SnapshotStrategy {
     Hybrid,
     /// Random selection (baseline)
     Random,
+}
+
+/// Benchmark engines supported by the CLI
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum BenchmarkEngineArg {
+    SciFuzz,
+    Echidna,
+    Forge,
+}
+
+impl std::fmt::Display for BenchmarkEngineArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SciFuzz => write!(f, "sci-fuzz"),
+            Self::Echidna => write!(f, "echidna"),
+            Self::Forge => write!(f, "forge"),
+        }
+    }
 }
 
 /// Verbosity level

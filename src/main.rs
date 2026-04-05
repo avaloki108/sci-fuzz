@@ -39,6 +39,7 @@ fn main() {
 #[cfg(feature = "cli")]
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
+        Commands::Benchmark(args) => handle_benchmark(args),
         Commands::Forge(args) => handle_forge(args),
         Commands::Audit(args) => handle_audit(args),
         Commands::Test(args) => handle_test(args),
@@ -51,6 +52,85 @@ fn run(cli: Cli) -> Result<()> {
 // ---------------------------------------------------------------------------
 // Sub-command handlers (stubs that will be fleshed out)
 // ---------------------------------------------------------------------------
+
+#[cfg(feature = "cli")]
+fn handle_benchmark(args: sci_fuzz::cli::BenchmarkArgs) -> Result<()> {
+    use sci_fuzz::benchmark::{
+        efcf_demo_plan, plan_for_foundry_project, run_benchmark_plan, write_benchmark_artifacts,
+    };
+    use sci_fuzz::scoreboard::BenchmarkEngine;
+
+    let engines: Vec<BenchmarkEngine> = args
+        .engines
+        .iter()
+        .map(|engine| match engine {
+            sci_fuzz::cli::BenchmarkEngineArg::SciFuzz => BenchmarkEngine::SciFuzz,
+            sci_fuzz::cli::BenchmarkEngineArg::Echidna => BenchmarkEngine::Echidna,
+            sci_fuzz::cli::BenchmarkEngineArg::Forge => BenchmarkEngine::Forge,
+        })
+        .collect();
+
+    let timeout = std::time::Duration::from_secs(args.timeout);
+    let max_execs = Some(args.max_execs);
+    let plan = if let Some(project) = &args.project {
+        plan_for_foundry_project(
+            project,
+            args.target.as_deref(),
+            &args.property,
+            &args.category,
+            timeout,
+            args.depth,
+            max_execs,
+        )?
+    } else {
+        match args.preset.as_str() {
+            "efcf-demo" => efcf_demo_plan(timeout, args.depth, max_execs),
+            other => {
+                anyhow::bail!(
+                    "Unknown benchmark preset `{other}`. Use `efcf-demo` or pass --project."
+                );
+            }
+        }
+    };
+
+    println!("⚡ sci-fuzz benchmark");
+    println!("  seeds      : {:?}", args.seeds);
+    println!("  engines    : {:?}", args.engines);
+    println!("  timeout    : {}s", args.timeout);
+    println!("  max_execs  : {}", args.max_execs);
+    println!("  depth      : {}", args.depth);
+    println!("  output-dir : {}", args.output_dir.display());
+    println!();
+
+    let board = run_benchmark_plan(&plan, &args.seeds, &engines);
+    write_benchmark_artifacts(&board, &args.output_dir)?;
+
+    println!("raw results:");
+    board.print_csv();
+    println!();
+    println!("summary:");
+    board.print_summary();
+    println!();
+    println!("wrote:");
+    println!(
+        "  {}",
+        args.output_dir.join("benchmark_results.csv").display()
+    );
+    println!(
+        "  {}",
+        args.output_dir.join("benchmark_results.json").display()
+    );
+    println!(
+        "  {}",
+        args.output_dir.join("benchmark_summary.csv").display()
+    );
+    println!(
+        "  {}",
+        args.output_dir.join("benchmark_summary.json").display()
+    );
+
+    Ok(())
+}
 
 #[cfg(feature = "cli")]
 fn handle_forge(args: sci_fuzz::cli::ForgeArgs) -> Result<()> {
@@ -79,6 +159,7 @@ fn handle_forge(args: sci_fuzz::cli::ForgeArgs) -> Result<()> {
     // Build a default campaign config from CLI args.
     let config = CampaignConfig {
         timeout: std::time::Duration::from_secs(args.timeout),
+        max_execs: None,
         max_depth: args.depth,
         max_snapshots: args.max_snapshots,
         workers: args.workers,

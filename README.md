@@ -24,6 +24,8 @@ The name stands for **S**mart **C**ontract **I**nvariant **Fuzz**er. The thesis 
 - **Real Echidna property calling** — `EchidnaPropertyCaller` discovers `echidna_*` functions from ABI, calls them via `static_call` after each sequence, checks bool returns. This is the actual Echidna workflow, not just log watching.
 - **Deterministic sequence shrinking** — findings are replayed from the same pre-sequence snapshot and reduced by prefix/suffix elimination, whole-tx removal, calldata-word reduction, `msg.value` reduction, and sender simplification
 - **Foundry artifact ingestion** — `sci-fuzz forge --project /path/to/project` runs `forge build`, parses standard `out/` artifacts, extracts ABI plus creation/runtime bytecode, and hands selected contracts to the existing campaign
+- **Structured benchmark pipeline** — `sci-fuzz benchmark` runs repeatable multi-seed benchmark cases, records first-hit / repro / finding metrics, and emits stable CSV + JSON result files plus grouped summaries
+- **Comparison schema for Echidna / Forge** — benchmark rows now include `engine` and `status`, so the same artifact format can hold measured sci-fuzz runs alongside honest `unavailable` / `skipped` external comparison rows
 - **Benchmark matrix** — 81 entries mapping EF/CF contracts to expected vulnerability types, with file-existence and category-coverage validation tests
 - **133 benchmark contracts** from EF/CF covering reentrancy, selfdestruct, overflow, cross-function attacks, property tests, and assertion tests
 
@@ -35,6 +37,7 @@ Honesty matters more than marketing. These are real gaps:
 - **Shrinking is still a first pass.** The shrinker is deterministic and useful today, but it is not yet a full semantic reducer: it does not reason about ABI types, storage dependencies, or minimal base-state snapshots, and it does not guarantee globally minimal sequences.
 - **No multi-worker parallelism.** The fuzzing loop is single-threaded. The `workers` config field exists but is not wired.
 - **Foundry integration is still partial.** Project mode now invokes `forge build` and ingests standard artifacts from `out/`, but it does not execute setup scripts, deploy script flows, imported invariant harnesses, or library-specific bootstrapping.
+- **External comparison execution is still partial.** `sci-fuzz benchmark` has a real measured path for sci-fuzz and a stable comparison schema for Echidna / Forge, but it does not yet orchestrate those tools end-to-end on shared targets. Their rows are reported as `unavailable` or `skipped`, never faked.
 - **No on-chain forking.** The `audit` subcommand exists in the CLI but is not implemented.
 - **Partial Echidna compatibility.** `EchidnaPropertyCaller` implements the core workflow (discover echidna_* functions, call them, check bool return). `EchidnaProperty` detects assertion events in logs. Neither handles revert/assert distinction with full Echidna fidelity, and the property-harness workflow (targetContract, configurable test limits, shrinking) is not implemented.
 - **No Foundry fork/invariant parity.** There is no Foundry fork-mode execution, no `StdInvariant` harness import path, and no parity claim with Foundry's invariant runner.
@@ -51,7 +54,9 @@ mutator.rs     ABI-aware generation, 5 mutation strategies, value dictionary, by
 invariant.rs   Invariant trait + 5 built-in checkers + EchidnaPropertyCaller
 oracle.rs      routes execution results through invariant registry
 types.rs       core types built on alloy-primitives (Address, U256, B256)
-cli.rs         clap-based CLI: forge, audit, test, ci, diff, version
+scoreboard.rs  stable benchmark result / summary schema + CSV / JSON writers
+benchmark.rs   benchmark case loading, sci-fuzz measurement, comparison scaffolding
+cli.rs         clap-based CLI: benchmark, forge, audit, test, ci, diff, version
 ```
 
 ## Installation
@@ -77,6 +82,12 @@ sci-fuzz forge --project /path/to/foundry-project --depth 32 --max-snapshots 819
 
 # Reproducible run
 sci-fuzz forge --seed 42 --timeout 60
+
+# Run the built-in EF/CF benchmark preset and emit CSV/JSON evidence
+sci-fuzz benchmark --preset efcf-demo --seeds 1,2,3 --max-execs 5000 --output-dir target/benchmark
+
+# Benchmark a real Foundry project with the same schema
+sci-fuzz benchmark --project /path/to/foundry-project --target Vault --property campaign --category Campaign --seeds 1,2,3 --max-execs 5000
 
 # Show version
 sci-fuzz version
@@ -108,12 +119,53 @@ The `tests/benchmark_matrix.rs` file tracks expected results for 81 contracts ac
 | AccessControl | 5 | EF/CF `tests/` |
 | IntegerOverflow | 2 | EF/CF `tests/` |
 
-**This matrix is currently aspirational.** sci-fuzz has not yet been validated against these contracts. The next milestone is running the fuzzer against each entry and recording:
+The matrix is still incomplete, but sci-fuzz now has a real benchmark artifact pipeline for filling it in. Raw benchmark rows can record:
 
-- Did sci-fuzz find the expected bug?
-- Time to first finding
-- Reproducer length (before and after shrinking, once shrinking exists)
-- False positive count
+- target / property / bug class / engine / status
+- whether the expected issue was found
+- first-hit execution count and first-hit wall-clock time
+- total executions and elapsed time
+- reproducer length before and after shrinking
+- total finding count and deduped finding count
+
+The built-in `efcf-demo` benchmark preset is real. A full 81-entry populated matrix is still aspirational until those cases are actually run and checked in.
+
+## Benchmark Artifacts
+
+`sci-fuzz benchmark` emits four files under the chosen output directory:
+
+- `benchmark_results.csv`
+- `benchmark_results.json`
+- `benchmark_summary.csv`
+- `benchmark_summary.json`
+
+The raw result schema includes:
+
+- `target`
+- `property`
+- `category`
+- `mode`
+- `seed`
+- `found`
+- `first_hit_execs`
+- `first_hit_time_ms`
+- `total_execs`
+- `elapsed_ms`
+- `repro_len_raw`
+- `repro_len_shrunk`
+- `finding_count`
+- `deduped_finding_count`
+- `engine`
+- `status`
+
+The grouped summary currently reports:
+
+- hit rate across measured runs
+- median first-hit execs
+- median first-hit time
+- median elapsed time
+- median shrunk reproducer length
+- counts of `measured`, `unavailable`, `failed`, and `skipped` rows
 
 ## What Informed the Design
 
@@ -141,9 +193,16 @@ The minimum proof standard before sci-fuzz earns the label "credible tool":
 1. **One real benchmark run** — the 81-entry matrix populated with actual pass/fail/time data
 2. **One real Foundry target** — a nontrivial project fuzzing end-to-end with measured findings
 3. **One minimized reproducer** — a finding with a shrunk transaction sequence
-4. **One side-by-side comparison** — sci-fuzz vs Echidna on a shared target with shared properties
+4. **One side-by-side measured comparison** — sci-fuzz vs Echidna / Forge on a shared target with shared properties
 
-None of these are done yet. Until they are, this is a working prototype, not a production tool.
+Progress today:
+
+- The benchmark runner and artifact schema are implemented.
+- Multi-seed sci-fuzz measurements are real.
+- Echidna / Forge comparison rows are scaffolded but not yet measured.
+- The full 81-entry matrix is not populated yet.
+
+Until the shared-target comparison rows become measured rather than scaffolded, sci-fuzz remains a working prototype rather than a production-ready benchmarked tool.
 
 ## Project Stats
 

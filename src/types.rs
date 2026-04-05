@@ -409,6 +409,9 @@ impl Finding {
 pub struct CampaignConfig {
     /// Maximum wall-clock time the campaign may run.
     pub timeout: Duration,
+    /// Optional deterministic execution budget. When set, the campaign stops
+    /// once this many EVM executions have completed.
+    pub max_execs: Option<u64>,
     /// Maximum transaction-sequence depth per exploration path.
     pub max_depth: u32,
     /// Upper bound on the number of retained state snapshots.
@@ -425,6 +428,7 @@ impl Default for CampaignConfig {
     fn default() -> Self {
         Self {
             timeout: Duration::from_secs(300),
+            max_execs: None,
             max_depth: 64,
             max_snapshots: 4096,
             workers: 1,

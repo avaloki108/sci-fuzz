@@ -472,7 +472,7 @@ fn multiseed_efcf_three_targets() {
         let harvey_detected = board
             .entries()
             .iter()
-            .filter(|e| e.target == "harvey_baz" && e.detected)
+            .filter(|e| e.target == "harvey_baz" && e.found)
             .count();
 
         // We cannot hard-assert a minimum hit count without knowing the
@@ -498,7 +498,7 @@ fn multiseed_efcf_three_targets() {
         let dao_detected = board
             .entries()
             .iter()
-            .filter(|e| e.target == "SimpleDAO" && e.detected)
+            .filter(|e| e.target == "SimpleDAO" && e.found)
             .count();
         eprintln!(
             "SimpleDAO: {}/{} seeds detected (expected: 0 — ControlLeak not implemented)",

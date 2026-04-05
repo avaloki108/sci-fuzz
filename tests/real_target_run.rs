@@ -422,6 +422,7 @@ fn campaign_with_real_target() {
 
     let config = CampaignConfig {
         timeout: Duration::from_secs(2),
+        max_execs: None,
         max_depth: 4,
         max_snapshots: 256,
         workers: 1,
@@ -571,6 +572,7 @@ fn campaign_solves_prop_stateful() {
 
     let config = CampaignConfig {
         timeout: Duration::from_secs(30),
+        max_execs: None,
         max_depth: 8,
         max_snapshots: 16,
         workers: 1,
