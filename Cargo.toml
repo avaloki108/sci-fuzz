@@ -1,0 +1,91 @@
+[package]
+name = "sci-fuzz"
+version = "0.1.0"
+edition = "2021"
+description = "Smart Contract Invariant Fuzzer — a coverage-guided fuzzer for EVM smart contracts"
+license = "MIT"
+publish = false
+
+[lib]
+name = "sci_fuzz"
+path = "src/lib.rs"
+
+# ---------------------------------------------------------------------------
+# Features
+# ---------------------------------------------------------------------------
+
+[[bin]]
+name = "sci-fuzz"
+path = "src/main.rs"
+
+[dependencies]
+# EVM execution engine — latest stable from crates.io (old API series, no MSRV)
+# NOT the ItyFuzz custom fork. default-features disabled; we pick what we need.
+revm = { version = "19.7", default-features = false, features = [
+  "dev",  # memory_limit, optional_balance_check, optional_block_gas_limit, etc.
+  "serde",
+  "serde-json",
+  "std",
+] }
+
+# Ethereum primitive types (Address, B256, U256, Bytes, etc.)
+alloy-primitives = { version = "0.8", default-features = false, features = [
+  "serde",
+  "std",
+] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Config parsing
+toml = "0.8"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# CLI (optional, pulled in by the "cli" feature)
+clap = { version = "4", features = ["derive"], optional = true }
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+
+# Randomness
+rand = "0.8"
+
+# Hex encoding / decoding
+hex = "0.4"
+
+# Keccak-256 hashing
+tiny-keccak = { version = "2", features = ["keccak"] }
+
+# Filesystem traversal
+walkdir = "2"
+
+# Parallelism
+rayon = "1"
+
+# Byte buffers
+bytes = "1"
+
+# ---------------------------------------------------------------------------
+# Dev-dependencies (tests, benchmarks)
+# ---------------------------------------------------------------------------
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
+
+[features]
+default = ["cli"]
+cli = ["dep:clap", "dep:tracing-subscriber"]
+
+[profile.dev]
+opt-level = 1  # keep dev builds somewhat fast for EVM execution
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

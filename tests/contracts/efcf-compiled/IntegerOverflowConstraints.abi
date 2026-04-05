@@ -1,0 +1,1 @@
+[{"inputs":[],"stateMutability":"payable","type":"constructor"},{"inputs":[],"name":"set_state","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint256","name":"x","type":"uint256"},{"internalType":"uint256","name":"y","type":"uint256"}],"name":"trigger","outputs":[],"stateMutability":"nonpayable","type":"function"}]
