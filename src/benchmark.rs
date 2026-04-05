@@ -301,6 +301,7 @@ fn run_sci_fuzz_case(case: &BenchmarkCase, seed: u64) -> ScorecardEntry {
         mode: crate::types::ExecutorMode::Fast,
         rpc_url: None,
         rpc_block_number: None,
+        attacker_address: None,
     };
 
     let mut campaign = Campaign::new(config);

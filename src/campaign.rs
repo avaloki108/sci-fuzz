@@ -27,6 +27,7 @@ use crate::types::{
     contract_info_for_mutator, Address, CampaignConfig, ContractInfo, CoverageMap, Finding,
     StateSnapshot, Transaction, U256,
 };
+use revm::primitives::U256 as RevmU256;
 
 /// ABI function names excluded from fuzzing (harness lifecycle; setup runs once at bootstrap).
 const STRIP_HARNESS_LIFECYCLE: &[&str] = &["setUp", "beforeTest", "afterTest"];
@@ -48,6 +49,12 @@ fn effective_worker_count(workers: usize, rpc_url: &Option<String>) -> usize {
     } else {
         workers.max(1)
     }
+}
+
+fn executor_block_meta(executor: &EvmExecutor) -> (u64, u64) {
+    let n = executor.block_env().number;
+    let t = executor.block_env().timestamp;
+    (n.saturating_to::<u64>(), t.saturating_to::<u64>())
 }
 
 /// Shared fuzzing state for multi-worker campaigns (mutex-protected).
@@ -142,6 +149,10 @@ impl Campaign {
         let mut rng = StdRng::seed_from_u64(self.config.seed);
         // --- 1. Set up the Executor ----------------------------------------
         let mut executor = if let Some(ref url) = self.config.rpc_url {
+            let url = url.trim();
+            if url.is_empty() {
+                anyhow::bail!("fork campaign requires a non-empty rpc_url");
+            }
             let rpc_db = crate::rpc::RpcCacheDB::new(url, self.config.rpc_block_number)?;
             EvmExecutor::new_with_db(FuzzerDatabase::Rpc(rpc_db))
         } else {
@@ -149,12 +160,64 @@ impl Campaign {
         };
         executor.set_mode(self.config.mode);
 
+        if let Some(ref url) = self.config.rpc_url {
+            let url = url.trim();
+            crate::rpc::rpc_probe_url(url)?;
+            let (num, ts) = crate::rpc::fetch_fork_block_header(url, self.config.rpc_block_number)?;
+            {
+                let be = executor.block_env_mut();
+                be.number = RevmU256::from(num);
+                be.timestamp = RevmU256::from(ts);
+            }
+            eprintln!(
+                "[campaign] fork: block_number={} timestamp={} (rpc_block tag: {:?})",
+                num, ts, self.config.rpc_block_number
+            );
+        }
+
         let mut feedback = CoverageFeedback::new();
         let mut snapshots = SnapshotCorpus::new(self.config.max_snapshots);
 
         // --- Set up attacker address with some ETH -------------------------
-        let attacker = Address::repeat_byte(0x42);
+        let attacker = self
+            .config
+            .attacker_address
+            .unwrap_or_else(|| Address::repeat_byte(0x42));
+        if attacker.is_zero() {
+            anyhow::bail!("attacker_address must not be zero; leave unset for default 0x42…42");
+        }
         executor.set_balance(attacker, U256::from(100_000_000_000_000_000_000_u128)); // 100 ETH
+
+        // --- Validate deployed-only targets (RPC preflight) ---------------
+        for target in &self.config.targets {
+            let has_init = target
+                .creation_bytecode
+                .as_ref()
+                .map(|c| !c.is_empty())
+                .unwrap_or(false);
+            let deploy_bytecode = if has_init {
+                target.creation_bytecode.clone().unwrap()
+            } else {
+                target.deployed_bytecode.clone()
+            };
+            if deploy_bytecode.is_empty() {
+                if target.address.is_zero() {
+                    anyhow::bail!(
+                        "target has no deployment bytecode and address is zero — set a deployed contract address"
+                    );
+                }
+                if let Some(ref url) = self.config.rpc_url {
+                    let u = url.trim();
+                    if !u.is_empty() {
+                        crate::rpc::preflight_deployed_code_nonempty(
+                            u,
+                            self.config.rpc_block_number,
+                            target.address,
+                        )?;
+                    }
+                }
+            }
+        }
 
         // --- Deploy target contracts ---------------------------------------
         // We must track the ACTUAL deployed addresses (returned by CREATE)
@@ -286,14 +349,29 @@ impl Campaign {
             property_callers.len(),
             deployed_targets.len()
         );
+
+        let missing_abi: Vec<Address> = deployed_targets
+            .iter()
+            .filter(|t| t.abi.is_none())
+            .map(|t| t.address)
+            .collect();
+        if !missing_abi.is_empty() {
+            eprintln!(
+                "[campaign] warning: {} target(s) have no ABI — mutation and echidna property discovery may be shallow: {:?}",
+                missing_abi.len(),
+                missing_abi
+            );
+        }
+
         // --- Seed the snapshot corpus with the initial state ----------------
+        let (root_bn, root_ts) = executor_block_meta(&executor);
         let initial_snapshot = StateSnapshot {
             id: 0, // will be reassigned by corpus
             parent_id: None,
             storage: Default::default(),
             balances: Default::default(),
-            block_number: 1,
-            timestamp: 1,
+            block_number: root_bn,
+            timestamp: root_ts,
             coverage: CoverageMap::new(),
             dataflow: Default::default(),
         };
@@ -325,13 +403,14 @@ impl Campaign {
                 let novel_df = feedback.record_dataflow(&df);
 
                 if novel_cov || novel_df {
+                    let (bn, ts) = executor_block_meta(&executor);
                     let snap = StateSnapshot {
                         id: 0,
                         parent_id: None,
                         storage: Default::default(),
                         balances: Default::default(),
-                        block_number: 1,
-                        timestamp: 1,
+                        block_number: bn,
+                        timestamp: ts,
                         coverage: cov.clone(),
                         dataflow: df.clone(),
                     };
@@ -563,13 +642,14 @@ impl Campaign {
                 let is_novel = novel_cov || novel_df;
                 if is_novel {
                     // Store a snapshot of this state for future exploration.
+                    let (bn, ts) = executor_block_meta(&executor);
                     let snap = StateSnapshot {
                         id: 0,
                         parent_id: None,
                         storage: Default::default(),
                         balances: Default::default(),
-                        block_number: 1,
-                        timestamp: 1,
+                        block_number: bn,
+                        timestamp: ts,
                         coverage: cov,
                         dataflow: df,
                     };
@@ -974,13 +1054,14 @@ fn parallel_worker_loop(
                 let novel_cov = g.feedback.record_from_coverage_map(&cov);
                 let novel_df = g.feedback.record_dataflow(&df);
                 if novel_cov || novel_df {
+                    let (bn, ts) = executor_block_meta(&executor);
                     let snap = StateSnapshot {
                         id: 0,
                         parent_id: None,
                         storage: Default::default(),
                         balances: Default::default(),
-                        block_number: 1,
-                        timestamp: 1,
+                        block_number: bn,
+                        timestamp: ts,
                         coverage: cov,
                         dataflow: df,
                     };
@@ -1137,7 +1218,7 @@ fn reproduces_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{CampaignConfig, ExecutorMode, Severity};
+    use crate::types::{CampaignConfig, ContractInfo, ExecutorMode, Severity};
     use std::time::Duration;
 
     #[test]
@@ -1164,6 +1245,7 @@ mod tests {
             mode: ExecutorMode::Realistic,
             rpc_url: None,
             rpc_block_number: None,
+            attacker_address: None,
         };
         let report = Campaign::new(config)
             .run_with_report()
@@ -1189,6 +1271,7 @@ mod tests {
             mode: ExecutorMode::Realistic,
             rpc_url: None,
             rpc_block_number: None,
+            attacker_address: None,
         };
         let mut campaign = Campaign::new(config);
         let findings = campaign.run().expect("campaign should not error");
@@ -1214,6 +1297,38 @@ mod tests {
             "no critical findings expected on empty campaign (found {} critical out of {} total)",
             critical,
             findings.len(),
+        );
+    }
+
+    #[test]
+    fn campaign_rejects_zero_address_deployed_only_target() {
+        let config = CampaignConfig {
+            timeout: Duration::from_millis(50),
+            max_execs: Some(5),
+            max_depth: 2,
+            max_snapshots: 8,
+            workers: 1,
+            seed: 1,
+            targets: vec![ContractInfo {
+                address: Address::ZERO,
+                deployed_bytecode: Default::default(),
+                creation_bytecode: None,
+                name: Some("x".into()),
+                source_path: None,
+                abi: None,
+            }],
+            harness: None,
+            mode: ExecutorMode::Fast,
+            rpc_url: None,
+            rpc_block_number: None,
+            attacker_address: None,
+        };
+        let err = Campaign::new(config)
+            .run()
+            .expect_err("expected validation error");
+        assert!(
+            err.to_string().contains("address is zero"),
+            "unexpected err: {err:#}"
         );
     }
 }

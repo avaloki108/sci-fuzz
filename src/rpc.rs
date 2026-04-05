@@ -111,7 +111,7 @@ use std::sync::Mutex;
 /// Internally it caches:
 /// - [`AccountInfo`] per address (balance, nonce, code hash, bytecode)
 /// - Storage slot values per address
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct RpcCacheDB {
     url: String,
     block: Option<u64>,
@@ -220,6 +220,18 @@ impl RpcCacheDB {
         })
     }
 
+    /// Test-only: insert a cached account without RPC (clone-isolation tests).
+    #[cfg(test)]
+    fn test_seed_account(&self, addr: RevmAddress, info: AccountInfo) {
+        self.accounts.lock().unwrap().insert(addr, info);
+    }
+
+    /// Test-only: number of cached accounts.
+    #[cfg(test)]
+    fn test_account_cache_len(&self) -> usize {
+        self.accounts.lock().unwrap().len()
+    }
+
     fn fetch_storage(&self, addr: RevmAddress, index: RevmU256) -> Result<RevmU256> {
         let addr_str = format!("0x{}", hex::encode(addr.as_slice()));
         let slot_bytes = index.to_be_bytes::<32>();
@@ -237,6 +249,113 @@ impl RpcCacheDB {
 
         RevmU256::from_str(&val).context("parse storage value")
     }
+}
+
+/// Deep-clone account/storage caches so each [`revm::db::CacheDB`] snapshot gets an
+/// independent RPC parent (prefetched entries do not leak across [`crate::evm::EvmExecutor::restore`]).
+impl Clone for RpcCacheDB {
+    fn clone(&self) -> Self {
+        let accounts = self.accounts.lock().unwrap().clone();
+        let storage = self.storage.lock().unwrap().clone();
+        Self {
+            url: self.url.clone(),
+            block: self.block,
+            accounts: Arc::new(Mutex::new(accounts)),
+            storage: Arc::new(Mutex::new(storage)),
+            req_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Standalone JSON-RPC helpers (preflight, block header, code check)
+// ---------------------------------------------------------------------------
+
+/// Block tag string matching [`RpcCacheDB`] pin semantics (`latest` vs hex number).
+pub fn fork_block_tag_json(block: Option<u64>) -> serde_json::Value {
+    match block {
+        Some(n) => serde_json::Value::String(format!("0x{n:x}")),
+        None => serde_json::Value::String("latest".to_string()),
+    }
+}
+
+fn rpc_post(url: &str, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+    if url.trim().is_empty() {
+        return Err(anyhow!("RPC URL is empty"));
+    }
+    let body = RpcRequest {
+        jsonrpc: "2.0",
+        id: 1u64,
+        method,
+        params,
+    };
+    let resp: RpcResponse = ureq::post(url)
+        .set("Content-Type", "application/json")
+        .send_json(serde_json::to_value(&body)?)
+        .context("JSON-RPC request failed")?
+        .into_json()
+        .context("JSON-RPC response was not valid JSON")?;
+
+    if let Some(err) = resp.error {
+        return Err(anyhow!("JSON-RPC error: {}", err.message));
+    }
+
+    resp.result
+        .ok_or_else(|| anyhow!("JSON-RPC returned null result for {method}"))
+}
+
+/// Verify the endpoint responds to `eth_blockNumber` (connectivity / URL validity).
+pub fn rpc_probe_url(url: &str) -> Result<()> {
+    let _ = rpc_post(url, "eth_blockNumber", serde_json::json!([]))?;
+    Ok(())
+}
+
+/// Fetch `(block_number, block_timestamp)` for the same fork tag as [`RpcCacheDB`].
+pub fn fetch_fork_block_header(url: &str, block: Option<u64>) -> Result<(u64, u64)> {
+    let tag = fork_block_tag_json(block);
+    let v = rpc_post(
+        url,
+        "eth_getBlockByNumber",
+        serde_json::json!([tag, false]),
+    )?;
+    let obj = v.as_object().ok_or_else(|| anyhow!("eth_getBlockByNumber: not an object"))?;
+    let num_hex = obj
+        .get("number")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| anyhow!("eth_getBlockByNumber: missing number"))?;
+    let ts_hex = obj
+        .get("timestamp")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| anyhow!("eth_getBlockByNumber: missing timestamp"))?;
+    let number = u64::from_str_radix(num_hex.trim_start_matches("0x"), 16)
+        .context("parse block number")?;
+    let timestamp = u64::from_str_radix(ts_hex.trim_start_matches("0x"), 16)
+        .context("parse block timestamp")?;
+    Ok((number, timestamp))
+}
+
+/// Ensure `eth_getCode` at `address` is non-empty at the fork block (deployed contract).
+pub fn preflight_deployed_code_nonempty(
+    url: &str,
+    block: Option<u64>,
+    address: crate::types::Address,
+) -> Result<()> {
+    let addr_str = format!("0x{}", hex::encode(address.as_slice()));
+    let code_hex = rpc_post(
+        url,
+        "eth_getCode",
+        serde_json::json!([&addr_str, fork_block_tag_json(block)]),
+    )?
+    .as_str()
+    .ok_or_else(|| anyhow!("eth_getCode: expected string"))?
+    .to_string();
+    let bytes = hex::decode(code_hex.trim_start_matches("0x")).context("decode code")?;
+    if bytes.is_empty() {
+        return Err(anyhow!(
+            "no contract code at {addr_str} for the configured fork block (eth_getCode empty)"
+        ));
+    }
+    Ok(())
 }
 
 use revm::DatabaseRef;
@@ -395,5 +514,19 @@ mod tests {
     fn rpc_cache_db_new() {
         let db = RpcCacheDB::new("https://example.com/rpc", Some(19_000_000));
         assert!(db.is_ok());
+    }
+
+    #[test]
+    fn rpc_cache_db_clone_does_not_share_caches() {
+        use revm::primitives::Address as A;
+        let a = RpcCacheDB::new("https://example.com/rpc", None).unwrap();
+        let b = a.clone();
+        let addr = A::with_last_byte(0x01);
+        a.test_seed_account(addr, AccountInfo::default());
+        assert_eq!(a.test_account_cache_len(), 1);
+        assert_eq!(b.test_account_cache_len(), 0);
+        b.test_seed_account(addr, AccountInfo::default());
+        assert_eq!(a.test_account_cache_len(), 1);
+        assert_eq!(b.test_account_cache_len(), 1);
     }
 }

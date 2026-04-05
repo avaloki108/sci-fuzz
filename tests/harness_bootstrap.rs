@@ -111,6 +111,7 @@ fn campaign_runs_harness_setup_before_fuzzing() {
         mode: ExecutorMode::Fast,
         rpc_url: None,
         rpc_block_number: None,
+        attacker_address: None,
     };
 
     let mut campaign = sci_fuzz::campaign::Campaign::new(config);

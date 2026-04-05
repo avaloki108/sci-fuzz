@@ -148,6 +148,10 @@ pub struct ForgeArgs {
     #[arg(long)]
     pub fork_block: Option<u64>,
 
+    /// Funder / primary `msg.sender` for fuzz transactions (default: 0x4242…4242)
+    #[arg(long)]
+    pub attacker: Option<String>,
+
     /// Templates to use for invariant generation
     #[arg(long, value_delimiter = ',')]
     pub templates: Vec<String>,
@@ -234,6 +238,10 @@ pub struct AuditArgs {
     /// Block number to fork from
     #[arg(long)]
     pub block_number: Option<u64>,
+
+    /// Funder / primary `msg.sender` for fuzz transactions (default: 0x4242…4242)
+    #[arg(long)]
+    pub attacker: Option<String>,
 
     /// Etherscan API key for source verification
     #[arg(long)]

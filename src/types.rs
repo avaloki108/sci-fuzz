@@ -651,6 +651,10 @@ pub struct CampaignConfig {
     /// Optional block number to pin the fork to.
     #[serde(default)]
     pub rpc_block_number: Option<u64>,
+    /// Optional funded fuzzer EOA (`msg.sender` pool). When `None`, uses the
+    /// default test address `0x42…42`.
+    #[serde(default)]
+    pub attacker_address: Option<Address>,
 }
 
 impl Default for CampaignConfig {
@@ -667,6 +671,7 @@ impl Default for CampaignConfig {
             mode: ExecutorMode::Fast,
             rpc_url: None,
             rpc_block_number: None,
+            attacker_address: None,
         }
     }
 }

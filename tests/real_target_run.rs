@@ -434,6 +434,7 @@ fn campaign_with_real_target() {
         mode: ExecutorMode::Fast,
         rpc_url: None,
         rpc_block_number: None,
+        attacker_address: None,
     };
 
     let mut campaign = sci_fuzz::campaign::Campaign::new(config);
@@ -588,6 +589,7 @@ fn campaign_solves_prop_stateful() {
         mode: ExecutorMode::Fast,
         rpc_url: None,
         rpc_block_number: None,
+        attacker_address: None,
     };
 
     let mut campaign = sci_fuzz::campaign::Campaign::new(config);

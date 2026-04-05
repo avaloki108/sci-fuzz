@@ -233,6 +233,9 @@ impl EvmExecutor {
     /// `deployer` is used as `msg.sender`, and `bytecode` should contain the
     /// **init-code** (constructor bytecode) of the contract.
     pub fn deploy(&mut self, deployer: Address, bytecode: Bytes) -> Result<Address> {
+        // CREATE uses the deployer's on-chain nonce (including forked state).
+        let nonce_before = self.deployer_nonce(deployer);
+
         let tx = Transaction {
             sender: deployer,
             to: None,
@@ -249,18 +252,20 @@ impl EvmExecutor {
             ));
         }
 
-        // The created address lives inside the `Output::Create` variant
-        // returned by `execute`. We cannot recover it from our flattened
-        // `ExecutionResult`, so we re-derive it from the deployer + nonce.
-        //
-        // However, revm already computed it for us during `transact()`.
-        // Since we committed the state, the new account is now in the DB.
-        // We find it by replaying the CREATE logic: we ran a create-tx so
-        // revm used CREATE (sender, nonce).  We track the nonce ourselves.
-        let nonce = self.deploy_nonce;
-        self.deploy_nonce += 1;
-        let created = compute_create_address(deployer, nonce);
+        // Re-derive the created address from the pre-tx nonce revm used (must match
+        // forked / non-zero starting nonces).
+        let created = compute_create_address(deployer, nonce_before);
+        self.deploy_nonce = self.deployer_nonce(deployer);
         Ok(created)
+    }
+
+    fn deployer_nonce(&self, deployer: Address) -> u64 {
+        self.db
+            .basic_ref(deployer)
+            .ok()
+            .flatten()
+            .map(|info| info.nonce)
+            .unwrap_or(0)
     }
 
     // -- Balance helpers ----------------------------------------------------
@@ -692,6 +697,28 @@ mod tests {
         let exec = EvmExecutor::new();
         let addr = Address::with_last_byte(0x10);
         assert_eq!(exec.get_storage(addr, U256::from(0u64)), U256::ZERO);
+    }
+
+    #[test]
+    fn deploy_uses_on_chain_nonce_for_create_address() {
+        let mut exec = EvmExecutor::new();
+        let deployer = Address::with_last_byte(0x99);
+        exec.insert_account_info(
+            deployer,
+            AccountInfo {
+                nonce: 7,
+                balance: U256::from(10u64).pow(U256::from(18)),
+                ..Default::default()
+            },
+        );
+        // init code: PUSH1 0x00 PUSH1 0x00 RETURN (empty runtime)
+        let init = Bytes::from(vec![0x60, 0x00, 0x60, 0x00, 0xf3]);
+        let expected_first = compute_create_address(deployer, 7);
+        let a1 = exec.deploy(deployer, init.clone()).expect("deploy1");
+        assert_eq!(a1, expected_first);
+        let expected_second = compute_create_address(deployer, 8);
+        let a2 = exec.deploy(deployer, init).expect("deploy2");
+        assert_eq!(a2, expected_second);
     }
 
     #[test]

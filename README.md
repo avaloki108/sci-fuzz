@@ -17,6 +17,10 @@ The name stands for **S**mart **C**ontract **I**nvariant **Fuzz**er. The thesis 
 - **Dual executor modes**: `Fast` (all safety checks off, best for exploration) and `Realistic` (balance enforcement on, reduces false positives from impossible states)
 - **AFL++ hitcount bucketing** — tracks not just "was this edge taken?" but which hitcount bucket (1, 2, 4, 8, 16, 32, 64, 128+), using real transition hitcounts from the executor so loop iteration differences count as new coverage
 - **Power scheduling** — snapshot selection weighted by novelty × new-bits boost × depth bonus ÷ √exploration-count, ported from LibAFL's power schedule and now driven by real execution coverage instead of storage-write heuristics
+- **RPC-backed fork / deployed-state execution** — When [`CampaignConfig::rpc_url`](src/types.rs) is set, the campaign builds an [`RpcCacheDB`](src/rpc.rs) (`eth_getBalance`, `eth_getCode`, `eth_getTransactionCount`, `eth_getStorageAt` at a pinned block or `latest`), probes the endpoint (`eth_blockNumber`), aligns [`BlockEnv`](src/evm.rs) with `eth_getBlockByNumber`, and uses the forked DB as the **campaign root**. Targets with **no** creation/runtime bytecode are treated as **already deployed** at the configured address; the engine checks `eth_getCode` before fuzzing. **Not** a Forge cheatcode VM: no `vm.*` semantics. [`RpcCacheDB::code_by_hash`](src/rpc.rs) is a stub (empty); execution relies on bytecode in account info / `CacheDB` overlays — rare `code_by_hash`-only lookups may misbehave.
+- **Project-mode fork (first pass)** — `sci-fuzz forge --fork-url … --fork-block …` sets `rpc_url` / `rpc_block_number`. If `--fork-url` is omitted, `[profile.default] eth_rpc_url` from `foundry.toml` is used when present. CLI overrides `foundry.toml`.
+- **Audit deployed contracts** — `sci-fuzz audit <address> --rpc-url …` **requires** an RPC URL (`ETH_RPC_URL` or `--rpc-url`). Optional Etherscan ABI fetch; warns when targets have no ABI.
+- **Attacker / sender model** — Default funded EOA is `0x4242…4242` (100 ETH), overwritten in the executor DB. On a fork that address may already exist on-chain; use `--attacker` (`forge` / `audit`) or [`CampaignConfig::attacker_address`](src/types.rs) to pick another EOA.
 - **Multi-worker parallel campaign (local in-memory DB)** — Implemented in `campaign.rs` as `run_parallel_campaign`: after calibration, one OS thread per worker (`parallel_worker_loop`), each with its **own** `EvmExecutor`. Shared resources — coverage feedback, snapshot corpus, saved DB snapshots, finding dedupe, aggregated `CampaignReport` counters — sit behind **mutexes** and are updated from all workers.
   - **RPC mode:** If `rpc_url` is set, the campaign **forces `workers = 1`**. Fork/RPC-backed state is not shared safely across threads.
   - **Reproducibility:** With `workers > 1`, **scheduling is not fully reproducible** across runs (thread interleaving differs).
@@ -55,9 +59,8 @@ Honesty matters more than marketing. These are real gaps:
 - **No distributed fuzzing** — still the case: parallel workers are threads in one process only; there is no multi-machine corpus or coordinator (see multi-worker **Scope** above).
 - **Foundry integration gaps after harness setup.** Script-based deploy flows, library-specific bootstrapping, and Forge cheatcodes (`vm.*`) are not implemented. Harness `setUp` must be plain Solidity (deploy, calls, storage); tests that rely on the Forge cheatcode VM may revert or behave incorrectly. There is still no `StdInvariant` / `targetContract` import path or parity with Foundry’s invariant runner.
 - **External comparison execution is still partial.** `sci-fuzz benchmark` has a real measured path for sci-fuzz and a stable comparison schema for Echidna / Forge, but it does not yet orchestrate those tools end-to-end on shared targets. Their rows are reported as `unavailable` or `skipped`, never faked.
-- **No on-chain forking.** The `audit` subcommand exists in the CLI but is not implemented.
+- **Not Foundry fork-test parity.** `sci-fuzz` can fork via JSON-RPC and fuzz from live-like state, but there is **no** Forge cheatcode VM (`vm.*`), no `StdInvariant` / `targetContract` wiring, and no automatic script-based protocol setup beyond a single harness `setUp()` when using Foundry artifacts. Deep protocol bootstrapping is still manual or ABI-driven.
 - **Partial Echidna compatibility.** `EchidnaPropertyCaller` implements the core workflow (discover echidna_* functions, call them, check bool return). `EchidnaProperty` detects assertion events in logs. Neither handles revert/assert distinction with full Echidna fidelity, and the property-harness workflow (targetContract, configurable test limits, shrinking) is not implemented.
-- **No Foundry fork-mode fuzzing.** Forked RPC state exists for the audit path only; project-mode fuzzing does not mirror Foundry’s forked test execution.
 - **Economic oracles are heuristic.** Storage slot layouts (ERC-20 `totalSupply` at slot 2, balances at mapping slot 0) match common OpenZeppelin layouts but break on proxies, diamonds, and custom storage. Rate-jump and same-tx spread checks can false-positive on extreme rounding, first-liquidity edges, or non-standard vaults. Expect false positives on exotic tokens and false negatives when bugs hide behind unmodeled semantics. There is still no deep per-protocol classification, ABI-driven slot discovery, or full reserve / multi-asset conservation modeling in the default campaign.
 - **The 207k execs/sec number is a smoke test.** It measures empty-target throughput. Real contracts with storage and complex logic will run at 1–5k execs/sec. The number demonstrates low framework overhead, not security-testing strength.
 
@@ -77,6 +80,7 @@ types.rs       core types built on alloy-primitives (Address, U256, B256); Execu
 scoreboard.rs  stable benchmark result / summary schema + CSV / JSON writers
 benchmark.rs   benchmark case loading, sci-fuzz measurement, comparison scaffolding
 cli.rs         clap-based CLI: benchmark, forge, audit, test, ci, diff, version
+rpc.rs         JSON-RPC fork DB (RpcCacheDB), block header fetch, deployed-code preflight
 ```
 
 ## Installation
@@ -102,6 +106,13 @@ sci-fuzz forge --project /path/to/foundry-project --depth 32 --max-snapshots 819
 
 # Reproducible run
 sci-fuzz forge --seed 42 --timeout 60
+
+# Foundry project + JSON-RPC fork (optional block pin; or set eth_rpc_url in foundry.toml)
+sci-fuzz forge --project /path/to/project --fork-url https://eth.llamarpc.com --fork-block 19000000 --timeout 600
+
+# Audit a deployed contract (requires ETH_RPC_URL or --rpc-url)
+export ETH_RPC_URL=https://eth.llamarpc.com
+sci-fuzz audit 0xYourTarget --chain mainnet --timeout 300
 
 # Run the built-in EF/CF benchmark preset and emit CSV/JSON evidence
 sci-fuzz benchmark --preset efcf-demo --seeds 1,2,3 --max-execs 5000 --output-dir target/benchmark
@@ -229,7 +240,7 @@ Until the shared-target comparison rows become measured rather than scaffolded, 
 | Metric | Value |
 |--------|-------|
 | Rust source | ~5,500 lines across 13 modules |
-| Unit tests | 106 passing |
+| Unit tests | 130+ passing |
 | Benchmark contracts | 133 (from EF/CF) |
 | Benchmark matrix entries | 81 with expected bug types |
 | Dependencies | revm 19.7, alloy-primitives 0.8, clap 4, serde, rand, tiny-keccak |

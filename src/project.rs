@@ -53,6 +53,9 @@ pub struct FoundryProfile {
     pub optimizer_runs: Option<u32>,
     /// Optimizer enabled
     pub optimizer: Option<bool>,
+    /// JSON-RPC URL for fork tests (Foundry `eth_rpc_url` in profile)
+    #[serde(default)]
+    pub eth_rpc_url: Option<String>,
 }
 
 /// Foundry dependency
@@ -513,6 +516,16 @@ impl Project {
         } else {
             self.root.join(path)
         }
+    }
+
+    /// RPC URL from `[profile.default] eth_rpc_url` in `foundry.toml`, if set.
+    pub fn eth_rpc_url(&self) -> Option<String> {
+        self.config.as_ref().and_then(|c| {
+            c.profile
+                .get("default")
+                .and_then(|p| p.eth_rpc_url.clone())
+                .filter(|s| !s.trim().is_empty())
+        })
     }
 }
 

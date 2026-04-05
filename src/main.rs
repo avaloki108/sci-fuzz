@@ -151,7 +151,22 @@ fn handle_forge(args: sci_fuzz::cli::ForgeArgs) -> Result<()> {
     println!("found project: {}", project_root.display());
     println!("running forge build...");
 
-    let (_project, bootstrap, artifact_count) = Project::build_and_select_targets(&project_root)?;
+    let (project, bootstrap, artifact_count) = Project::build_and_select_targets(&project_root)?;
+
+    let fork_url = args
+        .fork_url
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| project.eth_rpc_url());
+
+    if let Some(ref url) = fork_url {
+        println!("  fork RPC  : {url}");
+        if let Some(b) = args.fork_block {
+            println!("  fork block: {b}");
+        } else {
+            println!("  fork block: latest (default)");
+        }
+    }
 
     println!("discovered {} artifact(s)", artifact_count);
     println!(
@@ -166,6 +181,13 @@ fn handle_forge(args: sci_fuzz::cli::ForgeArgs) -> Result<()> {
     println!("starting campaign...");
     println!();
 
+    let attacker_address = args
+        .attacker
+        .as_ref()
+        .map(|s| s.parse::<Address>())
+        .transpose()
+        .context("invalid --attacker address")?;
+
     // Build a default campaign config from CLI args.
     let config = CampaignConfig {
         timeout: std::time::Duration::from_secs(args.timeout),
@@ -177,8 +199,9 @@ fn handle_forge(args: sci_fuzz::cli::ForgeArgs) -> Result<()> {
         targets: bootstrap.runtime_targets,
         harness: bootstrap.harness,
         mode: sci_fuzz::types::ExecutorMode::Fast,
-        rpc_url: args.fork_url,
+        rpc_url: fork_url,
         rpc_block_number: args.fork_block,
+        attacker_address,
     };
 
     let mut campaign = Campaign::new(config);
@@ -218,7 +241,14 @@ fn handle_audit(args: sci_fuzz::cli::AuditArgs) -> Result<()> {
     let rpc_url = args
         .rpc_url
         .clone()
-        .or_else(|| std::env::var("ETH_RPC_URL").ok());
+        .or_else(|| std::env::var("ETH_RPC_URL").ok())
+        .filter(|s| !s.trim().is_empty());
+
+    let rpc_url = rpc_url.ok_or_else(|| {
+        anyhow::anyhow!(
+            "fork audit requires an RPC URL: set ETH_RPC_URL or pass --rpc-url <https://...>"
+        )
+    })?;
 
     let block = args.block_number.or_else(|| {
         std::env::var("FORK_BLOCK_NUMBER")
@@ -226,20 +256,17 @@ fn handle_audit(args: sci_fuzz::cli::AuditArgs) -> Result<()> {
             .and_then(|s| s.parse().ok())
     });
 
-    if let Some(ref url) = rpc_url {
-        println!("  rpc        : {url}");
-        if let Some(b) = block {
-            println!("  fork-block: {b}");
-        }
-        println!();
-        println!("  ℹ️  RpcCacheDB fork configured (will lazy-load state on first access).");
-        // Validate the RPC URL is reachable; just warn on failure.
-        match sci_fuzz::rpc::RpcCacheDB::new(url, block) {
-            Ok(_) => println!("  ✅ RPC connection OK"),
-            Err(e) => println!("  ⚠️  RPC init warning: {e}"),
-        }
+    println!("  rpc        : {rpc_url}");
+    if let Some(b) = block {
+        println!("  fork-block : {b}");
     } else {
-        println!("  ⚠️  No RPC URL provided. Set ETH_RPC_URL or pass --rpc-url.");
+        println!("  fork-block : latest (default)");
+    }
+    println!();
+    println!("  ℹ️  RpcCacheDB fork (lazy-load on first access).");
+    match sci_fuzz::rpc::rpc_probe_url(&rpc_url) {
+        Ok(()) => println!("  ✅ RPC reachable (eth_blockNumber)"),
+        Err(e) => eprintln!("  ⚠️  RPC probe failed: {e}"),
     }
     let target_address: Address = args.address.parse().context("Invalid address format")?;
 
@@ -277,6 +304,13 @@ fn handle_audit(args: sci_fuzz::cli::AuditArgs) -> Result<()> {
         abi: abi_val,
     };
 
+    let attacker_address = args
+        .attacker
+        .as_ref()
+        .map(|s| s.parse::<Address>())
+        .transpose()
+        .context("invalid --attacker address")?;
+
     // --- Build Campaign Configuration --------------------------------------
     let config = CampaignConfig {
         timeout: std::time::Duration::from_secs(args.timeout),
@@ -288,8 +322,9 @@ fn handle_audit(args: sci_fuzz::cli::AuditArgs) -> Result<()> {
         targets: vec![target],
         harness: None,
         mode: ExecutorMode::Realistic, // Audits should use realistic mode by default
-        rpc_url: rpc_url.clone(),
+        rpc_url: Some(rpc_url.clone()),
         rpc_block_number: block,
+        attacker_address,
     };
 
     println!();
