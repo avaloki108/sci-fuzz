@@ -313,11 +313,7 @@ pub struct ForkBlockHeader {
 /// Fetch full block object for the fork tag (single RPC round-trip).
 pub fn fetch_fork_block_object(url: &str, block: Option<u64>) -> Result<serde_json::Value> {
     let tag = fork_block_tag_json(block);
-    rpc_post(
-        url,
-        "eth_getBlockByNumber",
-        serde_json::json!([tag, false]),
-    )
+    rpc_post(url, "eth_getBlockByNumber", serde_json::json!([tag, false]))
 }
 
 /// Parse [`ForkBlockHeader`] from `eth_getBlockByNumber` result object (testable).
@@ -338,23 +334,15 @@ pub fn parse_fork_block_header(v: &serde_json::Value) -> Result<ForkBlockHeader>
     let timestamp = u64::from_str_radix(ts_hex.trim_start_matches("0x"), 16)
         .context("parse block timestamp")?;
 
-    let gas_limit = obj
-        .get("gasLimit")
-        .and_then(json_hex_u64);
-    let basefee = obj
-        .get("baseFeePerGas")
-        .and_then(json_hex_u256);
-    let difficulty = obj
-        .get("difficulty")
-        .and_then(json_hex_u256);
+    let gas_limit = obj.get("gasLimit").and_then(json_hex_u64);
+    let basefee = obj.get("baseFeePerGas").and_then(json_hex_u256);
+    let difficulty = obj.get("difficulty").and_then(json_hex_u256);
     let prevrandao = obj
         .get("mixHash")
         .and_then(|x| x.as_str())
         .map(parse_hex_b256)
         .transpose()?;
-    let excess_blob_gas = obj
-        .get("excessBlobGas")
-        .and_then(json_hex_u64);
+    let excess_blob_gas = obj.get("excessBlobGas").and_then(json_hex_u64);
 
     Ok(ForkBlockHeader {
         number,
@@ -443,10 +431,7 @@ pub(crate) const EIP1167_SUFFIX: [u8; 15] = [
 
 /// Classify bytecode for logging / triage (not proof of proxy type).
 pub fn proxy_bytecode_hint(code: &[u8]) -> ProxyBytecodeHint {
-    if code.len() == 45
-        && code.starts_with(&EIP1167_PREFIX)
-        && code.ends_with(&EIP1167_SUFFIX)
-    {
+    if code.len() == 45 && code.starts_with(&EIP1167_PREFIX) && code.ends_with(&EIP1167_SUFFIX) {
         return ProxyBytecodeHint::Eip1167MinimalProxy;
     }
     ProxyBytecodeHint::None
@@ -748,8 +733,14 @@ mod tests {
         let mut code = Vec::from(EIP1167_PREFIX);
         code.extend(std::iter::repeat(0xab_u8).take(20));
         code.extend_from_slice(&EIP1167_SUFFIX);
-        assert_eq!(proxy_bytecode_hint(&code), ProxyBytecodeHint::Eip1167MinimalProxy);
-        assert_eq!(proxy_bytecode_hint(&[0x60, 0x00, 0x60, 0x00]), ProxyBytecodeHint::None);
+        assert_eq!(
+            proxy_bytecode_hint(&code),
+            ProxyBytecodeHint::Eip1167MinimalProxy
+        );
+        assert_eq!(
+            proxy_bytecode_hint(&[0x60, 0x00, 0x60, 0x00]),
+            ProxyBytecodeHint::None
+        );
     }
 
     #[test]

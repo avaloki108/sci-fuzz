@@ -9,11 +9,11 @@ use std::sync::Arc;
 use tiny_keccak::{Hasher, Keccak};
 
 use crate::invariant::Invariant;
+use crate::protocol_probes::probe_u256;
 use crate::protocol_semantics::{
     append_triage_simple, topic_uni_v2_swap, topic_uni_v2_sync, u112_from_word,
     ContractProtocolProfile,
 };
-use crate::protocol_probes::probe_u256;
 use crate::types::{Address, ExecutionResult, Finding, Severity, Transaction, B256, U256};
 
 /// Optional per-address ABI-derived protocol hints (from campaign targets).
@@ -62,7 +62,7 @@ fn keccak256(input: &[u8]) -> B256 {
     B256::from(output)
 }
 
-fn address_to_b256(addr: Address) -> B256 {
+pub(crate) fn address_to_b256(addr: Address) -> B256 {
     let mut bytes = [0u8; 32];
     bytes[12..].copy_from_slice(addr.as_slice());
     B256::from(bytes)
@@ -87,7 +87,7 @@ fn withdraw_topic() -> B256 {
 }
 
 /// `previewDeposit` return vs `Deposit` event shares: allow tiny rounding (>0.1% relative and >3 wei).
-fn materially_divergent_probe_u256(a: U256, b: U256) -> bool {
+pub(crate) fn materially_divergent_probe_u256(a: U256, b: U256) -> bool {
     if a == b {
         return false;
     }
@@ -1010,9 +1010,11 @@ impl Invariant for Erc4626PreviewVsDepositEventOracle {
             let Some(e) = snap.erc4626.as_ref() else {
                 continue;
             };
-            let Some(row) = e.deposit_rows.iter().find(|r| {
-                r.assets == assets && r.shares_emitted == shares_emitted
-            }) else {
+            let Some(row) = e
+                .deposit_rows
+                .iter()
+                .find(|r| r.assets == assets && r.shares_emitted == shares_emitted)
+            else {
                 continue;
             };
             let Some(prev) = row.preview_deposit_shares.as_ref().and_then(probe_u256) else {
@@ -1037,7 +1039,9 @@ impl Invariant for Erc4626PreviewVsDepositEventOracle {
             );
             return Some(Finding {
                 severity: Severity::High,
-                title: format!("Economic: ERC-4626 probe previewDeposit vs Deposit event ({vault})"),
+                title: format!(
+                    "Economic: ERC-4626 probe previewDeposit vs Deposit event ({vault})"
+                ),
                 description: desc,
                 contract: vault,
                 reproducer: sequence.to_vec(),
@@ -1293,8 +1297,8 @@ mod tests {
         classify_json_abi, topic_uni_v2_sync, ContractProtocolProfile, ProtocolKind,
     };
     use crate::types::{
-        AmmProbeSnapshot, Bytes, ContractProbeSnapshot, Erc4626DepositProbeRow, Erc4626ProbeSnapshot,
-        Log, ProbeScalar, ProbeStatus,
+        AmmProbeSnapshot, Bytes, ContractProbeSnapshot, Erc4626DepositProbeRow,
+        Erc4626ProbeSnapshot, Log, ProbeScalar, ProbeStatus,
     };
     use alloy_json_abi::JsonAbi;
     use serde_json::json;
@@ -1642,9 +1646,7 @@ mod tests {
         let row = Erc4626DepositProbeRow {
             assets: U256::from(100u64),
             shares_emitted: U256::from(10_000u64),
-            preview_deposit_shares: Some(ProbeStatus::Ok(ProbeScalar::U256(U256::from(
-                100u64,
-            )))),
+            preview_deposit_shares: Some(ProbeStatus::Ok(ProbeScalar::U256(U256::from(100u64)))),
             convert_to_shares: None,
         };
         let mut snap = ContractProbeSnapshot::default();
@@ -1687,9 +1689,7 @@ mod tests {
         let row = Erc4626DepositProbeRow {
             assets: U256::from(100u64),
             shares_emitted: U256::from(100u64),
-            preview_deposit_shares: Some(ProbeStatus::Ok(ProbeScalar::U256(U256::from(
-                100u64,
-            )))),
+            preview_deposit_shares: Some(ProbeStatus::Ok(ProbeScalar::U256(U256::from(100u64)))),
             convert_to_shares: None,
         };
         let mut snap = ContractProbeSnapshot::default();

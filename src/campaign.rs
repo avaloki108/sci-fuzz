@@ -19,15 +19,15 @@ use crate::path_id::fold_sequence;
 use crate::rpc::FuzzerDatabase;
 use revm::db::CacheDB;
 
+use crate::economic::ProtocolProfileMap;
 use crate::invariant::EchidnaPropertyCaller;
 use crate::mutator::TxMutator;
 use crate::oracle::{capture_eth_baseline, OracleEngine};
 use crate::shrinker::SequenceShrinker;
 use crate::snapshot::SnapshotCorpus;
-use crate::economic::ProtocolProfileMap;
 use crate::types::{
-    contract_info_for_mutator, Address, B256, Bytes, CampaignConfig, ContractInfo, CoverageMap,
-    Finding, StateSnapshot, Transaction, U256,
+    contract_info_for_mutator, Address, Bytes, CampaignConfig, ContractInfo, CoverageMap, Finding,
+    StateSnapshot, Transaction, B256, U256,
 };
 
 /// ABI function names excluded from fuzzing (harness lifecycle; setup runs once at bootstrap).
@@ -178,7 +178,8 @@ impl Campaign {
                 }
                 Err(e) => eprintln!("[campaign] warning: eth_chainId failed: {e:#}"),
             }
-            let header = crate::rpc::fetch_fork_block_header_full(url, self.config.rpc_block_number)?;
+            let header =
+                crate::rpc::fetch_fork_block_header_full(url, self.config.rpc_block_number)?;
             {
                 let be = executor.block_env_mut();
                 crate::rpc::merge_fork_header_into_block_env(&header, be);
@@ -215,7 +216,8 @@ impl Campaign {
                 );
             }
         } else {
-            executor.set_balance(attacker, U256::from(100_000_000_000_000_000_000_u128)); // 100 ETH local
+            executor.set_balance(attacker, U256::from(100_000_000_000_000_000_000_u128));
+            // 100 ETH local
         }
 
         // --- Validate / enrich deployed-only targets (RPC preflight) -------
@@ -246,10 +248,7 @@ impl Campaign {
                             target.address,
                         )
                         .map_err(|e| {
-                            anyhow::anyhow!(
-                                "preflight failed for target {}: {e:#}",
-                                target.address
-                            )
+                            anyhow::anyhow!("preflight failed for target {}: {e:#}", target.address)
                         })?;
                         eprintln!(
                             "[campaign] preflight: {} code_size={} bytes proxy_hint={:?}",
@@ -331,12 +330,11 @@ impl Campaign {
                 abi: harness.abi.clone(),
             });
 
-            crate::harness::run_setup(&mut executor, attacker, deployed_addr)
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "harness setUp failed (sci-fuzz does not implement Forge vm.* cheatcodes): {e}"
-                    )
-                })?;
+            crate::harness::run_setup(&mut executor, attacker, deployed_addr).map_err(|e| {
+                anyhow::anyhow!(
+                    "harness setUp failed (sci-fuzz does not implement Forge vm.* cheatcodes): {e}"
+                )
+            })?;
             eprintln!(
                 "[campaign] ran setUp() on harness {} ({})",
                 harness.name.as_deref().unwrap_or("?"),
@@ -465,8 +463,7 @@ impl Campaign {
                 let seq_path = fold_sequence(B256::ZERO, result.tx_path_id, 0);
                 let novel_tx_path = path_feedback.record_tx_path(&result.tx_path_id);
                 let novel_seq_path = path_feedback.record_sequence_path(&seq_path);
-                let path_only =
-                    (novel_tx_path || novel_seq_path) && !novel_cov && !novel_df;
+                let path_only = (novel_tx_path || novel_seq_path) && !novel_cov && !novel_df;
 
                 if novel_cov || novel_df || novel_tx_path || novel_seq_path {
                     let (bn, ts) = executor_block_meta(&executor);
@@ -731,8 +728,7 @@ impl Campaign {
                 let novel_df = feedback.record_dataflow(&df);
                 let novel_tx_path = path_feedback.record_tx_path(&result.tx_path_id);
                 let novel_seq_path = path_feedback.record_sequence_path(&sequence_path_id);
-                let path_only =
-                    (novel_tx_path || novel_seq_path) && !novel_cov && !novel_df;
+                let path_only = (novel_tx_path || novel_seq_path) && !novel_cov && !novel_df;
                 let is_novel = novel_cov || novel_df || novel_tx_path || novel_seq_path;
                 if is_novel {
                     // Store a snapshot of this state for future exploration.
@@ -1153,8 +1149,7 @@ fn parallel_worker_loop(
             let cov = result.coverage.clone();
             let df = result.dataflow.clone();
 
-            sequence_path_id =
-                fold_sequence(sequence_path_id, result.tx_path_id, step_idx as u32);
+            sequence_path_id = fold_sequence(sequence_path_id, result.tx_path_id, step_idx as u32);
 
             {
                 let mut g = shared.lock().expect("shared mutex poisoned");
@@ -1174,8 +1169,7 @@ fn parallel_worker_loop(
                 let novel_df = g.feedback.record_dataflow(&df);
                 let novel_tx_path = g.path_feedback.record_tx_path(&result.tx_path_id);
                 let novel_seq_path = g.path_feedback.record_sequence_path(&sequence_path_id);
-                let path_only =
-                    (novel_tx_path || novel_seq_path) && !novel_cov && !novel_df;
+                let path_only = (novel_tx_path || novel_seq_path) && !novel_cov && !novel_df;
                 if novel_cov || novel_df || novel_tx_path || novel_seq_path {
                     let (bn, ts) = executor_block_meta(&executor);
                     let snap = StateSnapshot {
@@ -1492,10 +1486,9 @@ mod tests {
         }
         let hex_str = std::fs::read_to_string(&bin).expect("read bin");
         let bytecode = hex::decode(hex_str.trim()).expect("hex");
-        let abi: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(&abi_path).expect("read abi"),
-        )
-        .expect("abi json");
+        let abi: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&abi_path).expect("read abi"))
+                .expect("abi json");
         let mk = |label: &str| ContractInfo {
             address: Address::ZERO,
             deployed_bytecode: Bytes::new(),

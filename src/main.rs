@@ -300,7 +300,9 @@ fn handle_audit(args: sci_fuzz::cli::AuditArgs) -> Result<()> {
             }
         } else if targets.is_empty() {
             println!();
-            println!("  ℹ️  No ETHERSCAN_API_KEY — ABIs will be missing unless provided elsewhere.");
+            println!(
+                "  ℹ️  No ETHERSCAN_API_KEY — ABIs will be missing unless provided elsewhere."
+            );
         }
 
         let short = addr_str

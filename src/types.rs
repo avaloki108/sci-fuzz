@@ -211,6 +211,9 @@ pub struct Erc4626WithdrawProbeRow {
 pub struct Erc4626ProbeSnapshot {
     pub asset: Option<ProbeStatus>,
     pub total_assets: Option<ProbeStatus>,
+    /// `balanceOf(vault)` on the underlying asset (post-state), when `asset` resolves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset_balance_of_vault: Option<ProbeStatus>,
     pub deposit_rows: Vec<Erc4626DepositProbeRow>,
     pub withdraw_rows: Vec<Erc4626WithdrawProbeRow>,
 }
@@ -701,6 +704,12 @@ impl Finding {
         if title.starts_with("Economic: AMM Sync reserves vs getReserves") {
             return "economic-amm-sync-vs-getreserves".into();
         }
+        if title.starts_with("Economic: AMM Sync reserve change without Swap/Mint/Burn") {
+            return "economic-amm-sync-explained".into();
+        }
+        if title.starts_with("Economic: ERC-4626 Deposit assets vs underlying Transfer") {
+            return "economic-erc4626-deposit-vs-transfer".into();
+        }
 
         title.to_string()
     }
@@ -1000,5 +1009,27 @@ mod tests {
             exploit_profit: None,
         };
         assert_eq!(h.failure_class(), "economic-amm-sync-vs-getreserves");
+
+        let i = Finding {
+            severity: Severity::High,
+            title: "Economic: AMM Sync reserve change without Swap/Mint/Burn (0x0000000000000000000000000000000000000003)"
+                .into(),
+            description: String::new(),
+            contract: Address::ZERO,
+            reproducer: vec![],
+            exploit_profit: None,
+        };
+        assert_eq!(i.failure_class(), "economic-amm-sync-explained");
+
+        let j = Finding {
+            severity: Severity::High,
+            title: "Economic: ERC-4626 Deposit assets vs underlying Transfer (0x0000000000000000000000000000000000000004)"
+                .into(),
+            description: String::new(),
+            contract: Address::ZERO,
+            reproducer: vec![],
+            exploit_profit: None,
+        };
+        assert_eq!(j.failure_class(), "economic-erc4626-deposit-vs-transfer");
     }
 }

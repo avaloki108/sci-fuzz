@@ -31,10 +31,7 @@ impl PathStreamHasher {
         let p = prev_pc as u64;
         let c = current_pc as u64;
 
-        self.state_lo = self
-            .state_lo
-            .wrapping_mul(GOLDEN)
-            .wrapping_add(a0 ^ p);
+        self.state_lo = self.state_lo.wrapping_mul(GOLDEN).wrapping_add(a0 ^ p);
         self.state_hi = self
             .state_hi
             .wrapping_mul(GOLDEN.wrapping_add(1))
@@ -66,10 +63,7 @@ fn split_address(address: Address) -> (u64, u64) {
     for i in 0..8 {
         hi |= (b[8 + i] as u64) << (i * 8);
     }
-    hi ^= (b[16] as u64)
-        | ((b[17] as u64) << 8)
-        | ((b[18] as u64) << 16)
-        | ((b[19] as u64) << 24);
+    hi ^= (b[16] as u64) | ((b[17] as u64) << 8) | ((b[18] as u64) << 16) | ((b[19] as u64) << 24);
     (lo, hi)
 }
 
@@ -100,18 +94,8 @@ mod tests {
     fn same_multiset_different_order_different_tx_path_id() {
         let addr = Address::ZERO;
         // Same edges each taken twice: (0,1),(1,2) twice vs interleaved order — multiset identical.
-        let order_a = vec![
-            (addr, 0, 1),
-            (addr, 1, 2),
-            (addr, 0, 1),
-            (addr, 1, 2),
-        ];
-        let order_b = vec![
-            (addr, 0, 1),
-            (addr, 0, 1),
-            (addr, 1, 2),
-            (addr, 1, 2),
-        ];
+        let order_a = vec![(addr, 0, 1), (addr, 1, 2), (addr, 0, 1), (addr, 1, 2)];
+        let order_b = vec![(addr, 0, 1), (addr, 0, 1), (addr, 1, 2), (addr, 1, 2)];
         let id_a = tx_path_id_from_stream(&order_a);
         let id_b = tx_path_id_from_stream(&order_b);
         assert_ne!(id_a, id_b);

@@ -49,9 +49,12 @@ pub mod shrinker;
 
 // ── Invariant / oracle system ───────────────────────────────────────────
 
+pub mod conservation;
+pub mod conservation_oracles;
 pub mod economic;
 pub mod protocol_probes;
 pub mod protocol_semantics;
+pub use conservation_oracles::{AmmSyncExplainedOracle, Erc4626DepositVsUnderlyingTransferOracle};
 pub use economic::{
     Erc20BalanceStorageWithoutTransferOracle, Erc20BurnWithoutSupplyWriteOracle,
     Erc20MintWithoutSupplyWriteOracle, Erc4626EventAnomalyOracle, Erc4626ExchangeRateJumpOracle,

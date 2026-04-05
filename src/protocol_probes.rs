@@ -56,6 +56,15 @@ fn decode_get_reserves(out: &[u8]) -> Option<(U256, U256)> {
     Some((r0, r1))
 }
 
+/// `balanceOf(address)` — `0x70a08231` + 32-byte padded address (works without asset ABI).
+fn encode_erc20_balance_of(holder: Address) -> Bytes {
+    let mut v = Vec::with_capacity(36);
+    v.extend_from_slice(&[0x70, 0xa0, 0x82, 0x31]);
+    v.extend_from_slice(&[0u8; 12]);
+    v.extend_from_slice(holder.as_slice());
+    Bytes::from(v)
+}
+
 fn encode_call(abi: &JsonAbi, name: &str, args: &[DynSolValue]) -> Option<Bytes> {
     let funcs = abi.functions.get(name)?;
     let f = funcs.first()?;
@@ -192,11 +201,9 @@ pub fn fill_protocol_probes(
                     };
 
                     if has_function(abi, "previewDeposit") {
-                        if let Some(data) = encode_call(
-                            abi,
-                            "previewDeposit",
-                            &[DynSolValue::Uint(assets, 256)],
-                        ) {
+                        if let Some(data) =
+                            encode_call(abi, "previewDeposit", &[DynSolValue::Uint(assets, 256)])
+                        {
                             if let Some((ok, out)) =
                                 run_probe(executor, caller, addr, data, &mut calls_left)
                             {
@@ -205,11 +212,9 @@ pub fn fill_protocol_probes(
                         }
                     }
                     if has_function(abi, "convertToShares") {
-                        if let Some(data) = encode_call(
-                            abi,
-                            "convertToShares",
-                            &[DynSolValue::Uint(assets, 256)],
-                        ) {
+                        if let Some(data) =
+                            encode_call(abi, "convertToShares", &[DynSolValue::Uint(assets, 256)])
+                        {
                             if let Some((ok, out)) =
                                 run_probe(executor, caller, addr, data, &mut calls_left)
                             {
@@ -230,11 +235,9 @@ pub fn fill_protocol_probes(
                         preview_redeem_assets: None,
                     };
                     if has_function(abi, "previewWithdraw") {
-                        if let Some(data) = encode_call(
-                            abi,
-                            "previewWithdraw",
-                            &[DynSolValue::Uint(assets, 256)],
-                        ) {
+                        if let Some(data) =
+                            encode_call(abi, "previewWithdraw", &[DynSolValue::Uint(assets, 256)])
+                        {
                             if let Some((ok, out)) =
                                 run_probe(executor, caller, addr, data, &mut calls_left)
                             {
@@ -243,11 +246,9 @@ pub fn fill_protocol_probes(
                         }
                     }
                     if has_function(abi, "previewRedeem") {
-                        if let Some(data) = encode_call(
-                            abi,
-                            "previewRedeem",
-                            &[DynSolValue::Uint(shares, 256)],
-                        ) {
+                        if let Some(data) =
+                            encode_call(abi, "previewRedeem", &[DynSolValue::Uint(shares, 256)])
+                        {
                             if let Some((ok, out)) =
                                 run_probe(executor, caller, addr, data, &mut calls_left)
                             {
@@ -259,8 +260,19 @@ pub fn fill_protocol_probes(
                 }
             }
 
+            // Underlying `balanceOf(vault)` at the asset token (one call per vault candidate).
+            if let Some(ProbeStatus::Ok(ProbeScalar::Address(asset_token))) = e.asset.as_ref() {
+                let data = encode_erc20_balance_of(addr);
+                if let Some((ok, out)) =
+                    run_probe(executor, caller, *asset_token, data, &mut calls_left)
+                {
+                    e.asset_balance_of_vault = Some(status_u256(ok, &out));
+                }
+            }
+
             if e.asset.is_some()
                 || e.total_assets.is_some()
+                || e.asset_balance_of_vault.is_some()
                 || !e.deposit_rows.is_empty()
                 || !e.withdraw_rows.is_empty()
             {
@@ -280,9 +292,7 @@ pub fn fill_protocol_probes(
                 }
             }
             if has_function(abi, "balanceOf") {
-                if let Some(data) =
-                    encode_call(abi, "balanceOf", &[DynSolValue::Address(caller)])
-                {
+                if let Some(data) = encode_call(abi, "balanceOf", &[DynSolValue::Address(caller)]) {
                     if let Some((ok, out)) =
                         run_probe(executor, caller, addr, data, &mut calls_left)
                     {
@@ -297,8 +307,7 @@ pub fn fill_protocol_probes(
 
         if prof.is_amm_pair_like() && has_function(abi, "getReserves") {
             if let Some(data) = encode_call(abi, "getReserves", &[]) {
-                if let Some((ok, out)) = run_probe(executor, caller, addr, data, &mut calls_left)
-                {
+                if let Some((ok, out)) = run_probe(executor, caller, addr, data, &mut calls_left) {
                     let (r0, r1) = status_reserves(ok, &out);
                     snap.amm = Some(AmmProbeSnapshot {
                         reserve0: r0,
@@ -344,12 +353,8 @@ mod tests {
     fn encode_preview_deposit_has_selector_and_args() {
         let abi = sample_erc4626_abi();
         let assets = U256::from(1000u64);
-        let data = encode_call(
-            &abi,
-            "previewDeposit",
-            &[DynSolValue::Uint(assets, 256)],
-        )
-        .expect("encode");
+        let data =
+            encode_call(&abi, "previewDeposit", &[DynSolValue::Uint(assets, 256)]).expect("encode");
         assert!(data.len() >= 4 + 32);
         let word = &data[4..36];
         assert_eq!(U256::from_be_slice(word), assets);

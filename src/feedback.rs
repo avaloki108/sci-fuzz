@@ -23,7 +23,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::types::{Address, B256, CoverageMap};
+use crate::types::{Address, CoverageMap, B256};
 
 // ---------------------------------------------------------------------------
 // Hitcount bucketing
@@ -577,18 +577,8 @@ mod tests {
     fn path_novelty_without_edge_novelty() {
         use crate::path_id::tx_path_id_from_stream;
         let addr = Address::ZERO;
-        let stream_a = vec![
-            (addr, 0, 1),
-            (addr, 1, 2),
-            (addr, 0, 1),
-            (addr, 1, 2),
-        ];
-        let stream_b = vec![
-            (addr, 0, 1),
-            (addr, 0, 1),
-            (addr, 1, 2),
-            (addr, 1, 2),
-        ];
+        let stream_a = vec![(addr, 0, 1), (addr, 1, 2), (addr, 0, 1), (addr, 1, 2)];
+        let stream_b = vec![(addr, 0, 1), (addr, 0, 1), (addr, 1, 2), (addr, 1, 2)];
         let mut cov_a = CoverageMap::new();
         for &(a, p, c) in &stream_a {
             cov_a.record_hit(a, p, c);

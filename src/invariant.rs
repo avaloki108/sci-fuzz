@@ -7,6 +7,9 @@ use std::collections::HashMap;
 
 use tiny_keccak::{Hasher, Keccak};
 
+use crate::conservation_oracles::{
+    AmmSyncExplainedOracle, Erc4626DepositVsUnderlyingTransferOracle,
+};
 use crate::economic::{
     Erc20BalanceStorageWithoutTransferOracle, Erc20BurnWithoutSupplyWriteOracle,
     Erc20MintWithoutSupplyWriteOracle, Erc4626EventAnomalyOracle, Erc4626ExchangeRateJumpOracle,
@@ -669,6 +672,9 @@ impl InvariantRegistry {
         reg.add(Box::new(UniswapV2StyleSwapReserveOracle {
             profiles: pmap.clone(),
         }));
+        reg.add(Box::new(AmmSyncExplainedOracle {
+            profiles: pmap.clone(),
+        }));
         reg.add(Box::new(Erc4626PreviewVsDepositEventOracle {
             profiles: pmap.clone(),
         }));
@@ -677,6 +683,9 @@ impl InvariantRegistry {
         }));
         reg.add(Box::new(Erc4626RateJumpWithoutTokenFlowOracle {
             max_multiplier: U256::from(5u64),
+            profiles: pmap.clone(),
+        }));
+        reg.add(Box::new(Erc4626DepositVsUnderlyingTransferOracle {
             profiles: pmap,
         }));
         reg
@@ -840,9 +849,10 @@ mod tests {
         // FlashloanEconomicOracle, Erc4626EventAnomaly, Erc20MintWithoutSupplyWrite,
         // Erc20BalanceStorageWithoutTransfer, Erc4626ExchangeRateJump,
         // Erc20BurnWithoutSupplyWrite, Erc4626WithdrawRateJump, Erc4626SameTransactionDepositRateSpread,
-        // UniswapV2StyleSwapReserve, Erc4626PreviewVsDepositEvent, UniswapV2StyleSyncVsGetReserves,
-        // Erc4626RateJumpWithoutTokenFlow (16 total)
-        assert_eq!(reg.len(), 16);
+        // UniswapV2StyleSwapReserve, AmmSyncExplained, Erc4626PreviewVsDepositEvent,
+        // UniswapV2StyleSyncVsGetReserves, Erc4626RateJumpWithoutTokenFlow,
+        // Erc4626DepositVsUnderlyingTransfer (18 total)
+        assert_eq!(reg.len(), 18);
         assert!(!reg.is_empty());
     }
 
@@ -1028,8 +1038,8 @@ mod tests {
         let attacker = Address::repeat_byte(0x99);
         let tokens = vec![Address::repeat_byte(0xA1), Address::repeat_byte(0xA2)];
         let reg = InvariantRegistry::with_erc20(attacker, &tokens);
-        // 16 defaults + 2 ERC20Supply invariants
-        assert_eq!(reg.len(), 18);
+        // 18 defaults + 2 ERC20Supply invariants
+        assert_eq!(reg.len(), 20);
     }
 
     // -- EchidnaPropertyCaller tests ------------------------------------------

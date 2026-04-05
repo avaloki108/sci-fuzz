@@ -188,8 +188,14 @@ impl EvmExecutor {
         self.db.commit(state.clone());
 
         // Convert the revm result into our own type.
-        let exec_result =
-            self.convert_result(&result, &state, &pre_balances, coverage, dataflow, tx_path_id)?;
+        let exec_result = self.convert_result(
+            &result,
+            &state,
+            &pre_balances,
+            coverage,
+            dataflow,
+            tx_path_id,
+        )?;
         Ok(exec_result)
     }
 
