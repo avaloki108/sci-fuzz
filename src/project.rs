@@ -251,9 +251,12 @@ impl Project {
             .values()
             .filter(|contract| !contract.deployed_bytecode.is_empty())
             .filter(|contract| !is_script_artifact(contract))
+            // Vendored libraries (node_modules/, lib/) are never fuzzing targets.
+            .filter(|contract| !is_dependency_artifact(contract))
             .cloned()
             .collect();
 
+        // If we have any non-test src contracts, prefer those over test/mock artifacts.
         let has_non_test = candidates
             .iter()
             .any(|contract| !is_test_artifact(contract));
@@ -270,22 +273,38 @@ impl Project {
         self.select_runtime_targets()
     }
 
-    /// Test/harness contracts that declare `setUp()`, have creation bytecode,
-    /// and are not scripts.
+    /// Test/harness contracts that have creation bytecode and are not scripts.
+    ///
+    /// Accepts two harness styles:
+    /// 1. Foundry invariant style: lives in test/ AND declares `setUp()`.
+    /// 2. Echidna style: declares `echidna_*` properties, may live anywhere
+    ///    (constructor does all setup; no `setUp()` required).
     pub fn select_harness_candidates(&self) -> Vec<ContractInfo> {
         let mut candidates: Vec<ContractInfo> = self
             .contracts
             .values()
             .filter(|c| !c.deployed_bytecode.is_empty())
             .filter(|c| !is_script_artifact(c))
-            .filter(|c| is_test_artifact(c))
+            .filter(|c| !is_dependency_artifact(c))
             .filter(|c| {
-                c.creation_bytecode
+                // Must have creation bytecode so we can deploy it.
+                let has_creation = c
+                    .creation_bytecode
                     .as_ref()
                     .map(|b| !b.is_empty())
-                    .unwrap_or(false)
+                    .unwrap_or(false);
+                if !has_creation {
+                    return false;
+                }
+                // Style 1: test artifact with setUp()
+                let is_test = is_test_artifact(c);
+                let has_setup = c.abi.as_ref().is_some_and(abi_has_set_up);
+                if is_test && has_setup {
+                    return true;
+                }
+                // Style 2: Echidna-compatible harness — echidna_* properties anywhere
+                c.abi.as_ref().is_some_and(abi_has_echidna_property)
             })
-            .filter(|c| c.abi.as_ref().is_some_and(abi_has_set_up))
             .cloned()
             .collect();
 
@@ -296,8 +315,9 @@ impl Project {
     /// Build [`FuzzBootstrap`]: runtime targets plus at most one harness
     /// (prefers an `echidna_*` harness when available).
     pub fn prepare_fuzz_bootstrap(&self) -> Result<FuzzBootstrap> {
-        let runtime_targets = self.select_runtime_targets();
         let mut harness_candidates = self.select_harness_candidates();
+        // Sort: echidna_* harnesses first (they carry real invariants), then
+        // alphabetically by source path so selection is deterministic.
         harness_candidates.sort_by_key(|c| {
             let prefers_echidna = c
                 .abi
@@ -306,8 +326,14 @@ impl Project {
                 .unwrap_or(false);
             (!prefers_echidna, harness_sort_key(c))
         });
-
         let harness = harness_candidates.into_iter().next();
+
+        // Exclude the chosen harness from the runtime-target list — it's already
+        // deployed separately and adding it again would duplicate transactions.
+        let mut runtime_targets = self.select_runtime_targets();
+        if let Some(ref h) = harness {
+            runtime_targets.retain(|t| t.address != h.address);
+        }
 
         if runtime_targets.is_empty() && harness.is_none() {
             return Err(Error::Project(format!(
@@ -687,6 +713,20 @@ fn parse_artifact_file(artifact_path: &Path, out_dir: &Path) -> Result<ContractI
 }
 
 fn extract_source_path(artifact: &Value, artifact_path: &Path, out_dir: &Path) -> String {
+    // Standard Forge artifact layout: metadata.settings.compilationTarget
+    // e.g. {"metadata":{"settings":{"compilationTarget":{"src/Vault.sol":"Vault"}}}}
+    if let Some(source_path) = artifact
+        .get("metadata")
+        .and_then(|m| m.get("settings"))
+        .and_then(|s| s.get("compilationTarget"))
+        .and_then(Value::as_object)
+        .and_then(|target| target.keys().next())
+    {
+        return source_path.to_string();
+    }
+
+    // Legacy / test-artifact format: top-level compilationTarget key.
+    // Real forge never writes this, but our unit-test fixtures do.
     if let Some(source_path) = artifact
         .get("compilationTarget")
         .and_then(Value::as_object)
@@ -695,6 +735,8 @@ fn extract_source_path(artifact: &Value, artifact_path: &Path, out_dir: &Path) -
         return source_path.to_string();
     }
 
+    // Last resort: infer from artifact path relative to out/.
+    // e.g. out/FlowAdminHandler.sol/FlowAdminHandler.json -> FlowAdminHandler.sol
     let rel = artifact_path.strip_prefix(out_dir).unwrap_or(artifact_path);
     rel.parent()
         .map(|parent| parent.to_string_lossy().replace('\\', "/"))
@@ -736,6 +778,17 @@ fn decode_hex_bytes(raw: &str, artifact_path: &Path) -> Result<Option<Bytes>> {
     let trimmed = raw.trim();
     let trimmed = trimmed.strip_prefix("0x").unwrap_or(trimmed);
     if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    // Forge emits __LibraryName__ placeholders in bytecode when a library hasn't
+    // been linked yet. These artifacts can't be deployed — treat as empty bytecode
+    // so they get filtered out downstream rather than crashing the campaign.
+    if trimmed.contains('_') {
+        tracing::debug!(
+            "[project] skipping unlinked-library artifact (contains placeholders): {}",
+            artifact_path.display()
+        );
         return Ok(None);
     }
 
@@ -798,10 +851,34 @@ fn is_test_artifact(contract: &ContractInfo) -> bool {
         .unwrap_or_default()
         .to_ascii_lowercase();
 
+    // Path-based: Foundry projects may use "test/" or "tests/" (with s).
+    // Also catch deeply-nested test paths like tests/invariant/handlers/.
     source_path.starts_with("test/")
+        || source_path.starts_with("tests/")
         || source_path.contains("/test/")
+        || source_path.contains("/tests/")
         || source_path.ends_with(".t.sol")
+        // Name-based fallbacks for artifacts whose path isn't readable.
         || name.ends_with("test")
+        || name.ends_with("handler") // invariant test handlers
+        || name.ends_with("store")   // invariant stores (e.g. FlowStore)
+        || name.ends_with("mock")    // mock contracts
+        || name.ends_with("stub") // stub contracts (e.g. NFTDescStub)
+}
+
+/// True if this artifact lives in a dependency directory (node_modules, lib/).
+/// These are vendored libraries — not fuzzing targets.
+fn is_dependency_artifact(contract: &ContractInfo) -> bool {
+    let source_path = contract
+        .source_path
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    source_path.starts_with("node_modules/")
+        || source_path.starts_with("lib/")
+        || source_path.contains("/node_modules/")
+        || source_path.contains("/lib/")
 }
 
 fn target_sort_key(contract: &ContractInfo) -> (u8, String, String) {

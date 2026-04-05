@@ -107,11 +107,29 @@ impl Invariant for BalanceIncrease {
 // Built-in: UnexpectedRevert
 // ---------------------------------------------------------------------------
 
-/// Flags executions that revert when they were expected to succeed.
+/// Flags executions that revert with meaningful gas usage.
 ///
-/// This is a low-severity informational check — useful for surfacing
-/// potential overflow / underflow conditions in pre-0.8 contracts.
-pub struct UnexpectedRevert;
+/// Low-gas reverts (< 5000 gas) are typically just "no matching function
+/// selector" or basic argument validation — not interesting. Only fires
+/// when the EVM got at least deep enough to do real work before reverting,
+/// which suggests an overflow / underflow / unexpected state.
+pub struct UnexpectedRevert {
+    /// Minimum gas consumed before a revert is worth flagging.
+    /// Default: 5000. Set to 0 to capture all reverts (very noisy).
+    pub min_gas_threshold: u64,
+}
+
+impl Default for UnexpectedRevert {
+    fn default() -> Self {
+        Self {
+            // EVM base tx cost is 21,000 gas. A revert immediately after costs
+            // ~21,100-21,200. Only flag reverts that consumed real work — set
+            // threshold well above the base cost so trivial "bad selector" calls
+            // don't flood findings.
+            min_gas_threshold: 30_000,
+        }
+    }
+}
 
 impl Invariant for UnexpectedRevert {
     fn name(&self) -> &str {
@@ -127,6 +145,11 @@ impl Invariant for UnexpectedRevert {
         if result.success || sequence.is_empty() {
             return None;
         }
+        // Low-gas reverts are almost always invalid selector / arg validation.
+        // Skip them — they flood findings with noise.
+        if result.gas_used < self.min_gas_threshold {
+            return None;
+        }
         let last = sequence.last()?;
         let to = last.to?;
 
@@ -134,7 +157,7 @@ impl Invariant for UnexpectedRevert {
             severity: Severity::Low,
             title: "Unexpected revert".into(),
             description: format!(
-                "Transaction to {to} reverted unexpectedly (gas used: {})",
+                "Transaction to {to} reverted after consuming {} gas — possible assertion/overflow",
                 result.gas_used,
             ),
             contract: to,
@@ -150,7 +173,16 @@ impl Invariant for UnexpectedRevert {
 
 /// Detects when a contract's balance drops to zero — a heuristic for
 /// `SELFDESTRUCT`.
-pub struct SelfDestructDetector;
+///
+/// Only fires when:
+/// 1. The balance drop is substantial (> 1e15 wei / 0.001 ETH) to filter
+///    out mock tokens whose dust balances drain legitimately.
+/// 2. The balance of the *attacker* increased in the same execution —
+///    the typical selfdestruct-drain pattern.
+pub struct SelfDestructDetector {
+    /// Address of the attacker/fuzzer sender (for profit cross-check).
+    pub attacker: Address,
+}
 
 impl Invariant for SelfDestructDetector {
     fn name(&self) -> &str {
@@ -159,21 +191,45 @@ impl Invariant for SelfDestructDetector {
 
     fn check(
         &self,
-        _pre_balances: &HashMap<Address, U256>,
+        pre_balances: &HashMap<Address, U256>,
         result: &ExecutionResult,
         sequence: &[Transaction],
     ) -> Option<Finding> {
+        // Minimum ETH drain worth flagging: 0.001 ETH.
+        let min_drain = U256::from(1_000_000_000_000_000u128);
+
         for (&addr, &(old, new)) in &result.state_diff.balance_changes {
-            if old > U256::ZERO && new == U256::ZERO {
-                return Some(Finding {
-                    severity: Severity::High,
-                    title: format!("Possible selfdestruct of {addr}"),
-                    description: format!("Contract {addr} balance went from {old} to 0",),
-                    contract: addr,
-                    reproducer: sequence.to_vec(),
-                    exploit_profit: None,
-                });
+            // Skip the attacker's own address and zero-balance contracts.
+            if addr == self.attacker || old <= min_drain || new != U256::ZERO {
+                continue;
             }
+            // Require that the attacker's balance also went up — confirms profit,
+            // reduces false positives from legitimate fee collection or burns.
+            let attacker_old = pre_balances
+                .get(&self.attacker)
+                .copied()
+                .unwrap_or(U256::ZERO);
+            let attacker_new = result
+                .state_diff
+                .balance_changes
+                .get(&self.attacker)
+                .map(|&(_, n)| n)
+                .unwrap_or(attacker_old);
+            if attacker_new <= attacker_old {
+                continue;
+            }
+
+            return Some(Finding {
+                severity: Severity::High,
+                title: format!("Possible selfdestruct of {addr}"),
+                description: format!(
+                    "Contract {addr} balance drained from {old} to 0; attacker gained {} wei",
+                    attacker_new.saturating_sub(attacker_old),
+                ),
+                contract: addr,
+                reproducer: sequence.to_vec(),
+                exploit_profit: Some(attacker_new.saturating_sub(attacker_old)),
+            });
         }
         None
     }
@@ -633,8 +689,8 @@ impl InvariantRegistry {
             attacker,
             threshold: U256::from(1u64),
         }));
-        reg.add(Box::new(UnexpectedRevert));
-        reg.add(Box::new(SelfDestructDetector));
+        reg.add(Box::new(UnexpectedRevert::default()));
+        reg.add(Box::new(SelfDestructDetector { attacker }));
         reg.add(Box::new(EchidnaProperty));
         reg.add(Box::new(FlashloanEconomicOracle {
             attacker,
@@ -806,8 +862,11 @@ mod tests {
     }
 
     #[test]
-    fn unexpected_revert_fires_on_failure() {
-        let inv = UnexpectedRevert;
+    fn unexpected_revert_fires_on_high_gas_failure() {
+        // High-gas revert (above threshold) should fire.
+        let inv = UnexpectedRevert {
+            min_gas_threshold: 0, // no threshold for this test
+        };
         let target = Address::repeat_byte(0xCC);
         let result = make_result(false, HashMap::new());
         let seq = dummy_sequence(target);
@@ -818,8 +877,21 @@ mod tests {
     }
 
     #[test]
+    fn unexpected_revert_silent_on_low_gas_failure() {
+        // Default threshold (5000 gas) should suppress low-gas reverts.
+        let inv = UnexpectedRevert::default();
+        let target = Address::repeat_byte(0xCC);
+        let mut result = make_result(false, HashMap::new());
+        result.gas_used = 100; // way below threshold
+
+        let seq = dummy_sequence(target);
+        // Should be None because gas_used < min_gas_threshold
+        assert!(inv.check(&HashMap::new(), &result, &seq).is_none());
+    }
+
+    #[test]
     fn unexpected_revert_silent_on_success() {
-        let inv = UnexpectedRevert;
+        let inv = UnexpectedRevert::default();
         let result = make_result(true, HashMap::new());
         let seq = dummy_sequence(Address::ZERO);
 
@@ -827,19 +899,46 @@ mod tests {
     }
 
     #[test]
-    fn selfdestruct_detects_balance_zeroing() {
-        let inv = SelfDestructDetector;
+    fn selfdestruct_detects_balance_zeroing_with_attacker_profit() {
+        let attacker = Address::repeat_byte(0xAA);
+        let inv = SelfDestructDetector { attacker };
         let contract = Address::repeat_byte(0xDD);
 
+        // Contract loses big balance, attacker gains it.
+        let drain = U256::from(2_000_000_000_000_000u128); // 0.002 ETH
         let mut bc = HashMap::new();
-        bc.insert(contract, (U256::from(5000u64), U256::ZERO));
+        bc.insert(contract, (drain, U256::ZERO));
+        bc.insert(attacker, (U256::ZERO, drain));
 
         let result = make_result(true, bc);
+        let pre = {
+            let mut m = HashMap::new();
+            m.insert(attacker, U256::ZERO);
+            m
+        };
         let seq = dummy_sequence(contract);
 
-        let finding = inv.check(&HashMap::new(), &result, &seq);
+        let finding = inv.check(&pre, &result, &seq);
         assert!(finding.is_some());
         assert_eq!(finding.unwrap().severity, Severity::High);
+    }
+
+    #[test]
+    fn selfdestruct_ignores_dust_drain() {
+        let attacker = Address::repeat_byte(0xAA);
+        let inv = SelfDestructDetector { attacker };
+        let contract = Address::repeat_byte(0xDD);
+
+        // Tiny balance (below threshold) — should not fire.
+        let mut bc = HashMap::new();
+        bc.insert(contract, (U256::from(100u64), U256::ZERO));
+        bc.insert(attacker, (U256::ZERO, U256::from(100u64)));
+
+        let result = make_result(true, bc);
+        let pre = HashMap::new();
+        let seq = dummy_sequence(contract);
+
+        assert!(inv.check(&pre, &result, &seq).is_none());
     }
 
     #[test]

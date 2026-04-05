@@ -293,15 +293,27 @@ impl Campaign {
                 .unwrap_or_else(|| target.deployed_bytecode.clone());
 
             if !deployment_bytecode.is_empty() {
-                let deployed_addr = executor.deploy(attacker, deployment_bytecode)?;
-                deployed_targets.push(ContractInfo {
-                    address: deployed_addr,
-                    deployed_bytecode: target.deployed_bytecode.clone(),
-                    creation_bytecode: target.creation_bytecode.clone(),
-                    name: target.name.clone(),
-                    source_path: target.source_path.clone(),
-                    abi: target.abi.clone(),
-                });
+                // Graceful: a failed deploy (e.g. constructor args, vm.* cheatcodes)
+                // should not abort the whole campaign. Warn and skip the target.
+                match executor.deploy(attacker, deployment_bytecode) {
+                    Ok(deployed_addr) => {
+                        deployed_targets.push(ContractInfo {
+                            address: deployed_addr,
+                            deployed_bytecode: target.deployed_bytecode.clone(),
+                            creation_bytecode: target.creation_bytecode.clone(),
+                            name: target.name.clone(),
+                            source_path: target.source_path.clone(),
+                            abi: target.abi.clone(),
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "[campaign] skipping target {} — deploy failed (constructor args or vm.* cheatcodes): {}",
+                            target.name.as_deref().unwrap_or("?"),
+                            e
+                        );
+                    }
+                }
             } else {
                 // No bytecode — use the config address as-is (pre-deployed).
                 deployed_targets.push(target.clone());
@@ -330,16 +342,38 @@ impl Campaign {
                 abi: harness.abi.clone(),
             });
 
-            crate::harness::run_setup(&mut executor, attacker, deployed_addr).map_err(|e| {
-                anyhow::anyhow!(
-                    "harness setUp failed (sci-fuzz does not implement Forge vm.* cheatcodes): {e}"
-                )
-            })?;
-            eprintln!(
-                "[campaign] ran setUp() on harness {} ({})",
-                harness.name.as_deref().unwrap_or("?"),
-                deployed_addr
-            );
+            // Only call setUp() if the ABI declares it (Echidna-style harnesses don't).
+            let has_setup = harness
+                .abi
+                .as_ref()
+                .is_some_and(|abi| crate::project::abi_has_set_up(abi));
+            if has_setup {
+                match crate::harness::run_setup(&mut executor, attacker, deployed_addr) {
+                    Ok(()) => {
+                        eprintln!(
+                            "[campaign] ran setUp() on harness {} ({})",
+                            harness.name.as_deref().unwrap_or("?"),
+                            deployed_addr
+                        );
+                    }
+                    Err(e) => {
+                        // setUp() reverts are usually vm.* cheatcodes. Warn and continue —
+                        // the constructor already set up base state so fuzzing can proceed.
+                        tracing::warn!(
+                            "[campaign] setUp() failed on harness {} — continuing without it \
+                             (vm.* cheatcodes not supported): {}",
+                            harness.name.as_deref().unwrap_or("?"),
+                            e
+                        );
+                    }
+                }
+            } else {
+                eprintln!(
+                    "[campaign] harness {} ({}) uses constructor-only setup (no setUp())",
+                    harness.name.as_deref().unwrap_or("?"),
+                    deployed_addr
+                );
+            }
         }
 
         // --- JSON ABIs at deployed addresses (shrinker / oracles) ------------
