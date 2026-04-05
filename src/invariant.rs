@@ -8,8 +8,9 @@ use std::collections::HashMap;
 use tiny_keccak::{Hasher, Keccak};
 
 use crate::economic::{
-    Erc20BalanceStorageWithoutTransferOracle, Erc20MintWithoutSupplyWriteOracle,
-    Erc4626EventAnomalyOracle, Erc4626ExchangeRateJumpOracle,
+    Erc20BalanceStorageWithoutTransferOracle, Erc20BurnWithoutSupplyWriteOracle,
+    Erc20MintWithoutSupplyWriteOracle, Erc4626EventAnomalyOracle, Erc4626ExchangeRateJumpOracle,
+    Erc4626SameTransactionDepositRateSpreadOracle, Erc4626WithdrawRateJumpOracle,
 };
 use crate::types::{Address, ExecutionResult, Finding, Severity, Transaction, B256, U256};
 
@@ -422,7 +423,7 @@ impl Invariant for FlashloanEconomicOracle {
         result: &ExecutionResult,
         sequence: &[Transaction],
     ) -> Option<Finding> {
-        use crate::flashloan::{BORROW_SELECTOR, REPAY_SELECTOR, MOCK_FLASHLOAN_POOL};
+        use crate::flashloan::{BORROW_SELECTOR, MOCK_FLASHLOAN_POOL, REPAY_SELECTOR};
 
         // Only fire on sequences that contain a complete flashloan scaffold (borrow AND repay).
         let has_borrow = sequence.iter().any(|tx| {
@@ -459,10 +460,7 @@ impl Invariant for FlashloanEconomicOracle {
             .get(&self.attacker)
             .copied()
             .unwrap_or(U256::ZERO);
-        let &(_old, post) = result
-            .state_diff
-            .balance_changes
-            .get(&self.attacker)?;
+        let &(_old, post) = result.state_diff.balance_changes.get(&self.attacker)?;
 
         if post <= pre {
             return None;
@@ -632,6 +630,11 @@ impl InvariantRegistry {
         reg.add(Box::new(Erc20MintWithoutSupplyWriteOracle::default()));
         reg.add(Box::new(Erc20BalanceStorageWithoutTransferOracle));
         reg.add(Box::new(Erc4626ExchangeRateJumpOracle::default()));
+        reg.add(Box::new(Erc20BurnWithoutSupplyWriteOracle::default()));
+        reg.add(Box::new(Erc4626WithdrawRateJumpOracle::default()));
+        reg.add(Box::new(
+            Erc4626SameTransactionDepositRateSpreadOracle::default(),
+        ));
         reg
     }
 
@@ -789,8 +792,9 @@ mod tests {
         let reg = InvariantRegistry::with_defaults(Address::ZERO);
         // BalanceIncrease, UnexpectedRevert, SelfDestructDetector, EchidnaProperty,
         // FlashloanEconomicOracle, Erc4626EventAnomaly, Erc20MintWithoutSupplyWrite,
-        // Erc20BalanceStorageWithoutTransfer, Erc4626ExchangeRateJump
-        assert_eq!(reg.len(), 9);
+        // Erc20BalanceStorageWithoutTransfer, Erc4626ExchangeRateJump,
+        // Erc20BurnWithoutSupplyWrite, Erc4626WithdrawRateJump, Erc4626SameTransactionDepositRateSpread
+        assert_eq!(reg.len(), 12);
         assert!(!reg.is_empty());
     }
 
@@ -974,8 +978,8 @@ mod tests {
         let attacker = Address::repeat_byte(0x99);
         let tokens = vec![Address::repeat_byte(0xA1), Address::repeat_byte(0xA2)];
         let reg = InvariantRegistry::with_erc20(attacker, &tokens);
-        // 9 defaults + 2 ERC20Supply invariants
-        assert_eq!(reg.len(), 11);
+        // 12 defaults + 2 ERC20Supply invariants
+        assert_eq!(reg.len(), 14);
     }
 
     // -- EchidnaPropertyCaller tests ------------------------------------------

@@ -48,9 +48,10 @@ pub mod shrinker;
 
 pub mod economic;
 pub use economic::{
-    Erc20BalanceStorageWithoutTransferOracle, Erc20MintWithoutSupplyWriteOracle,
-    Erc4626EventAnomalyOracle, Erc4626ExchangeRateJumpOracle, PairwiseStorageDriftOracle,
-    OZ_ERC20_TOTAL_SUPPLY_SLOT, MIN_LARGE_TOKEN_MOVE,
+    Erc20BalanceStorageWithoutTransferOracle, Erc20BurnWithoutSupplyWriteOracle,
+    Erc20MintWithoutSupplyWriteOracle, Erc4626EventAnomalyOracle, Erc4626ExchangeRateJumpOracle,
+    Erc4626SameTransactionDepositRateSpreadOracle, Erc4626WithdrawRateJumpOracle,
+    PairwiseStorageDriftOracle, MIN_LARGE_TOKEN_MOVE, OZ_ERC20_TOTAL_SUPPLY_SLOT,
 };
 pub mod invariant;
 pub mod oracle;
@@ -90,11 +91,11 @@ pub use campaign::Campaign;
 pub use campaign::{CampaignFindingRecord, CampaignReport};
 pub use error::{Error, Result};
 pub use evm::EvmExecutor;
+pub use project::{abi_has_echidna_property, abi_has_set_up, FuzzBootstrap};
 pub use scoreboard::{
     BenchmarkEngine, BenchmarkStatus, MultiSeedSummary, Scoreboard, ScorecardEntry,
 };
 pub use shrinker::SequenceShrinker;
-pub use project::{abi_has_echidna_property, abi_has_set_up, FuzzBootstrap};
 pub use types::{
     contract_info_for_mutator, strip_abi_functions_named, Address, Bytes, CampaignConfig,
     ContractInfo, CoverageMap, ExecutionResult, Finding, Log, Severity, StateDiff, StateSnapshot,

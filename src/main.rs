@@ -5,8 +5,8 @@
 use std::process;
 
 use anyhow::{Context, Result};
-use sci_fuzz::types::{Address, Bytes, CampaignConfig, ContractInfo, ExecutorMode};
 use sci_fuzz::campaign::Campaign;
+use sci_fuzz::types::{Address, Bytes, CampaignConfig, ContractInfo, ExecutorMode};
 
 #[cfg(feature = "cli")]
 use clap::Parser;
@@ -158,10 +158,7 @@ fn handle_forge(args: sci_fuzz::cli::ForgeArgs) -> Result<()> {
         "selected {} runtime fuzz target(s){}",
         bootstrap.runtime_targets.len(),
         if let Some(ref h) = bootstrap.harness {
-            format!(
-                " + harness {}",
-                h.name.as_deref().unwrap_or("(unnamed)")
-            )
+            format!(" + harness {}", h.name.as_deref().unwrap_or("(unnamed)"))
         } else {
             String::new()
         }
@@ -245,7 +242,7 @@ fn handle_audit(args: sci_fuzz::cli::AuditArgs) -> Result<()> {
         println!("  ⚠️  No RPC URL provided. Set ETH_RPC_URL or pass --rpc-url.");
     }
     let target_address: Address = args.address.parse().context("Invalid address format")?;
-    
+
     // Resolve Etherscan API key from CLI flag → env var.
     let api_key = args
         .etherscan_key
@@ -256,7 +253,10 @@ fn handle_audit(args: sci_fuzz::cli::AuditArgs) -> Result<()> {
     let mut abi_val = None;
     if !api_key.is_empty() {
         println!();
-        println!("  🔍 Fetching ABI from Etherscan for {} ({})…", args.address, args.chain);
+        println!(
+            "  🔍 Fetching ABI from Etherscan for {} ({})…",
+            args.address, args.chain
+        );
         match sci_fuzz::rpc::fetch_etherscan_abi(&args.address, &args.chain, &api_key) {
             Ok(abi) => {
                 println!("  ✅ ABI retrieved successfully!");
@@ -297,7 +297,10 @@ fn handle_audit(args: sci_fuzz::cli::AuditArgs) -> Result<()> {
     println!("   Mode      : {:?}", config.mode);
     println!("   Timeout   : {}s", args.timeout);
     if args.flashloan {
-        println!("   Flashloan : Enabled (Mock Pool 0x{})", hex::encode(sci_fuzz::flashloan::MOCK_FLASHLOAN_POOL.as_slice()));
+        println!(
+            "   Flashloan : Enabled (Mock Pool 0x{})",
+            hex::encode(sci_fuzz::flashloan::MOCK_FLASHLOAN_POOL.as_slice())
+        );
     }
     println!();
 
@@ -317,7 +320,7 @@ fn handle_audit(args: sci_fuzz::cli::AuditArgs) -> Result<()> {
             }
             println!();
         }
-        
+
         if let Some(out_dir) = args.output {
             std::fs::create_dir_all(&out_dir)?;
             for f in findings {

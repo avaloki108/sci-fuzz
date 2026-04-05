@@ -57,7 +57,10 @@ pub struct ContractInfo {
 /// (e.g. `setUp`) so the mutator does not generate setup calls mid-campaign.
 /// Other uses (e.g. `echidna_*` discovery) should keep the original [`ContractInfo::abi`].
 pub fn contract_info_for_mutator(contract: &ContractInfo, strip_names: &[&str]) -> ContractInfo {
-    let abi = contract.abi.as_ref().and_then(|a| strip_abi_functions_named(a, strip_names));
+    let abi = contract
+        .abi
+        .as_ref()
+        .and_then(|a| strip_abi_functions_named(a, strip_names));
     ContractInfo {
         address: contract.address,
         deployed_bytecode: contract.deployed_bytecode.clone(),
@@ -70,7 +73,10 @@ pub fn contract_info_for_mutator(contract: &ContractInfo, strip_names: &[&str]) 
 
 /// Return a copy of a JSON ABI array with `function` entries whose `name` is
 /// in `strip_names` removed.
-pub fn strip_abi_functions_named(abi: &serde_json::Value, strip_names: &[&str]) -> Option<serde_json::Value> {
+pub fn strip_abi_functions_named(
+    abi: &serde_json::Value,
+    strip_names: &[&str],
+) -> Option<serde_json::Value> {
     let arr = abi.as_array()?;
     let filtered: Vec<serde_json::Value> = arr
         .iter()
@@ -291,12 +297,23 @@ impl CoverageMap {
     }
 
     /// Record `count` hits for a single `(prev_pc, current_pc)` pair.
-    pub fn record_hitcount(&mut self, address: Address, prev_pc: usize, current_pc: usize, count: u32) {
+    pub fn record_hitcount(
+        &mut self,
+        address: Address,
+        prev_pc: usize,
+        current_pc: usize,
+        count: u32,
+    ) {
         if count == 0 {
             return;
         }
 
-        let entry = self.map.entry(address).or_default().entry((prev_pc, current_pc)).or_insert(0);
+        let entry = self
+            .map
+            .entry(address)
+            .or_default()
+            .entry((prev_pc, current_pc))
+            .or_insert(0);
         *entry = entry.saturating_add(count);
     }
 
@@ -576,6 +593,18 @@ impl Finding {
         if title.starts_with("Economic: lending debt exceeds collateral") {
             return "economic-lending-pairwise-drift".into();
         }
+        if title.starts_with("Economic: ERC-20 large burn without totalSupply") {
+            return "economic-erc20-burn-no-supply".into();
+        }
+        if title.starts_with("Economic: ERC-4626 withdraw exchange rate jump") {
+            return "economic-erc4626-withdraw-rate-jump".into();
+        }
+        if title.starts_with("Economic: ERC-4626 withdraw exchange rate plunge") {
+            return "economic-erc4626-withdraw-rate-plunge".into();
+        }
+        if title.starts_with("Economic: ERC-4626 same-tx Deposit rate spread") {
+            return "economic-erc4626-same-tx-deposit-spread".into();
+        }
 
         title.to_string()
     }
@@ -784,5 +813,18 @@ mod tests {
 
         assert!(a.same_root_cause_as(&b));
         assert_eq!(a.failure_id(), b.failure_id());
+    }
+
+    #[test]
+    fn finding_failure_class_maps_economic_oracle_titles() {
+        let f = Finding {
+            severity: Severity::High,
+            title: "Economic: ERC-20 large burn without totalSupply storage update (0x0000000000000000000000000000000000000001)".into(),
+            description: String::new(),
+            contract: Address::ZERO,
+            reproducer: vec![],
+            exploit_profit: None,
+        };
+        assert_eq!(f.failure_class(), "economic-erc20-burn-no-supply");
     }
 }

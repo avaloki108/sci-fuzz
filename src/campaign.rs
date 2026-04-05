@@ -450,7 +450,8 @@ impl Campaign {
             // the Global Economic Oracle to catch logic flaws.
             let wrap_flashloan = rng.gen_bool(0.05);
             let final_sequence = if wrap_flashloan {
-                let flashloan_mutator = crate::flashloan::FlashloanMutator::new(&mutator, &mutator.dict);
+                let flashloan_mutator =
+                    crate::flashloan::FlashloanMutator::new(&mutator, &mutator.dict);
                 flashloan_mutator.wrap_sequence(raw_sequence, &mut rng)
             } else {
                 raw_sequence
@@ -1136,7 +1137,7 @@ fn reproduces_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{CampaignConfig, Severity, ExecutorMode};
+    use crate::types::{CampaignConfig, ExecutorMode, Severity};
     use std::time::Duration;
 
     #[test]

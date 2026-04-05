@@ -301,10 +301,7 @@ impl Project {
                 .as_ref()
                 .map(|a| abi_has_echidna_property(a))
                 .unwrap_or(false);
-            (
-                !prefers_echidna,
-                harness_sort_key(c),
-            )
+            (!prefers_echidna, harness_sort_key(c))
         });
 
         let harness = harness_candidates.into_iter().next();

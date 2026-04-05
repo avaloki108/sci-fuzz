@@ -212,7 +212,7 @@ impl SequenceShrinker {
             .find(|f| f.selector().as_slice() == selector)?;
 
         let decoded = function.abi_decode_input(&data[4..], true).ok()?;
-        
+
         for p_idx in 0..decoded.len() {
             let mut params = decoded.clone();
             for simplified_param in self.shrink_dyn_sol_value(&decoded[p_idx]) {

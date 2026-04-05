@@ -7,9 +7,7 @@ use std::time::Duration;
 use sci_fuzz::evm::EvmExecutor;
 use sci_fuzz::harness;
 use sci_fuzz::invariant::EchidnaPropertyCaller;
-use sci_fuzz::project::{
-    abi_has_echidna_property, abi_has_set_up, Project,
-};
+use sci_fuzz::project::{abi_has_echidna_property, abi_has_set_up, Project};
 use sci_fuzz::types::{Address, CampaignConfig, ContractInfo, ExecutorMode, U256};
 
 const FIXTURE_ROOT: &str = "tests/fixtures/harness_project";
@@ -20,7 +18,9 @@ fn load_fixture_bootstrap() -> sci_fuzz::FuzzBootstrap {
     project
         .load_artifacts_from_out()
         .expect("load fixture artifacts");
-    project.prepare_fuzz_bootstrap().expect("prepare_fuzz_bootstrap")
+    project
+        .prepare_fuzz_bootstrap()
+        .expect("prepare_fuzz_bootstrap")
 }
 
 #[test]
@@ -48,7 +48,10 @@ fn fixture_classifies_runtime_vs_harness() {
     assert_eq!(b.runtime_targets.len(), 1);
     assert_eq!(b.runtime_targets[0].name.as_deref(), Some("RuntimeStub"));
     let sp = b.runtime_targets[0].source_path.as_deref();
-    assert!(sp.unwrap().contains("src/"), "runtime should be under src/: {sp:?}");
+    assert!(
+        sp.unwrap().contains("src/"),
+        "runtime should be under src/: {sp:?}"
+    );
 
     let h = b.harness.as_ref().expect("harness");
     assert_eq!(h.name.as_deref(), Some("HarnessWithSetup"));

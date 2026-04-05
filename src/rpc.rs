@@ -25,7 +25,6 @@ use revm::{
 };
 use serde::Deserialize;
 
-
 // ---------------------------------------------------------------------------
 // Etherscan helpers
 // ---------------------------------------------------------------------------
@@ -37,15 +36,9 @@ use serde::Deserialize;
 ///
 /// Requires a valid `ETHERSCAN_API_KEY` (or equivalent) in the environment,
 /// but also accepts an explicit `api_key` argument.
-pub fn fetch_etherscan_abi(
-    address: &str,
-    chain: &str,
-    api_key: &str,
-) -> Result<serde_json::Value> {
+pub fn fetch_etherscan_abi(address: &str, chain: &str, api_key: &str) -> Result<serde_json::Value> {
     let base = etherscan_api_base(chain);
-    let url = format!(
-        "{base}?module=contract&action=getabi&address={address}&apikey={api_key}"
-    );
+    let url = format!("{base}?module=contract&action=getabi&address={address}&apikey={api_key}");
 
     let resp: EtherscanResponse = ureq::get(&url)
         .call()
@@ -77,11 +70,11 @@ struct EtherscanResponse {
 fn etherscan_api_base(chain: &str) -> &'static str {
     match chain.to_lowercase().as_str() {
         "mainnet" | "ethereum" => "https://api.etherscan.io/api",
-        "polygon"              => "https://api.polygonscan.com/api",
-        "arbitrum" | "arb"    => "https://api.arbiscan.io/api",
-        "optimism" | "op"     => "https://api-optimistic.etherscan.io/api",
-        "base"                => "https://api.basescan.org/api",
-        _                     => "https://api.etherscan.io/api",
+        "polygon" => "https://api.polygonscan.com/api",
+        "arbitrum" | "arb" => "https://api.arbiscan.io/api",
+        "optimism" | "op" => "https://api-optimistic.etherscan.io/api",
+        "base" => "https://api.basescan.org/api",
+        _ => "https://api.etherscan.io/api",
     }
 }
 
@@ -110,8 +103,8 @@ struct RpcError {
     message: String,
 }
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 /// A `revm` database that forks on-chain state on first access.
 ///
@@ -148,14 +141,19 @@ impl RpcCacheDB {
     fn block_param(&self) -> serde_json::Value {
         match self.block {
             Some(n) => serde_json::Value::String(format!("0x{n:x}")),
-            None    => serde_json::Value::String("latest".to_string()),
+            None => serde_json::Value::String("latest".to_string()),
         }
     }
 
     fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
         let id = self.req_id.fetch_add(1, Ordering::SeqCst);
 
-        let body = RpcRequest { jsonrpc: "2.0", id, method, params };
+        let body = RpcRequest {
+            jsonrpc: "2.0",
+            id,
+            method,
+            params,
+        };
         let resp: RpcResponse = ureq::post(&self.url)
             .set("Content-Type", "application/json")
             .send_json(serde_json::to_value(&body)?)
@@ -167,7 +165,8 @@ impl RpcCacheDB {
             return Err(anyhow!("JSON-RPC error: {}", err.message));
         }
 
-        resp.result.ok_or_else(|| anyhow!("JSON-RPC returned null result for {method}"))
+        resp.result
+            .ok_or_else(|| anyhow!("JSON-RPC returned null result for {method}"))
     }
 
     fn fetch_account(&self, addr: RevmAddress) -> Result<AccountInfo> {
@@ -176,21 +175,26 @@ impl RpcCacheDB {
 
         // eth_getBalance
         let bal_hex = self
-            .call("eth_getBalance", serde_json::json!([&addr_str, block.clone()]))?
+            .call(
+                "eth_getBalance",
+                serde_json::json!([&addr_str, block.clone()]),
+            )?
             .as_str()
             .ok_or_else(|| anyhow!("bad balance"))?
             .to_string();
-        let balance = RevmU256::from_str(&bal_hex)
-            .context("parse balance")?;
+        let balance = RevmU256::from_str(&bal_hex).context("parse balance")?;
 
         // eth_getTransactionCount (nonce)
         let nonce_hex = self
-            .call("eth_getTransactionCount", serde_json::json!([&addr_str, block.clone()]))?
+            .call(
+                "eth_getTransactionCount",
+                serde_json::json!([&addr_str, block.clone()]),
+            )?
             .as_str()
             .ok_or_else(|| anyhow!("bad nonce"))?
             .to_string();
-        let nonce = u64::from_str_radix(nonce_hex.trim_start_matches("0x"), 16)
-            .context("parse nonce")?;
+        let nonce =
+            u64::from_str_radix(nonce_hex.trim_start_matches("0x"), 16).context("parse nonce")?;
 
         // eth_getCode
         let code_hex = self
@@ -198,8 +202,7 @@ impl RpcCacheDB {
             .as_str()
             .ok_or_else(|| anyhow!("bad code"))?
             .to_string();
-        let code_bytes = hex::decode(code_hex.trim_start_matches("0x"))
-            .context("decode code")?;
+        let code_bytes = hex::decode(code_hex.trim_start_matches("0x")).context("decode code")?;
         let code = if code_bytes.is_empty() {
             None
         } else {
@@ -209,19 +212,25 @@ impl RpcCacheDB {
         Ok(AccountInfo {
             balance,
             nonce,
-            code_hash: code.as_ref().map(|c| c.hash_slow()).unwrap_or(revm::primitives::KECCAK_EMPTY),
+            code_hash: code
+                .as_ref()
+                .map(|c| c.hash_slow())
+                .unwrap_or(revm::primitives::KECCAK_EMPTY),
             code,
         })
     }
 
     fn fetch_storage(&self, addr: RevmAddress, index: RevmU256) -> Result<RevmU256> {
-        let addr_str   = format!("0x{}", hex::encode(addr.as_slice()));
+        let addr_str = format!("0x{}", hex::encode(addr.as_slice()));
         let slot_bytes = index.to_be_bytes::<32>();
-        let slot_str   = format!("0x{}", hex::encode(&slot_bytes));
-        let block      = self.block_param();
+        let slot_str = format!("0x{}", hex::encode(&slot_bytes));
+        let block = self.block_param();
 
         let val = self
-            .call("eth_getStorageAt", serde_json::json!([addr_str, slot_str, block]))?
+            .call(
+                "eth_getStorageAt",
+                serde_json::json!([addr_str, slot_str, block]),
+            )?
             .as_str()
             .ok_or_else(|| anyhow!("bad storage value"))?
             .to_string();
@@ -306,28 +315,36 @@ impl DatabaseRef for FuzzerDatabase {
 
     fn basic_ref(&self, address: RevmAddress) -> Result<Option<AccountInfo>, Self::Error> {
         match self {
-            Self::Empty(db) => Ok(db.basic_ref(address).map_err(|_| anyhow!("EmptyDB error"))?),
+            Self::Empty(db) => Ok(db
+                .basic_ref(address)
+                .map_err(|_| anyhow!("EmptyDB error"))?),
             Self::Rpc(db) => db.basic_ref(address),
         }
     }
 
     fn code_by_hash_ref(&self, code_hash: RevmB256) -> Result<Bytecode, Self::Error> {
         match self {
-            Self::Empty(db) => Ok(db.code_by_hash_ref(code_hash).map_err(|_| anyhow!("EmptyDB error"))?),
+            Self::Empty(db) => Ok(db
+                .code_by_hash_ref(code_hash)
+                .map_err(|_| anyhow!("EmptyDB error"))?),
             Self::Rpc(db) => db.code_by_hash_ref(code_hash),
         }
     }
 
     fn storage_ref(&self, address: RevmAddress, index: RevmU256) -> Result<RevmU256, Self::Error> {
         match self {
-            Self::Empty(db) => Ok(db.storage_ref(address, index).map_err(|_| anyhow!("EmptyDB error"))?),
+            Self::Empty(db) => Ok(db
+                .storage_ref(address, index)
+                .map_err(|_| anyhow!("EmptyDB error"))?),
             Self::Rpc(db) => db.storage_ref(address, index),
         }
     }
 
     fn block_hash_ref(&self, number: u64) -> Result<RevmB256, Self::Error> {
         match self {
-            Self::Empty(db) => Ok(db.block_hash_ref(number).map_err(|_| anyhow!("EmptyDB error"))?),
+            Self::Empty(db) => Ok(db
+                .block_hash_ref(number)
+                .map_err(|_| anyhow!("EmptyDB error"))?),
             Self::Rpc(db) => db.block_hash_ref(number),
         }
     }
@@ -363,9 +380,15 @@ mod tests {
 
     #[test]
     fn etherscan_base_url_mainnet() {
-        assert_eq!(etherscan_api_base("mainnet"), "https://api.etherscan.io/api");
-        assert_eq!(etherscan_api_base("polygon"), "https://api.polygonscan.com/api");
-        assert_eq!(etherscan_api_base("base"),    "https://api.basescan.org/api");
+        assert_eq!(
+            etherscan_api_base("mainnet"),
+            "https://api.etherscan.io/api"
+        );
+        assert_eq!(
+            etherscan_api_base("polygon"),
+            "https://api.polygonscan.com/api"
+        );
+        assert_eq!(etherscan_api_base("base"), "https://api.basescan.org/api");
     }
 
     #[test]

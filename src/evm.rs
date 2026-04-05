@@ -20,10 +20,10 @@ use revm::{
     Database, DatabaseCommit, DatabaseRef, Evm, EvmContext, Inspector,
 };
 
-use crate::types::{
-    Address, Bytes, CoverageMap, ExecutorMode, ExecutionResult, Log, StateDiff, Transaction, U256,
-};
 use crate::rpc::FuzzerDatabase;
+use crate::types::{
+    Address, Bytes, CoverageMap, ExecutionResult, ExecutorMode, Log, StateDiff, Transaction, U256,
+};
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
@@ -181,7 +181,8 @@ impl EvmExecutor {
         self.db.commit(state.clone());
 
         // Convert the revm result into our own type.
-        let exec_result = self.convert_result(&result, &state, &pre_balances, coverage, dataflow)?;
+        let exec_result =
+            self.convert_result(&result, &state, &pre_balances, coverage, dataflow)?;
         Ok(exec_result)
     }
 
