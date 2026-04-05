@@ -46,6 +46,12 @@ pub mod shrinker;
 
 // ── Invariant / oracle system ───────────────────────────────────────────
 
+pub mod economic;
+pub use economic::{
+    Erc20BalanceStorageWithoutTransferOracle, Erc20MintWithoutSupplyWriteOracle,
+    Erc4626EventAnomalyOracle, Erc4626ExchangeRateJumpOracle, PairwiseStorageDriftOracle,
+    OZ_ERC20_TOTAL_SUPPLY_SLOT, MIN_LARGE_TOKEN_MOVE,
+};
 pub mod invariant;
 pub mod oracle;
 

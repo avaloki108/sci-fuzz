@@ -131,6 +131,7 @@ fn real_target_prop_false_found() {
 
         let seq_len: usize = rng.gen_range(1..=4);
         let mut sequence: Vec<Transaction> = Vec::new();
+        let mut cumulative_logs: Vec<sci_fuzz::types::Log> = Vec::new();
 
         for _ in 0..seq_len {
             let tx = if sequence.is_empty() || rng.gen_bool(0.3) {
@@ -140,7 +141,9 @@ fn real_target_prop_false_found() {
             };
 
             match executor.execute(&tx) {
-                Ok(result) => {
+                Ok(mut result) => {
+                    cumulative_logs.extend(result.logs.iter().cloned());
+                    result.sequence_cumulative_logs = cumulative_logs.clone();
                     total_execs += 1;
 
                     // Check built-in invariants.

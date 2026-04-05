@@ -7,6 +7,10 @@ use std::collections::HashMap;
 
 use tiny_keccak::{Hasher, Keccak};
 
+use crate::economic::{
+    Erc20BalanceStorageWithoutTransferOracle, Erc20MintWithoutSupplyWriteOracle,
+    Erc4626EventAnomalyOracle, Erc4626ExchangeRateJumpOracle,
+};
 use crate::types::{Address, ExecutionResult, Finding, Severity, Transaction, B256, U256};
 
 // ---------------------------------------------------------------------------
@@ -624,6 +628,10 @@ impl InvariantRegistry {
             // Only fire when profit > 1 wei after accounting for the fee.
             min_profit: U256::from(1u64),
         }));
+        reg.add(Box::new(Erc4626EventAnomalyOracle));
+        reg.add(Box::new(Erc20MintWithoutSupplyWriteOracle::default()));
+        reg.add(Box::new(Erc20BalanceStorageWithoutTransferOracle));
+        reg.add(Box::new(Erc4626ExchangeRateJumpOracle::default()));
         reg
     }
 
@@ -681,6 +689,7 @@ mod tests {
                 storage_writes: HashMap::new(),
                 balance_changes,
             },
+            sequence_cumulative_logs: Vec::new(),
         }
     }
 
@@ -776,11 +785,12 @@ mod tests {
     }
 
     #[test]
-    fn registry_with_defaults_has_four() {
+    fn registry_with_defaults_has_expected_count() {
         let reg = InvariantRegistry::with_defaults(Address::ZERO);
-        // 5 defaults: BalanceIncrease, UnexpectedRevert, SelfDestructDetector,
-        //              EchidnaProperty, FlashloanEconomicOracle
-        assert_eq!(reg.len(), 5);
+        // BalanceIncrease, UnexpectedRevert, SelfDestructDetector, EchidnaProperty,
+        // FlashloanEconomicOracle, Erc4626EventAnomaly, Erc20MintWithoutSupplyWrite,
+        // Erc20BalanceStorageWithoutTransfer, Erc4626ExchangeRateJump
+        assert_eq!(reg.len(), 9);
         assert!(!reg.is_empty());
     }
 
@@ -825,6 +835,7 @@ mod tests {
                 storage_writes: HashMap::new(),
                 balance_changes: HashMap::new(),
             },
+            sequence_cumulative_logs: Vec::new(),
         }
     }
 
@@ -963,8 +974,8 @@ mod tests {
         let attacker = Address::repeat_byte(0x99);
         let tokens = vec![Address::repeat_byte(0xA1), Address::repeat_byte(0xA2)];
         let reg = InvariantRegistry::with_erc20(attacker, &tokens);
-        // 5 defaults + 2 token invariants
-        assert_eq!(reg.len(), 7);
+        // 9 defaults + 2 ERC20Supply invariants
+        assert_eq!(reg.len(), 11);
     }
 
     // -- EchidnaPropertyCaller tests ------------------------------------------

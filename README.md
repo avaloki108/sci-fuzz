@@ -21,7 +21,10 @@ The name stands for **S**mart **C**ontract **I**nvariant **Fuzz**er. The thesis 
 - **Calibration phase** — runs seed transactions before the main loop to establish coverage baselines and populate the value dictionary
 - **ABI-aware mutation** — extracts function selectors from ABI JSON, generates typed arguments (uint256, address, bool, bytes32), mutates with bit-flip, byte-replace, selector-swap, value-change, sender-swap
 - **Value dictionary** — seeded from EVM bytecode (PUSH1–PUSH32 operand extraction) and grown from execution results (return data, log topics, storage writes)
-- **5 invariant checkers**: BalanceIncrease, UnexpectedRevert, SelfDestruct, EchidnaProperty (log-based assertion detection), ERC20Supply (mint/burn monitoring)
+- **Core invariant checkers** (always registered): BalanceIncrease, UnexpectedRevert, SelfDestruct, EchidnaProperty (log-based assertion detection), FlashloanEconomicOracle (profit after mock flashloan scaffold)
+- **Exploit-grade economic oracles** ([`economic.rs`](src/economic.rs)): ERC-4626 impossible `Deposit`/`Withdraw` tuples, large ERC-20 mint without an OpenZeppelin-style `_totalSupply` storage write (slot 2 heuristic), ERC-20 balance mapping writes with no `Transfer` in the same tx (callback / direct-write signal), ERC-4626 exchange-rate jumps between consecutive `Deposit` events (uses **sequence-cumulative logs**), plus optional [`PairwiseStorageDriftOracle`](src/economic.rs) for lending-style debt-vs-collateral slot heuristics when wired manually. Helps vaults, AMMs, lending pools, and bridges only insofar as logs and storage diffs expose the modeled patterns — **not** full protocol semantics.
+- **Sequence-cumulative logs** — the campaign and shrink replay attach all logs from the current transaction sequence to [`ExecutionResult::sequence_cumulative_logs`](src/types.rs) so oracles can reason about multi-step event history without wrapping external fuzzers.
+- **ERC20Supply** (optional via `InvariantRegistry::with_erc20`) — large mint/burn monitoring (legacy heuristic, separate from supply-vs-storage reconciliation above)
 - **Real Echidna property calling** — `EchidnaPropertyCaller` discovers `echidna_*` functions from ABI, calls them via `static_call` after each sequence, checks bool returns. This is the actual Echidna workflow, not just log watching.
 - **Deterministic sequence shrinking** — findings are replayed from the same pre-sequence snapshot and reduced by prefix/suffix elimination, whole-tx removal, calldata-word reduction, `msg.value` reduction, and sender simplification
 - **Foundry artifact ingestion** — `sci-fuzz forge --project /path/to/project` runs `forge build`, parses standard `out/` artifacts, extracts ABI plus creation/runtime bytecode, and hands selected contracts to the existing campaign
@@ -43,6 +46,7 @@ Honesty matters more than marketing. These are real gaps:
 - **No on-chain forking.** The `audit` subcommand exists in the CLI but is not implemented.
 - **Partial Echidna compatibility.** `EchidnaPropertyCaller` implements the core workflow (discover echidna_* functions, call them, check bool return). `EchidnaProperty` detects assertion events in logs. Neither handles revert/assert distinction with full Echidna fidelity, and the property-harness workflow (targetContract, configurable test limits, shrinking) is not implemented.
 - **No Foundry fork-mode fuzzing.** Forked RPC state exists for the audit path only; project-mode fuzzing does not mirror Foundry’s forked test execution.
+- **Economic oracles are heuristic.** Storage slot layouts (ERC-20 `totalSupply` at slot 2, balances at mapping slot 0) match common OpenZeppelin layouts but break on proxies, diamonds, and custom storage. Expect false positives on exotic tokens and false negatives when bugs hide behind unmodeled semantics. There is still no deep per-protocol classification or ABI-driven slot discovery in the default campaign.
 - **The 207k execs/sec number is a smoke test.** It measures empty-target throughput. Real contracts with storage and complex logic will run at 1–5k execs/sec. The number demonstrates low framework overhead, not security-testing strength.
 
 ## Architecture
@@ -54,9 +58,10 @@ evm.rs         revm 19.7 wrapper: execute, deploy, static_call, snapshot/restore
 snapshot.rs    state corpus: novelty-weighted selection, power scheduling metadata, auto-pruning over real coverage
 feedback.rs    AFL++ hitcount bucketing (8 classes), virgin-bits tracking, real-hitcount ingestion
 mutator.rs     ABI-aware generation, 5 mutation strategies, value dictionary, bytecode constant extraction
-invariant.rs   Invariant trait + 5 built-in checkers + EchidnaPropertyCaller
+economic.rs    exploit-oriented economic invariants (ERC-4626, ERC-20 accounting, optional lending drift)
+invariant.rs   Invariant trait + default registry + EchidnaPropertyCaller
 oracle.rs      routes execution results through invariant registry
-types.rs       core types built on alloy-primitives (Address, U256, B256)
+types.rs       core types built on alloy-primitives (Address, U256, B256); ExecutionResult includes sequence_cumulative_logs
 scoreboard.rs  stable benchmark result / summary schema + CSV / JSON writers
 benchmark.rs   benchmark case loading, sci-fuzz measurement, comparison scaffolding
 cli.rs         clap-based CLI: benchmark, forge, audit, test, ci, diff, version

@@ -460,12 +460,16 @@ impl Campaign {
             let db_snapshot = executor.snapshot();
             let mut reached_exec_budget = false;
             let mut sequence: Vec<Transaction> = Vec::with_capacity(final_sequence.len());
+            let mut cumulative_logs: Vec<crate::types::Log> = Vec::new();
 
             for tx in final_sequence {
-                let result = match executor.execute(&tx) {
+                let mut result = match executor.execute(&tx) {
                     Ok(r) => r,
                     Err(_) => continue,
                 };
+
+                cumulative_logs.extend(result.logs.iter().cloned());
+                result.sequence_cumulative_logs = cumulative_logs.clone();
 
                 total_execs += 1;
                 sequence.push(tx.clone());
@@ -882,6 +886,7 @@ fn parallel_worker_loop(
         let db_snapshot = executor.snapshot();
         let mut reached_exec_budget = false;
         let mut sequence: Vec<Transaction> = Vec::with_capacity(final_sequence.len());
+        let mut cumulative_logs: Vec<crate::types::Log> = Vec::new();
 
         for tx in final_sequence {
             if campaign_start.elapsed() >= config.timeout {
@@ -895,10 +900,13 @@ fn parallel_worker_loop(
                 }
             }
 
-            let result = match executor.execute(&tx) {
+            let mut result = match executor.execute(&tx) {
                 Ok(r) => r,
                 Err(_) => continue,
             };
+
+            cumulative_logs.extend(result.logs.iter().cloned());
+            result.sequence_cumulative_logs = cumulative_logs.clone();
 
             sequence.push(tx.clone());
             total_execs.fetch_add(1, Ordering::Relaxed);
@@ -1092,11 +1100,15 @@ fn reproduces_failure(
     executor.restore(base_snapshot.clone());
 
     let mut executed: Vec<Transaction> = Vec::with_capacity(sequence.len());
+    let mut cumulative_logs: Vec<crate::types::Log> = Vec::new();
     for tx in sequence {
-        let result = match executor.execute(tx) {
+        let mut result = match executor.execute(tx) {
             Ok(result) => result,
             Err(_) => return false,
         };
+
+        cumulative_logs.extend(result.logs.iter().cloned());
+        result.sequence_cumulative_logs = cumulative_logs.clone();
 
         executed.push(tx.clone());
 

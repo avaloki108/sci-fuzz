@@ -134,6 +134,11 @@ pub struct ExecutionResult {
     pub dataflow: DataflowWaypoints,
     /// Storage & balance mutations caused by this execution.
     pub state_diff: StateDiff,
+    /// Logs from all transactions in the current fuzz sequence up to and
+    /// including this execution. Populated by the campaign loop and shrink
+    /// replay; the EVM executor leaves this empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sequence_cumulative_logs: Vec<Log>,
 }
 
 impl Default for ExecutionResult {
@@ -146,6 +151,7 @@ impl Default for ExecutionResult {
             coverage: CoverageMap::new(),
             dataflow: DataflowWaypoints::new(),
             state_diff: StateDiff::default(),
+            sequence_cumulative_logs: Vec::new(),
         }
     }
 }
@@ -548,6 +554,27 @@ impl Finding {
         }
         if title.starts_with("Large token burn at ") {
             return "erc20-large-burn".into();
+        }
+        if title.starts_with("Economic: ERC-4626 impossible Deposit") {
+            return "economic-erc4626-impossible-deposit".into();
+        }
+        if title.starts_with("Economic: ERC-4626 impossible Withdraw") {
+            return "economic-erc4626-impossible-withdraw".into();
+        }
+        if title.starts_with("Economic: ERC-20 large mint without totalSupply") {
+            return "economic-erc20-mint-no-supply".into();
+        }
+        if title.starts_with("Economic: ERC-20 balance storage write without Transfer") {
+            return "economic-erc20-balance-no-transfer".into();
+        }
+        if title.starts_with("Economic: ERC-4626 exchange rate jump") {
+            return "economic-erc4626-rate-jump".into();
+        }
+        if title.starts_with("Economic: ERC-4626 exchange rate plunge") {
+            return "economic-erc4626-rate-plunge".into();
+        }
+        if title.starts_with("Economic: lending debt exceeds collateral") {
+            return "economic-lending-pairwise-drift".into();
         }
 
         title.to_string()

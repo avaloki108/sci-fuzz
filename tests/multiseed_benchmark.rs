@@ -154,6 +154,7 @@ impl BenchmarkHarness {
             let db_snap = self.executor.snapshot();
             let seq_len = self.rng.gen_range(1..=max_depth as usize);
             let mut sequence: Vec<Transaction> = Vec::new();
+            let mut cumulative_logs: Vec<sci_fuzz::types::Log> = Vec::new();
 
             for _ in 0..seq_len {
                 let prev_sender = sequence.last().map(|t| t.sender);
@@ -162,7 +163,9 @@ impl BenchmarkHarness {
                     .generate_in_sequence(prev_sender, &mut self.rng);
 
                 match self.executor.execute(&tx) {
-                    Ok(result) => {
+                    Ok(mut result) => {
+                        cumulative_logs.extend(result.logs.iter().cloned());
+                        result.sequence_cumulative_logs = cumulative_logs.clone();
                         total_execs += 1;
                         self.mutator.feed_execution(&result);
 

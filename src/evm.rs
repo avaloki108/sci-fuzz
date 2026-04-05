@@ -453,6 +453,7 @@ impl EvmExecutor {
             coverage,
             dataflow,
             state_diff,
+            sequence_cumulative_logs: Vec::new(),
         })
     }
 
