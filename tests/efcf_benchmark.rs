@@ -100,12 +100,7 @@ impl BenchmarkLoop {
         let mut mutator = TxMutator::new(vec![target]);
         mutator.add_to_address_pool(attacker);
 
-        let mut oracle = OracleEngine::new(attacker);
-        {
-            let mut balances = std::collections::HashMap::new();
-            balances.insert(attacker, executor.get_balance(attacker));
-            oracle.set_initial_balances(balances);
-        }
+        let oracle = OracleEngine::new(attacker);
 
         let property_caller = abi
             .as_ref()
@@ -145,6 +140,8 @@ impl BenchmarkLoop {
             }
 
             let db_snap = self.executor.snapshot();
+            let pre_seq_balances =
+                sci_fuzz::oracle::capture_eth_baseline(&self.executor, self.attacker);
             let seq_len: usize = self.rng.gen_range(1..=max_depth as usize);
             let mut sequence: Vec<Transaction> = Vec::new();
             let mut cumulative_logs: Vec<sci_fuzz::types::Log> = Vec::new();
@@ -176,12 +173,14 @@ impl BenchmarkLoop {
                             self.snapshots.add(snap);
                         }
 
+                        sequence.push(tx.clone());
+
                         // Oracle checks.
-                        let oracle_findings = self.oracle.check(&result, &sequence);
+                        let oracle_findings = self
+                            .oracle
+                            .check(&pre_seq_balances, &result, &sequence);
                         for mut f in oracle_findings {
-                            let mut repro = sequence.clone();
-                            repro.push(tx.clone());
-                            f.reproducer = repro;
+                            f.reproducer = sequence.clone();
                             let h = f.dedup_hash();
                             if seen_hashes.insert(h) {
                                 if first_hit_ms.is_none() {
@@ -190,8 +189,6 @@ impl BenchmarkLoop {
                                 findings.push(f);
                             }
                         }
-
-                        sequence.push(tx);
                     }
                     Err(_) => continue,
                 }

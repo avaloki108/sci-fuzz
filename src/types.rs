@@ -657,6 +657,17 @@ pub struct CampaignConfig {
     pub attacker_address: Option<Address>,
 }
 
+impl CampaignConfig {
+    /// Funded fuzzer EOA used for deploy, `msg.sender`, and balance oracles.
+    ///
+    /// [`Self::attacker_address`] when set; otherwise the default test address
+    /// `0x4242…4242` (20 bytes of `0x42`).
+    pub fn resolved_attacker(&self) -> Address {
+        self.attacker_address
+            .unwrap_or_else(|| Address::repeat_byte(0x42))
+    }
+}
+
 impl Default for CampaignConfig {
     fn default() -> Self {
         Self {
@@ -681,6 +692,22 @@ impl Default for CampaignConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn campaign_config_resolved_attacker_default() {
+        let cfg = CampaignConfig::default();
+        assert_eq!(cfg.resolved_attacker(), Address::repeat_byte(0x42));
+    }
+
+    #[test]
+    fn campaign_config_resolved_attacker_override() {
+        let custom = Address::with_last_byte(0x77);
+        let cfg = CampaignConfig {
+            attacker_address: Some(custom),
+            ..CampaignConfig::default()
+        };
+        assert_eq!(cfg.resolved_attacker(), custom);
+    }
 
     #[test]
     fn coverage_map_basics() {

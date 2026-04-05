@@ -128,6 +128,7 @@ fn real_target_prop_false_found() {
     // --- Main fuzzing loop (mini-campaign) ---------------------------------
     while start.elapsed() < timeout && findings.is_empty() {
         let db_snap = executor.snapshot();
+        let pre_seq_balances = sci_fuzz::oracle::capture_eth_baseline(&executor, deployer);
 
         let seq_len: usize = rng.gen_range(1..=4);
         let mut sequence: Vec<Transaction> = Vec::new();
@@ -146,17 +147,16 @@ fn real_target_prop_false_found() {
                     result.sequence_cumulative_logs = cumulative_logs.clone();
                     total_execs += 1;
 
-                    // Check built-in invariants.
-                    let oracle_findings = oracle.check(&result, &sequence);
+                    sequence.push(tx.clone());
+
+                    // Check built-in invariants (sequence includes current tx).
+                    let oracle_findings = oracle.check(&pre_seq_balances, &result, &sequence);
                     for f in oracle_findings {
                         let mut finding = f;
                         let mut repro = sequence.clone();
-                        repro.push(tx.clone());
                         finding.reproducer = repro;
                         findings.push(finding);
                     }
-
-                    sequence.push(tx);
                 }
                 Err(_) => continue,
             }

@@ -20,7 +20,7 @@ use revm::db::CacheDB;
 
 use crate::invariant::EchidnaPropertyCaller;
 use crate::mutator::TxMutator;
-use crate::oracle::OracleEngine;
+use crate::oracle::{capture_eth_baseline, OracleEngine};
 use crate::shrinker::SequenceShrinker;
 use crate::snapshot::SnapshotCorpus;
 use crate::types::{
@@ -179,10 +179,7 @@ impl Campaign {
         let mut snapshots = SnapshotCorpus::new(self.config.max_snapshots);
 
         // --- Set up attacker address with some ETH -------------------------
-        let attacker = self
-            .config
-            .attacker_address
-            .unwrap_or_else(|| Address::repeat_byte(0x42));
+        let attacker = self.config.resolved_attacker();
         if attacker.is_zero() {
             anyhow::bail!("attacker_address must not be zero; leave unset for default 0x42…42");
         }
@@ -299,17 +296,7 @@ impl Campaign {
             .collect();
         let mut mutator = TxMutator::new(mutator_targets);
         mutator.add_to_address_pool(attacker);
-        let mut oracle = OracleEngine::new(attacker);
-
-        // Seed the oracle with the attacker's ACTUAL initial balance so
-        // BalanceIncrease doesn't fire spuriously just because the attacker
-        // was pre-funded.  Without this, old=0 and any nonzero balance looks
-        // like profit.
-        {
-            let mut initial_balances = std::collections::HashMap::new();
-            initial_balances.insert(attacker, executor.get_balance(attacker));
-            oracle.set_initial_balances(initial_balances);
-        }
+        let oracle = OracleEngine::new(attacker);
 
         // --- Build Echidna property callers at deployed addresses -----------
         let mut property_callers: Vec<EchidnaPropertyCaller> = Vec::new();
@@ -538,6 +525,10 @@ impl Campaign {
 
             // Save the executor state so we can roll back after the sequence.
             let db_snapshot = executor.snapshot();
+            // Balance/profit invariants must use balances at this snapshot, not
+            // a one-time campaign-root baseline (fuzzing often resumes from
+            // non-root corpus snapshots).
+            let pre_seq_balances = capture_eth_baseline(&executor, attacker);
             let mut reached_exec_budget = false;
             let mut sequence: Vec<Transaction> = Vec::with_capacity(final_sequence.len());
             let mut cumulative_logs: Vec<crate::types::Log> = Vec::new();
@@ -576,7 +567,7 @@ impl Campaign {
                 }
 
                 // --- Oracle / invariant checks -----------------------------
-                let new_findings = oracle.check(&result, &sequence);
+                let new_findings = oracle.check(&pre_seq_balances, &result, &sequence);
                 if !new_findings.is_empty() {
                     for mut f in new_findings {
                         finding_count += 1;
@@ -965,6 +956,7 @@ fn parallel_worker_loop(
         };
 
         let db_snapshot = executor.snapshot();
+        let pre_seq_balances = capture_eth_baseline(&executor, attacker);
         let mut reached_exec_budget = false;
         let mut sequence: Vec<Transaction> = Vec::with_capacity(final_sequence.len());
         let mut cumulative_logs: Vec<crate::types::Log> = Vec::new();
@@ -1000,7 +992,7 @@ fn parallel_worker_loop(
                 }
             }
 
-            let new_findings = oracle.check(&result, &sequence);
+            let new_findings = oracle.check(&pre_seq_balances, &result, &sequence);
             if !new_findings.is_empty() {
                 for mut f in new_findings {
                     let mut repro = sequence.clone();
@@ -1180,6 +1172,7 @@ fn reproduces_failure(
     sequence: &[Transaction],
 ) -> bool {
     executor.restore(base_snapshot.clone());
+    let pre_seq_balances = capture_eth_baseline(executor, attacker);
 
     let mut executed: Vec<Transaction> = Vec::with_capacity(sequence.len());
     let mut cumulative_logs: Vec<crate::types::Log> = Vec::new();
@@ -1195,7 +1188,7 @@ fn reproduces_failure(
         executed.push(tx.clone());
 
         if oracle
-            .check(&result, &executed)
+            .check(&pre_seq_balances, &result, &executed)
             .iter()
             .any(|candidate| candidate.failure_id() == target_failure)
         {

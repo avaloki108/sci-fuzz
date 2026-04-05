@@ -104,12 +104,7 @@ impl BenchmarkHarness {
         let mut mutator = TxMutator::new(vec![target]);
         mutator.add_to_address_pool(att);
 
-        let mut oracle = OracleEngine::new(att);
-        {
-            let mut init_bal = std::collections::HashMap::new();
-            init_bal.insert(att, executor.get_balance(att));
-            oracle.set_initial_balances(init_bal);
-        }
+        let oracle = OracleEngine::new(att);
 
         let property_caller = abi
             .as_ref()
@@ -152,6 +147,8 @@ impl BenchmarkHarness {
             }
 
             let db_snap = self.executor.snapshot();
+            let pre_seq_balances =
+                sci_fuzz::oracle::capture_eth_baseline(&self.executor, self.attacker);
             let seq_len = self.rng.gen_range(1..=max_depth as usize);
             let mut sequence: Vec<Transaction> = Vec::new();
             let mut cumulative_logs: Vec<sci_fuzz::types::Log> = Vec::new();
@@ -182,10 +179,14 @@ impl BenchmarkHarness {
                             self.snapshots.add(snap);
                         }
 
+                        sequence.push(tx.clone());
+
                         // Oracle checks (BalanceIncrease, SelfDestruct, …).
-                        for mut f in self.oracle.check(&result, &sequence) {
+                        for mut f in self
+                            .oracle
+                            .check(&pre_seq_balances, &result, &sequence)
+                        {
                             let mut repro = sequence.clone();
-                            repro.push(tx.clone());
                             f.reproducer = repro;
                             let h = f.dedup_hash();
                             if seen_hashes.insert(h) {
@@ -196,8 +197,6 @@ impl BenchmarkHarness {
                                 findings.push(f);
                             }
                         }
-
-                        sequence.push(tx);
                     }
                     Err(_) => continue,
                 }
@@ -284,13 +283,6 @@ fn run_multiseed(spec: &TargetSpec, seeds: &[u64], board: &mut Scoreboard) {
             .executor
             .set_balance(attacker(), U256::from(100_000_000_000_000_000_000_u128));
         harness.initial_db = harness.executor.snapshot();
-
-        // Re-seed oracle baseline with the new executor's attacker balance.
-        {
-            let mut init_bal = std::collections::HashMap::new();
-            init_bal.insert(attacker(), harness.executor.get_balance(attacker()));
-            harness.oracle.set_initial_balances(init_bal);
-        }
 
         let (findings, total_execs, first_hit_execs, first_hit_ms) =
             harness.run(timeout, spec.max_depth);

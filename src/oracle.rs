@@ -2,13 +2,23 @@
 //!
 //! The [`OracleEngine`] is the top-level entry point that the fuzzing loop
 //! calls after every execution.  It delegates to an [`InvariantRegistry`] for
-//! the actual violation checks and maintains the baseline balance snapshot
-//! needed by balance-based invariants.
+//! the actual violation checks.  Balance/profit invariants compare against
+//! `pre_sequence_balances` supplied per check (typically captured immediately
+//! before executing the sequence under test, after restoring the base snapshot).
 
 use std::collections::HashMap;
 
+use crate::evm::EvmExecutor;
 use crate::invariant::InvariantRegistry;
 use crate::types::{Address, ExecutionResult, Finding, Transaction, U256};
+
+/// ETH balance baseline for the default invariant set (attacker-only).
+///
+/// Call after restoring the EVM to the snapshot you are about to fuzz from so
+/// balance/profit oracles compare against that state, not a stale campaign root.
+pub fn capture_eth_baseline(executor: &EvmExecutor, attacker: Address) -> HashMap<Address, U256> {
+    HashMap::from([(attacker, executor.get_balance(attacker))])
+}
 
 // ---------------------------------------------------------------------------
 // OracleEngine
@@ -19,19 +29,16 @@ use crate::types::{Address, ExecutionResult, Finding, Transaction, U256};
 /// Typical usage:
 ///
 /// ```ignore
-/// let mut oracle = OracleEngine::new(attacker_address);
-/// oracle.set_initial_balances(balances);
-///
-/// // … after executing a transaction sequence …
-/// let findings = oracle.check(&result, &sequence);
+/// let oracle = OracleEngine::new(attacker_address);
+/// let pre = capture_eth_baseline(&executor, attacker_address);
+/// // … after each tx in a sequence …
+/// let findings = oracle.check(&pre, &result, &sequence);
 /// ```
 pub struct OracleEngine {
     /// Invariant registry used for violation checks.
     registry: InvariantRegistry,
     /// The address considered the "attacker" for profit-detection invariants.
     attacker: Address,
-    /// Balance baseline captured before the sequence under test.
-    initial_balances: HashMap<Address, U256>,
 }
 
 impl OracleEngine {
@@ -40,7 +47,6 @@ impl OracleEngine {
         Self {
             registry: InvariantRegistry::with_defaults(attacker),
             attacker,
-            initial_balances: HashMap::new(),
         }
     }
 
@@ -49,25 +55,24 @@ impl OracleEngine {
         Self {
             registry,
             attacker,
-            initial_balances: HashMap::new(),
         }
-    }
-
-    /// Record the balance baseline that invariants compare against.
-    ///
-    /// This should be called once before starting a new sequence, typically
-    /// by snapshotting the EVM balances of all monitored addresses.
-    pub fn set_initial_balances(&mut self, balances: HashMap<Address, U256>) {
-        self.initial_balances = balances;
     }
 
     /// Run every registered invariant against an execution result.
     ///
+    /// `pre_sequence_balances` must reflect balances **before** the first
+    /// transaction in `sequence` (i.e. at the restored base snapshot).
+    ///
     /// Returns all [`Finding`]s produced — an empty `Vec` means no
     /// violations were detected.
-    pub fn check(&self, result: &ExecutionResult, sequence: &[Transaction]) -> Vec<Finding> {
+    pub fn check(
+        &self,
+        pre_sequence_balances: &HashMap<Address, U256>,
+        result: &ExecutionResult,
+        sequence: &[Transaction],
+    ) -> Vec<Finding> {
         self.registry
-            .check_all(&self.initial_balances, result, sequence)
+            .check_all(pre_sequence_balances, result, sequence)
     }
 
     /// The attacker address this engine was configured with.
@@ -93,17 +98,17 @@ mod tests {
     #[test]
     fn no_findings_on_empty_result() {
         let engine = OracleEngine::new(Address::ZERO);
-        let findings = engine.check(&empty_result(), &[]);
+        let findings = engine.check(&HashMap::new(), &empty_result(), &[]);
         assert!(findings.is_empty());
     }
 
     #[test]
     fn detects_balance_increase() {
         let attacker = Address::ZERO;
-        let mut engine = OracleEngine::new(attacker);
+        let engine = OracleEngine::new(attacker);
 
         // Baseline: attacker starts with 0.
-        engine.set_initial_balances(HashMap::from([(attacker, U256::ZERO)]));
+        let pre = HashMap::from([(attacker, U256::ZERO)]);
 
         // Simulate a result where attacker gained ether.
         let mut result = empty_result();
@@ -120,7 +125,7 @@ mod tests {
             gas_limit: 30_000_000,
         };
 
-        let findings = engine.check(&result, &[tx]);
+        let findings = engine.check(&pre, &result, &[tx]);
         assert!(!findings.is_empty());
         assert!(findings.iter().any(|f| f.severity == Severity::Critical));
     }
@@ -132,7 +137,7 @@ mod tests {
         let registry = InvariantRegistry::new();
         let engine = OracleEngine::with_invariants(attacker, registry);
 
-        let findings = engine.check(&empty_result(), &[]);
+        let findings = engine.check(&HashMap::new(), &empty_result(), &[]);
         assert!(findings.is_empty());
     }
 
