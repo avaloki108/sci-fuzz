@@ -12,14 +12,16 @@ use anyhow::{anyhow, Context as _, Result};
 use revm::{
     db::{CacheDB, EmptyDB},
     inspector_handle_register,
-    interpreter::Interpreter,
+    interpreter::{CallInputs, CallOutcome, InstructionResult, Interpreter, InterpreterResult},
     primitives::{
         AccountInfo, BlockEnv, ExecutionResult as RevmResult, Output, ResultAndState, SpecId,
         TxKind, U256 as RevmU256,
     },
     Database, DatabaseCommit, DatabaseRef, Evm, EvmContext, Inspector,
 };
+use revm::interpreter::Gas;
 
+use crate::cheatcodes::{self, TxCheatcodeState};
 use crate::path_id::{native_flashloan_path_id, PathStreamHasher};
 use crate::rpc::FuzzerDatabase;
 use crate::types::{
@@ -40,6 +42,9 @@ use crate::types::{
 /// `CALL` into another contract), `prev_pc` is reset so we never record a false
 /// edge from the caller's last PC to the callee's first PC under the callee's
 /// address.
+///
+/// Also acts as the Forge VM cheatcode interceptor: any `CALL` targeting
+/// [`FORGE_VM_ADDRESS`] is handled here without hitting real EVM execution.
 #[derive(Debug, Clone, Default)]
 struct CoverageInspector {
     coverage: CoverageMap,
@@ -50,9 +55,51 @@ struct CoverageInspector {
     /// on cross-contract execution context switches.
     last_coverage_address: Option<Address>,
     dataflow: crate::types::DataflowWaypoints,
+    /// In-flight cheatcode state for the current transaction.
+    pub cheatcodes: TxCheatcodeState,
 }
 
 impl<DB: Database> Inspector<DB> for CoverageInspector {
+    /// Intercept CALL instructions before revm processes them.
+    ///
+    /// If the target is the Forge VM cheatcode address, dispatch the cheatcode
+    /// and return `Some(outcome)` to short-circuit real execution.  Otherwise,
+    /// apply any active prank (`msg.sender` override) to the call inputs.
+    fn call(
+        &mut self,
+        context: &mut EvmContext<DB>,
+        inputs: &mut CallInputs,
+    ) -> Option<CallOutcome> {
+        // ── Cheatcode interception ────────────────────────────────────────────
+        if inputs.target_address == cheatcodes::FORGE_VM_ADDRESS {
+            let calldata = inputs.input.as_ref();
+            let (success, output) =
+                cheatcodes::dispatch(&mut self.cheatcodes, context, calldata);
+
+            let instruction_result = if success {
+                InstructionResult::Return
+            } else {
+                InstructionResult::Revert
+            };
+
+            return Some(CallOutcome {
+                result: InterpreterResult {
+                    result: instruction_result,
+                    output: output.into(),
+                    gas: Gas::new(inputs.gas_limit),
+                },
+                memory_offset: inputs.return_memory_offset.clone(),
+            });
+        }
+
+        // ── Prank: override msg.sender for non-Vm calls ───────────────────────
+        if let Some(override_sender) = self.cheatcodes.take_caller_override() {
+            inputs.caller = override_sender;
+        }
+
+        None
+    }
+
     fn step(&mut self, interp: &mut Interpreter, _context: &mut EvmContext<DB>) {
         let address = interp
             .contract
@@ -97,6 +144,10 @@ pub struct EvmExecutor {
     pub deploy_nonce: u64,
     /// Execution strictness.
     pub mode: ExecutorMode,
+    /// Persistent cheatcode state that carries across transactions.
+    /// Updated after each `execute()` call to propagate `vm.startPrank`
+    /// and `vm.warp` / `vm.roll` effects.
+    pub cheatcode_state: crate::cheatcodes::ExecutorCheatcodeState,
 }
 
 impl EvmExecutor {
@@ -119,6 +170,7 @@ impl EvmExecutor {
             block_env,
             deploy_nonce: 0,
             mode: ExecutorMode::Fast,
+            cheatcode_state: crate::cheatcodes::ExecutorCheatcodeState::default(),
         }
     }
 
@@ -144,9 +196,21 @@ impl EvmExecutor {
             None => TxKind::Create,
         };
 
+        // If a persistent prank is active (e.g. from vm.startPrank in a prior
+        // setUp() call), apply it to this transaction's top-level sender.
+        let effective_sender = self
+            .cheatcode_state
+            .persistent_prank
+            .unwrap_or(tx.sender);
+
+        // Seed the per-transaction inspector with current persistent prank so
+        // that sub-calls inside this transaction also see it before stopPrank.
+        let mut inspector = CoverageInspector::default();
+        inspector.cheatcodes.persistent_prank = self.cheatcode_state.persistent_prank;
+
         let mut evm = Evm::builder()
             .with_db(&mut self.db)
-            .with_external_context(CoverageInspector::default())
+            .with_external_context(inspector)
             .with_block_env(self.block_env.clone())
             .with_spec_id(SpecId::CANCUN)
             .append_handler_register(inspector_handle_register)
@@ -165,7 +229,7 @@ impl EvmExecutor {
                 }
             })
             .modify_tx_env(|tx_env| {
-                tx_env.caller = tx.sender;
+                tx_env.caller = effective_sender;
                 tx_env.transact_to = transact_to;
                 tx_env.data = tx.data.clone();
                 tx_env.value = tx.value;
@@ -183,9 +247,33 @@ impl EvmExecutor {
         let coverage = ext.coverage.clone();
         let dataflow = ext.dataflow.clone();
 
+        // Propagate cheatcode effects back to the executor's block environment
+        // so subsequent transactions see the same warp/roll values.
+        if let Some(ts) = ext.cheatcodes.pending_warp {
+            self.block_env.timestamp = RevmU256::from(ts);
+        }
+        if let Some(num) = ext.cheatcodes.pending_roll {
+            self.block_env.number = RevmU256::from(num);
+        }
+        // Persist or clear the prank state for the next transaction.
+        self.cheatcode_state.persistent_prank = ext.cheatcodes.persistent_prank;
+        // Collect deferred deals and stores before dropping the EVM.
+        let pending_deals = ext.cheatcodes.pending_deals.clone();
+        let pending_stores = ext.cheatcodes.pending_stores.clone();
+
         // Commit state changes into the CacheDB.
         drop(evm); // release mutable borrow on self.db
         self.db.commit(state.clone());
+
+        // Apply deferred vm.deal() balance overrides (post-commit so they take
+        // precedence over any balance changes from the transaction itself).
+        for (addr, amount) in pending_deals {
+            self.set_balance(addr, amount);
+        }
+        // Apply deferred vm.store() storage writes.
+        for (addr, slot, value) in pending_stores {
+            let _ = self.db.insert_account_storage(addr, slot, value);
+        }
 
         // Convert the revm result into our own type.
         let exec_result = self.convert_result(

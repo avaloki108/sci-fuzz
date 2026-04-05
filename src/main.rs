@@ -342,6 +342,11 @@ fn handle_audit(args: sci_fuzz::cli::AuditArgs) -> Result<()> {
         rpc_url: Some(rpc_url.clone()),
         rpc_block_number: block,
         attacker_address,
+        // Audit mode: use pre-deployed on-chain addresses directly.
+        // Do NOT re-deploy — the contracts already exist on the forked chain.
+        // Setting this to false ensures the campaign sees empty deployed_bytecode
+        // and falls through to the "use address as-is" path in the deploy loop.
+        fork_hydrate_deployed_bytecode: false,
         ..Default::default()
     };
 

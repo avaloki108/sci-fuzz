@@ -564,6 +564,8 @@ impl Campaign {
         let mut first_hit_time_ms: Option<u64> = None;
         let mut successful_state_changes: u64 = 0;
         let mut snapshots_saved: u64 = 0;
+        // Corpus of interesting sequences for splice-based crossover (capped at 64).
+        let mut seq_corpus: Vec<Vec<Transaction>> = Vec::with_capacity(64);
         // Diagnostic counters for stateful property debugging.
         let mut diag_funded_deposits: u64 = 0;
         let mut diag_withdraws_ok: u64 = 0;
@@ -614,18 +616,26 @@ impl Campaign {
             }
 
             // Generate a transaction sequence.
+            // 10% of the time splice two corpus sequences for crossover coverage.
+            let do_splice = !seq_corpus.is_empty() && rng.gen_bool(0.10);
             let seq_len: u32 = rng.gen_range(1..=self.config.max_depth);
-            let mut raw_sequence: Vec<Transaction> = Vec::with_capacity(seq_len as usize);
-
-            for _ in 0..seq_len {
-                let tx = if raw_sequence.is_empty() || rng.gen_bool(0.3) {
-                    let prev_sender = raw_sequence.last().map(|t: &Transaction| t.sender);
-                    mutator.generate_in_sequence(prev_sender, &mut rng)
-                } else {
-                    mutator.mutate(raw_sequence.last().unwrap(), &mut rng)
-                };
-                raw_sequence.push(tx);
-            }
+            let raw_sequence: Vec<Transaction> = if do_splice {
+                let a_idx = rng.gen_range(0..seq_corpus.len());
+                let b_idx = rng.gen_range(0..seq_corpus.len());
+                TxMutator::splice(&seq_corpus[a_idx], &seq_corpus[b_idx], &mut rng)
+            } else {
+                let mut seq: Vec<Transaction> = Vec::with_capacity(seq_len as usize);
+                for _ in 0..seq_len {
+                    let tx = if seq.is_empty() || rng.gen_bool(0.3) {
+                        let prev_sender = seq.last().map(|t: &Transaction| t.sender);
+                        mutator.generate_in_sequence(prev_sender, &mut rng)
+                    } else {
+                        mutator.mutate(seq.last().unwrap(), &mut rng)
+                    };
+                    seq.push(tx);
+                }
+                seq
+            };
 
             // Wrap a small percentage (e.g. 5%) of sequences in a flashloan to enable
             // the Global Economic Oracle to catch logic flaws.
@@ -750,6 +760,13 @@ impl Campaign {
                     mutator.dict.seed_from_storage_reserves(&reserve_candidates);
                 }
 
+                // Keep the mutator's block-timestamp hint in sync so time-aware
+                // argument generation produces plausible deadline/expiry values.
+                {
+                    let (_, ts) = executor_block_meta(&executor);
+                    mutator.update_block_timestamp(ts);
+                }
+
                 // Track successful state-changing transactions.
                 if result.success && !result.state_diff.storage_writes.is_empty() {
                     successful_state_changes += 1;
@@ -793,6 +810,17 @@ impl Campaign {
                     {
                         saved_dbs.insert(snap_id, executor.snapshot());
                         snapshots_saved += 1;
+                    }
+
+                    // Add this sequence to the splice corpus so future
+                    // iterations can crossover from this coverage path.
+                    if !sequence.is_empty() && (novel_cov || novel_df) {
+                        if seq_corpus.len() >= 64 {
+                            let evict = rng.gen_range(0..seq_corpus.len());
+                            seq_corpus[evict] = sequence.clone();
+                        } else {
+                            seq_corpus.push(sequence.clone());
+                        }
                     }
                 }
 

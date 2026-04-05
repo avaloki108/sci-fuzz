@@ -5,7 +5,7 @@
 //! four-byte function selectors and builds well-formed calldata.  When no
 //! ABI is present it falls back to raw random bytes.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use rand::Rng;
 
@@ -81,6 +81,15 @@ pub struct ValueDictionary {
     pub address_values: Vec<Address>,
     /// Interesting bytes32 values.
     pub bytes32_values: Vec<B256>,
+    /// Recent 32-byte return-value words (ring buffer, max 64 entries).
+    ///
+    /// Seeded from transaction output data, enabling patterns like
+    /// `createStream(params) → streamId` then `cancel(streamId)` to
+    /// emerge naturally when the fuzzer reuses returned IDs as arguments.
+    pub recent_returns: VecDeque<U256>,
+    /// Last known block timestamp (seconds).  Used to bias time-parameter
+    /// generation toward plausible deadline/expiry windows.
+    pub block_timestamp_hint: u64,
 }
 
 impl ValueDictionary {
@@ -114,6 +123,8 @@ impl ValueDictionary {
             uint_values,
             address_values,
             bytes32_values,
+            recent_returns: VecDeque::new(),
+            block_timestamp_hint: 0,
         }
     }
 
@@ -169,8 +180,20 @@ impl ValueDictionary {
     ///
     /// Harvests values from return data, log topics/data, and storage writes.
     pub fn seed_from_execution(&mut self, result: &ExecutionResult) {
-        // Extract 32-byte words from return data.
+        // Extract 32-byte words from return data into the general dictionary
+        // AND the recent-returns ring buffer (for return-value propagation).
         self.extract_words_from_bytes(&result.output);
+        let mut offset = 0;
+        while offset + 32 <= result.output.len() {
+            let mut word = [0u8; 32];
+            word.copy_from_slice(&result.output[offset..offset + 32]);
+            let val = U256::from_be_bytes(word);
+            if self.recent_returns.len() >= 64 {
+                self.recent_returns.pop_front();
+            }
+            self.recent_returns.push_back(val);
+            offset += 32;
+        }
 
         // Extract from logs.
         for log in &result.logs {
@@ -224,9 +247,15 @@ impl ValueDictionary {
         }
     }
 
-    /// Pick a random uint256 — biased toward dictionary values.
+    /// Pick a random uint256 — biased toward recent return values first,
+    /// then dictionary values, then fully random.
     pub fn random_uint(&self, rng: &mut impl Rng) -> U256 {
-        if !self.uint_values.is_empty() && rng.gen_bool(0.8) {
+        let r: f64 = rng.gen();
+        if r < 0.30 && !self.recent_returns.is_empty() {
+            // 30%: reuse a recently returned value (enables id/token pass-through).
+            self.recent_returns[rng.gen_range(0..self.recent_returns.len())]
+        } else if r < 0.86 && !self.uint_values.is_empty() {
+            // ~56% (after the 30% above): pull from the general dictionary.
             self.uint_values[rng.gen_range(0..self.uint_values.len())]
         } else {
             U256::from_be_bytes(rng.gen::<[u8; 32]>())
@@ -284,9 +313,41 @@ impl ValueDictionary {
 /// Returns a 32-byte big-endian encoded value suitable for direct
 /// concatenation into EVM calldata.
 fn generate_typed_arg(typ: &str, dict: &ValueDictionary, rng: &mut impl Rng) -> Vec<u8> {
+    generate_typed_arg_named(typ, None, dict, rng)
+}
+
+/// Generate a random ABI-encoded argument, optionally using the parameter
+/// name to bias generation (e.g. "deadline" → near `block.timestamp`).
+fn generate_typed_arg_named(
+    typ: &str,
+    name: Option<&str>,
+    dict: &ValueDictionary,
+    rng: &mut impl Rng,
+) -> Vec<u8> {
     match typ {
         // --- unsigned integers -------------------------------------------
-        "uint256" => dict.random_uint(rng).to_be_bytes::<32>().to_vec(),
+        "uint256" => {
+            // Time-aware: if param name hints at a time value, bias toward
+            // block.timestamp ± a reasonable window (seconds).
+            let is_time_hint = name.map(|n| {
+                let n = n.to_ascii_lowercase();
+                n.contains("time") || n.contains("deadline") || n.contains("expiry")
+                    || n.contains("start") || n.contains("end") || n.contains("expire")
+                    || n.contains("duration") || n.contains("cliff") || n.contains("until")
+            }).unwrap_or(false);
+
+            if is_time_hint && dict.block_timestamp_hint > 0 && rng.gen_bool(0.70) {
+                const DELTAS: &[i64] = &[
+                    0, 1, -1, 60, 300, 3600, 86400, 604800,
+                    2_592_000, 31_536_000, -3600, -86400,
+                ];
+                let delta = DELTAS[rng.gen_range(0..DELTAS.len())];
+                let ts = dict.block_timestamp_hint as i64 + delta;
+                U256::from(ts.max(0) as u64).to_be_bytes::<32>().to_vec()
+            } else {
+                dict.random_uint(rng).to_be_bytes::<32>().to_vec()
+            }
+        }
         "uint128" => {
             let v = dict.random_uint(rng) & U256::from(u128::MAX);
             v.to_be_bytes::<32>().to_vec()
@@ -355,6 +416,45 @@ fn generate_typed_arg(typ: &str, dict: &ValueDictionary, rng: &mut impl Rng) -> 
     }
 }
 
+/// Generate ABI-encoded calldata for a full ABI input object (supports
+/// tuples/structs by recursively handling `components`).
+///
+/// For a `tuple` type, encodes each component field in order (head-only,
+/// no dynamic offsets — good-enough for most fixed-size Solidity structs
+/// like `CreateWithDurations`, `LockupLinear.Timestamps`, etc.).
+/// Dynamic types inside tuples fall back to 32 random bytes.
+fn generate_typed_arg_from_input(
+    input: &serde_json::Value,
+    dict: &ValueDictionary,
+    rng: &mut impl Rng,
+) -> Vec<u8> {
+    let typ = input.get("type").and_then(|t| t.as_str()).unwrap_or("bytes32");
+    let name = input.get("name").and_then(|n| n.as_str());
+
+    if typ == "tuple" {
+        // Recursively encode each component of the struct.
+        if let Some(components) = input.get("components").and_then(|c| c.as_array()) {
+            let mut buf = Vec::new();
+            for component in components {
+                buf.extend(generate_typed_arg_from_input(component, dict, rng));
+            }
+            return buf;
+        }
+        // Fallback: one random word.
+        return rng.gen::<[u8; 32]>().to_vec();
+    }
+
+    // Strip array suffix for now — fuzz a single element as head.
+    let base_typ = if typ.ends_with("[]") || typ.ends_with(']') {
+        // For dynamic arrays, just generate 0 (empty array head word).
+        return U256::ZERO.to_be_bytes::<32>().to_vec();
+    } else {
+        typ
+    };
+
+    generate_typed_arg_named(base_typ, name, dict, rng)
+}
+
 // ---------------------------------------------------------------------------
 // Protocol classification
 // ---------------------------------------------------------------------------
@@ -406,8 +506,11 @@ pub struct TxMutator {
     targets: Vec<ContractInfo>,
     /// Known four-byte function selectors extracted from ABIs.
     selectors: Vec<[u8; 4]>,
-    /// Parameter types for each known selector (from ABI).
+    /// Parameter types for each known selector (from ABI) — plain type strings.
     selector_params: HashMap<[u8; 4], Vec<String>>,
+    /// Full ABI input objects for each selector (preserves `name`, `components`
+    /// for tuple/struct encoding and time-aware generation).
+    selector_full_params: HashMap<[u8; 4], Vec<serde_json::Value>>,
     /// Selectors whose ABI entry has `stateMutability: "payable"`.
     payable_selectors: HashSet<[u8; 4]>,
     /// Pool of known addresses (senders, contracts, constants).
@@ -425,6 +528,7 @@ impl TxMutator {
     pub fn new(targets: Vec<ContractInfo>) -> Self {
         let mut selectors = Vec::new();
         let mut selector_params: HashMap<[u8; 4], Vec<String>> = HashMap::new();
+        let mut selector_full_params: HashMap<[u8; 4], Vec<serde_json::Value>> = HashMap::new();
         let mut payable_selectors: HashSet<[u8; 4]> = HashSet::new();
         let mut address_pool = Vec::new();
         let mut dict = ValueDictionary::new();
@@ -459,6 +563,9 @@ impl TxMutator {
                                         })
                                         .collect();
                                     selector_params.insert(sel, types);
+
+                                    // Store full input objects for tuple/name-aware generation.
+                                    selector_full_params.insert(sel, inputs.clone());
                                 }
                             }
                         }
@@ -476,6 +583,7 @@ impl TxMutator {
             targets,
             selectors,
             selector_params,
+            selector_full_params,
             payable_selectors,
             address_pool,
             dict,
@@ -703,7 +811,14 @@ impl TxMutator {
             };
             let mut buf = sel.to_vec();
 
-            if let Some(params) = self.selector_params.get(&sel) {
+            if let Some(full_inputs) = self.selector_full_params.get(&sel) {
+                // Use full ABI objects for tuple/name-aware encoding.
+                for input in full_inputs {
+                    buf.extend_from_slice(&generate_typed_arg_from_input(
+                        input, &self.dict, rng,
+                    ));
+                }
+            } else if let Some(params) = self.selector_params.get(&sel) {
                 // ABI-aware: generate correctly typed arguments.
                 for param_type in params {
                     buf.extend_from_slice(&generate_typed_arg(param_type, &self.dict, rng));
@@ -854,8 +969,20 @@ impl TxMutator {
                 let sel = usable[rng.gen_range(0..usable.len())];
                 let mut buf = sel.to_vec();
 
-                // Generate args: for vault/lending use realistic token amounts.
-                if let Some(params) = self.selector_params.get(&sel) {
+                // Generate args: prefer full ABI objects (tuple/name-aware),
+                // fall back to plain type strings, biasing uint toward token amounts.
+                if let Some(full_inputs) = self.selector_full_params.get(&sel) {
+                    for input in full_inputs {
+                        let typ = input.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                        if typ.starts_with("uint") {
+                            buf.extend_from_slice(&biased_token_amount(&self.dict, rng).to_be_bytes::<32>());
+                        } else {
+                            buf.extend_from_slice(&generate_typed_arg_from_input(
+                                input, &self.dict, rng,
+                            ));
+                        }
+                    }
+                } else if let Some(params) = self.selector_params.get(&sel) {
                     for param_type in params {
                         if param_type.starts_with("uint") {
                             // Bias toward token-like amounts (not just random U256).
@@ -899,6 +1026,44 @@ impl TxMutator {
         if !self.address_pool.contains(&addr) {
             self.address_pool.push(addr);
         }
+    }
+
+    /// Splice two sequences together: take a prefix of `seq_a` and a suffix
+    /// of `seq_b`, chosen at random split points.
+    ///
+    /// This implements corpus crossover — it combines coverage discovered via
+    /// two different paths so the fuzzer can explore states that neither path
+    /// alone would produce (e.g. `deposit` from seq_a then `borrow` from seq_b).
+    pub fn splice(
+        seq_a: &[Transaction],
+        seq_b: &[Transaction],
+        rng: &mut impl Rng,
+    ) -> Vec<Transaction> {
+        if seq_a.is_empty() {
+            return seq_b.to_vec();
+        }
+        if seq_b.is_empty() {
+            return seq_a.to_vec();
+        }
+        // Split point: take 1..=len-1 of seq_a to guarantee at least one
+        // element from each side (when both have at least 2 elements).
+        let split_a = if seq_a.len() > 1 {
+            rng.gen_range(1..seq_a.len())
+        } else {
+            1
+        };
+        let split_b = rng.gen_range(0..seq_b.len());
+        let mut out: Vec<Transaction> = seq_a[..split_a].to_vec();
+        out.extend_from_slice(&seq_b[split_b..]);
+        out
+    }
+
+    /// Update the block-timestamp hint in the value dictionary.
+    ///
+    /// Call this after each committed block so time-aware argument generation
+    /// stays near the current chain timestamp.
+    pub fn update_block_timestamp(&mut self, timestamp_secs: u64) {
+        self.dict.block_timestamp_hint = timestamp_secs;
     }
 }
 
@@ -1197,5 +1362,157 @@ mod tests {
             same_sender > trials * 40 / 100,
             "expected sender stickiness, got {same_sender}/{trials}"
         );
+    }
+
+    // -- Phase 2: splice, return-value propagation, tuple, time-aware ------
+
+    #[test]
+    fn splice_prefix_plus_suffix() {
+        let mut rng = rand::thread_rng();
+        let tx_a1 = Transaction {
+            sender: Address::from([0xAA; 20]),
+            to: Some(Address::ZERO),
+            data: Bytes::from(vec![0xAA]),
+            value: U256::ZERO,
+            gas_limit: 30_000_000,
+        };
+        let tx_a2 = Transaction {
+            sender: Address::from([0xAA; 20]),
+            to: Some(Address::ZERO),
+            data: Bytes::from(vec![0xAB]),
+            value: U256::ZERO,
+            gas_limit: 30_000_000,
+        };
+        let tx_b1 = Transaction {
+            sender: Address::from([0xBB; 20]),
+            to: Some(Address::ZERO),
+            data: Bytes::from(vec![0xBB]),
+            value: U256::ZERO,
+            gas_limit: 30_000_000,
+        };
+        let seq_a = vec![tx_a1, tx_a2];
+        let seq_b = vec![tx_b1];
+
+        for _ in 0..50 {
+            let spliced = TxMutator::splice(&seq_a, &seq_b, &mut rng);
+            assert!(!spliced.is_empty(), "splice must not be empty");
+        }
+    }
+
+    #[test]
+    fn splice_with_empty_returns_other() {
+        let mut rng = rand::thread_rng();
+        let tx = Transaction {
+            sender: Address::ZERO,
+            to: Some(Address::ZERO),
+            data: Bytes::new(),
+            value: U256::ZERO,
+            gas_limit: 30_000_000,
+        };
+        let seq = vec![tx];
+
+        // splice([], seq) → seq
+        let result_a = TxMutator::splice(&[], &seq, &mut rng);
+        assert_eq!(result_a.len(), seq.len());
+        assert_eq!(result_a[0].sender, seq[0].sender);
+
+        // splice(seq, []) → seq
+        let result_b = TxMutator::splice(&seq, &[], &mut rng);
+        assert_eq!(result_b.len(), seq.len());
+        assert_eq!(result_b[0].sender, seq[0].sender);
+    }
+
+    #[test]
+    fn recent_returns_ring_buffer_caps_at_64() {
+        let mut dict = ValueDictionary::new();
+        // Create a fake output with 70 * 32 bytes (70 words).
+        let output: Vec<u8> = (0u64..70)
+            .flat_map(|i| U256::from(i).to_be_bytes::<32>())
+            .collect();
+        let mut offset = 0;
+        while offset + 32 <= output.len() {
+            let mut raw = [0u8; 32];
+            raw.copy_from_slice(&output[offset..offset + 32]);
+            let val = U256::from_be_bytes(raw);
+            if dict.recent_returns.len() >= 64 {
+                dict.recent_returns.pop_front();
+            }
+            dict.recent_returns.push_back(val);
+            offset += 32;
+        }
+        assert_eq!(dict.recent_returns.len(), 64);
+        // The first 6 words (0..5) should have been evicted; last 64 should be 6..69.
+        assert_eq!(dict.recent_returns[0], U256::from(6u64));
+        assert_eq!(dict.recent_returns[63], U256::from(69u64));
+    }
+
+    #[test]
+    fn recent_returns_bias_returns_seeded_value() {
+        let mut dict = ValueDictionary::new();
+        let sentinel = U256::from(0xDEAD_BEEF_u64);
+        dict.recent_returns.push_back(sentinel);
+
+        let mut rng = rand::thread_rng();
+        let mut found = false;
+        for _ in 0..300 {
+            if dict.random_uint(&mut rng) == sentinel {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "sentinel should appear in random_uint output");
+    }
+
+    #[test]
+    fn time_aware_generation_uses_timestamp_hint() {
+        let mut dict = ValueDictionary::new();
+        dict.block_timestamp_hint = 1_700_000_000;
+
+        let mut rng = rand::thread_rng();
+        let mut near_ts_count = 0u32;
+        for _ in 0..100 {
+            let word = generate_typed_arg_named("uint256", Some("deadline"), &dict, &mut rng);
+            let mut raw = [0u8; 32];
+            raw.copy_from_slice(&word);
+            let val = U256::from_be_bytes(raw);
+            // Accept values within ±1 year of the hint.
+            let ts = dict.block_timestamp_hint;
+            if val >= U256::from(ts.saturating_sub(31_536_000))
+                && val <= U256::from(ts + 31_536_000)
+            {
+                near_ts_count += 1;
+            }
+        }
+        // With 70% probability, at least 40% should be near the timestamp.
+        assert!(
+            near_ts_count >= 40,
+            "expected time-biased values, got {near_ts_count}/100 near hint"
+        );
+    }
+
+    #[test]
+    fn tuple_encoding_encodes_all_components() {
+        let input = serde_json::json!({
+            "type": "tuple",
+            "name": "params",
+            "components": [
+                { "type": "address", "name": "recipient" },
+                { "type": "uint256", "name": "amount" },
+                { "type": "bool", "name": "cancelable" }
+            ]
+        });
+
+        let dict = ValueDictionary::new();
+        let mut rng = rand::thread_rng();
+        // A tuple of (address, uint256, bool) should encode to 3 × 32 = 96 bytes.
+        let encoded = generate_typed_arg_from_input(&input, &dict, &mut rng);
+        assert_eq!(
+            encoded.len(),
+            96,
+            "tuple(address,uint256,bool) should be 96 bytes, got {}",
+            encoded.len()
+        );
+        // Address word: first 12 bytes must be zero.
+        assert_eq!(&encoded[..12], &[0u8; 12], "address must be left-padded");
     }
 }

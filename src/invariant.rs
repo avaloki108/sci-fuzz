@@ -956,7 +956,7 @@ mod tests {
         // UniswapV2StyleSwapReserve, AmmSyncExplained, Erc4626PreviewVsDepositEvent,
         // UniswapV2StyleSyncVsGetReserves, Erc4626RateJumpWithoutTokenFlow,
         // Erc4626DepositVsUnderlyingTransfer, Erc4626FirstDepositorInflation (19 total)
-        assert_eq!(reg.len(), 18);
+        assert_eq!(reg.len(), 19);
         assert!(!reg.is_empty());
     }
 
