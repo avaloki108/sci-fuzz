@@ -313,7 +313,7 @@ mod tests {
         hc.insert((Address::ZERO, (20, 21)), 5u32);
 
         assert!(fb.record(&hc), "first time → novel");
-        assert_eq!(fb.total_coverage(), 2); // (ZERO,10->11,bucket(1)=1) and (ZERO,20->21,bucket(5)=8)
+        assert_eq!(fb.total_coverage(), 2); // two distinct (address, edge, bucket) triples
 
         // Exact same hitcounts → same buckets → not novel.
         assert!(
@@ -328,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn new_bucket_for_existing_pc_is_novel() {
+    fn new_bucket_for_existing_edge_is_novel() {
         let mut fb = CoverageFeedback::new();
 
         // First execution: edge 10->11 hit once → bucket 1.
@@ -341,12 +341,12 @@ mod tests {
         assert!(!fb.record(&hc1));
 
         // Second execution: edge 10->11 hit 5 times → bucket 8.
-        // Different bucket for the same PC → novel!
+        // Different bucket for the same edge → novel!
         let mut hc2 = HashMap::new();
         hc2.insert((Address::ZERO, (0x10, 0x11)), 5u32);
         assert!(
             fb.is_interesting(&hc2),
-            "different bucket for same PC should be interesting"
+            "different bucket for same edge should be interesting"
         );
         assert!(fb.record(&hc2));
         assert_eq!(
@@ -378,7 +378,7 @@ mod tests {
             fb.record_from_coverage_map(&cov),
             "first record_from_coverage_map should be novel"
         );
-        // Each PC was hit once → bucket 1, so 3 unique triples.
+        // Each edge was hit once → bucket 1, so 3 unique triples.
         assert_eq!(fb.total_coverage(), 3);
 
         // Recording the same CoverageMap again should not be novel.
@@ -387,6 +387,24 @@ mod tests {
             "duplicate coverage map should not be novel"
         );
         assert_eq!(fb.total_coverage(), 3);
+    }
+
+    #[test]
+    fn interesting_when_edge_set_differs_with_same_pc_endpoints() {
+        let mut fb = CoverageFeedback::new();
+        let mut first_path = HashMap::new();
+        first_path.insert((Address::ZERO, (0, 1)), 1u32);
+        first_path.insert((Address::ZERO, (1, 2)), 1u32);
+        assert!(fb.record(&first_path));
+
+        let mut other_path = HashMap::new();
+        other_path.insert((Address::ZERO, (0, 2)), 1u32);
+        other_path.insert((Address::ZERO, (2, 1)), 1u32);
+        assert!(
+            fb.is_interesting(&other_path),
+            "disjoint edges should be novel even when PCs overlap"
+        );
+        assert!(fb.record(&other_path));
     }
 
     #[test]

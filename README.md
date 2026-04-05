@@ -13,9 +13,9 @@ The name stands for **S**mart **C**ontract **I**nvariant **Fuzz**er. The thesis 
 ## What Works Today
 
 - **EVM execution** via revm 19.7 with snapshot/restore (CacheDB cloning)
-- **Real EVM instruction coverage** via a revm inspector that records per-contract instruction hitcounts during execution
+- **Per-contract control-flow edge coverage** via a revm inspector that records `(prev_pc, current_pc)` transitions (per attributed contract) with raw hitcounts during execution
 - **Dual executor modes**: `Fast` (all safety checks off, best for exploration) and `Realistic` (balance enforcement on, reduces false positives from impossible states)
-- **AFL++ hitcount bucketing** — tracks not just "was this PC hit?" but which hitcount bucket (1, 2, 4, 8, 16, 32, 64, 128+), using real instruction hitcounts from the executor so loop iteration differences count as new coverage
+- **AFL++ hitcount bucketing** — tracks not just "was this edge taken?" but which hitcount bucket (1, 2, 4, 8, 16, 32, 64, 128+), using real transition hitcounts from the executor so loop iteration differences count as new coverage
 - **Power scheduling** — snapshot selection weighted by novelty × new-bits boost × depth bonus ÷ √exploration-count, ported from LibAFL's power schedule and now driven by real execution coverage instead of storage-write heuristics
 - **Calibration phase** — runs seed transactions before the main loop to establish coverage baselines and populate the value dictionary
 - **ABI-aware mutation** — extracts function selectors from ABI JSON, generates typed arguments (uint256, address, bool, bytes32), mutates with bit-flip, byte-replace, selector-swap, value-change, sender-swap
@@ -34,7 +34,7 @@ The name stands for **S**mart **C**ontract **I**nvariant **Fuzz**er. The thesis 
 
 Honesty matters more than marketing. These are real gaps:
 
-- **No edge coverage yet.** sci-fuzz now records real per-instruction hitcounts from revm and feeds those into `CoverageFeedback`, but it does not yet record exact edge coverage (`prev_pc -> current_pc`) or perform block/sequence-level path canonicalization.
+- **No block- or sequence-level path IDs yet.** Coverage is keyed by `(contract, prev_pc, current_pc)` edges with AFL-style bucketing on each edge’s hitcount. There is no canonical basic-block trace, call-stack-aware edge key, or transaction-sequence fingerprint yet — different dynamic paths that share the same edge multiset can look identical to the engine.
 - **Shrinking is still a first pass.** The shrinker is deterministic and useful today, but it is not yet a full semantic reducer: it does not reason about ABI types, storage dependencies, or minimal base-state snapshots, and it does not guarantee globally minimal sequences.
 - **No multi-worker parallelism.** The fuzzing loop is single-threaded. The `workers` config field exists but is not wired.
 - **Foundry integration gaps after harness setup.** Script-based deploy flows, library-specific bootstrapping, and Forge cheatcodes (`vm.*`) are not implemented. Harness `setUp` must be plain Solidity (deploy, calls, storage); tests that rely on the Forge cheatcode VM may revert or behave incorrectly. There is still no `StdInvariant` / `targetContract` import path or parity with Foundry’s invariant runner.
@@ -49,7 +49,7 @@ Honesty matters more than marketing. These are real gaps:
 ```text
 campaign.rs    main loop: calibrate → select snapshot → generate/mutate → execute → check → learn
 harness.rs     Foundry-style setUp() selector + one-shot setup execution on the revm executor
-evm.rs         revm 19.7 wrapper: execute, deploy, static_call, snapshot/restore, Fast/Realistic modes, instruction coverage inspector
+evm.rs         revm 19.7 wrapper: execute, deploy, static_call, snapshot/restore, Fast/Realistic modes, edge coverage inspector
 snapshot.rs    state corpus: novelty-weighted selection, power scheduling metadata, auto-pruning over real coverage
 feedback.rs    AFL++ hitcount bucketing (8 classes), virgin-bits tracking, real-hitcount ingestion
 mutator.rs     ABI-aware generation, 5 mutation strategies, value dictionary, bytecode constant extraction

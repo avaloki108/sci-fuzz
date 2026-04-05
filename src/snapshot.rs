@@ -332,9 +332,9 @@ mod tests {
         // Corpus can hold at most 2 snapshots.
         let mut corpus = SnapshotCorpus::new(2);
 
-        // Snap A: covers PCs 0, 1 (shared with B).
+        // Snap A: covers edges (0,1) and (1,2) (shared with B).
         let _id_a = corpus.add(snapshot_with_pcs(&[(0, 1), (1, 2)]));
-        // Snap B: covers PCs 0, 1 (identical to A — redundant).
+        // Snap B: identical edge set to A — redundant.
         let _id_b = corpus.add(snapshot_with_pcs(&[(0, 1), (1, 2)]));
         assert_eq!(corpus.len(), 2);
 

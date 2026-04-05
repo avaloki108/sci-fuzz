@@ -671,6 +671,23 @@ mod tests {
         assert!(base.has_new_coverage(&superset));
     }
 
+    /// Two runs can visit the same set of PCs but follow different edges; that must count as new coverage.
+    #[test]
+    fn coverage_map_distinguishes_paths_with_same_pc_set_different_edges() {
+        let addr = Address::ZERO;
+
+        let mut path_ab = CoverageMap::new();
+        path_ab.record_hit(addr, 0, 1);
+        path_ab.record_hit(addr, 1, 2);
+
+        let mut path_acb = CoverageMap::new();
+        path_acb.record_hit(addr, 0, 2);
+        path_acb.record_hit(addr, 2, 1);
+
+        assert!(path_ab.has_new_coverage(&path_acb));
+        assert!(path_acb.has_new_coverage(&path_ab));
+    }
+
     #[test]
     fn severity_ordering() {
         assert!(Severity::Info < Severity::Low);
