@@ -10,8 +10,9 @@ use tiny_keccak::{Hasher, Keccak};
 use crate::economic::{
     Erc20BalanceStorageWithoutTransferOracle, Erc20BurnWithoutSupplyWriteOracle,
     Erc20MintWithoutSupplyWriteOracle, Erc4626EventAnomalyOracle, Erc4626ExchangeRateJumpOracle,
-    Erc4626RateJumpWithoutTokenFlowOracle, Erc4626SameTransactionDepositRateSpreadOracle,
-    Erc4626WithdrawRateJumpOracle, ProtocolProfileMap, UniswapV2StyleSwapReserveOracle,
+    Erc4626PreviewVsDepositEventOracle, Erc4626RateJumpWithoutTokenFlowOracle,
+    Erc4626SameTransactionDepositRateSpreadOracle, Erc4626WithdrawRateJumpOracle,
+    ProtocolProfileMap, UniswapV2StyleSwapReserveOracle, UniswapV2StyleSyncVsGetReservesOracle,
 };
 use crate::types::{Address, ExecutionResult, Finding, Severity, Transaction, B256, U256};
 
@@ -668,6 +669,12 @@ impl InvariantRegistry {
         reg.add(Box::new(UniswapV2StyleSwapReserveOracle {
             profiles: pmap.clone(),
         }));
+        reg.add(Box::new(Erc4626PreviewVsDepositEventOracle {
+            profiles: pmap.clone(),
+        }));
+        reg.add(Box::new(UniswapV2StyleSyncVsGetReservesOracle {
+            profiles: pmap.clone(),
+        }));
         reg.add(Box::new(Erc4626RateJumpWithoutTokenFlowOracle {
             max_multiplier: U256::from(5u64),
             profiles: pmap,
@@ -730,6 +737,7 @@ mod tests {
                 balance_changes,
             },
             sequence_cumulative_logs: Vec::new(),
+            protocol_probes: Default::default(),
         }
     }
 
@@ -831,8 +839,9 @@ mod tests {
         // FlashloanEconomicOracle, Erc4626EventAnomaly, Erc20MintWithoutSupplyWrite,
         // Erc20BalanceStorageWithoutTransfer, Erc4626ExchangeRateJump,
         // Erc20BurnWithoutSupplyWrite, Erc4626WithdrawRateJump, Erc4626SameTransactionDepositRateSpread,
-        // UniswapV2StyleSwapReserve, Erc4626RateJumpWithoutTokenFlow
-        assert_eq!(reg.len(), 14);
+        // UniswapV2StyleSwapReserve, Erc4626PreviewVsDepositEvent, UniswapV2StyleSyncVsGetReserves,
+        // Erc4626RateJumpWithoutTokenFlow (16 total)
+        assert_eq!(reg.len(), 16);
         assert!(!reg.is_empty());
     }
 
@@ -878,6 +887,7 @@ mod tests {
                 balance_changes: HashMap::new(),
             },
             sequence_cumulative_logs: Vec::new(),
+            protocol_probes: Default::default(),
         }
     }
 
@@ -1016,8 +1026,8 @@ mod tests {
         let attacker = Address::repeat_byte(0x99);
         let tokens = vec![Address::repeat_byte(0xA1), Address::repeat_byte(0xA2)];
         let reg = InvariantRegistry::with_erc20(attacker, &tokens);
-        // 14 defaults + 2 ERC20Supply invariants
-        assert_eq!(reg.len(), 16);
+        // 16 defaults + 2 ERC20Supply invariants
+        assert_eq!(reg.len(), 18);
     }
 
     // -- EchidnaPropertyCaller tests ------------------------------------------

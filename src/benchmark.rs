@@ -302,6 +302,7 @@ fn run_sci_fuzz_case(case: &BenchmarkCase, seed: u64) -> ScorecardEntry {
         rpc_url: None,
         rpc_block_number: None,
         attacker_address: None,
+        ..Default::default()
     };
 
     let mut campaign = Campaign::new(config);

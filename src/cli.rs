@@ -68,13 +68,14 @@ deep-state vulnerabilities.
     )]
     Forge(ForgeArgs),
 
-    /// Audit a deployed contract
+    /// Audit deployed contract(s) on a JSON-RPC fork
     #[command(
         name = "audit",
-        about = "Audit a deployed contract on-chain",
+        about = "Audit deployed contract(s) on-chain",
         long_about = r#"
-Audit a deployed contract by forking the chain at a specific block.
-Automatically generates exploits and provides detailed vulnerability reports.
+Fork at a block (or `latest`) and fuzz one or more predeployed addresses on that chain state.
+Requires `--rpc-url` or `ETH_RPC_URL`. Optional Etherscan ABI fetch per address when an API key is set.
+This is sci-fuzz’s own revm campaign — not `forge test` and not a cheatcode VM.
 "#
     )]
     Audit(AuditArgs),
@@ -84,8 +85,8 @@ Automatically generates exploits and provides detailed vulnerability reports.
         name = "test",
         about = "Run Foundry tests with enhanced fuzzing",
         long_about = r#"
-Replace `forge test` with Sci-Fuzz's enhanced fuzzing capabilities.
-Supports all Foundry test patterns with deeper state exploration.
+**Not implemented yet** — this subcommand is a stub. Sci-Fuzz does not run `forge test`
+or replace the Foundry test runner. Use `sci-fuzz forge` for in-engine fuzzing.
 "#
     )]
     Test(TestArgs),
@@ -95,8 +96,7 @@ Supports all Foundry test patterns with deeper state exploration.
         name = "ci",
         about = "Run security scan for CI/CD pipelines",
         long_about = r#"
-Run a security scan suitable for CI/CD pipelines.
-Outputs results in machine-readable formats (JUnit, SARIF).
+**Not implemented yet** — stub only. Use `sci-fuzz forge` or library API for real runs.
 "#
     )]
     Ci(CiArgs),
@@ -106,8 +106,7 @@ Outputs results in machine-readable formats (JUnit, SARIF).
         name = "diff",
         about = "Compare two implementations via differential fuzzing",
         long_about = r#"
-Compare two contract implementations using differential fuzzing.
-Detects behavioral differences that could indicate bugs or optimization issues.
+**Not implemented yet** — stub only.
 "#
     )]
     Diff(DiffArgs),
@@ -228,8 +227,9 @@ pub struct BenchmarkArgs {
 /// Arguments for the `audit` subcommand
 #[derive(Parser, Debug)]
 pub struct AuditArgs {
-    /// Contract address to audit
-    pub address: String,
+    /// On-chain contract address(es) to fuzz against the fork (one or more)
+    #[arg(required = true)]
+    pub addresses: Vec<String>,
 
     /// RPC URL for on-chain access
     #[arg(long)]
@@ -531,6 +531,20 @@ mod tests {
                 assert_eq!(forge_args.depth, 100);
             }
             _ => panic!("Expected forge command"),
+        }
+
+        let audit = vec![
+            "sci-fuzz",
+            "audit",
+            "0x1111111111111111111111111111111111111111",
+            "0x2222222222222222222222222222222222222222",
+        ];
+        let cli = Cli::parse_from(audit);
+        match cli.command {
+            Commands::Audit(ref a) => {
+                assert_eq!(a.addresses.len(), 2);
+            }
+            _ => panic!("Expected audit command"),
         }
     }
 

@@ -202,6 +202,7 @@ fn handle_forge(args: sci_fuzz::cli::ForgeArgs) -> Result<()> {
         rpc_url: fork_url,
         rpc_block_number: args.fork_block,
         attacker_address,
+        ..Default::default()
     };
 
     let mut campaign = Campaign::new(config);
@@ -231,7 +232,7 @@ fn handle_audit(args: sci_fuzz::cli::AuditArgs) -> Result<()> {
     let _ = dotenvy_load();
 
     println!("⚡ sci-fuzz audit");
-    println!("  address   : {}", args.address);
+    println!("  addresses : {}", args.addresses.join(", "));
     println!("  chain     : {}", args.chain);
     println!("  timeout   : {}s", args.timeout);
     println!("  flashloan : {}", args.flashloan);
@@ -268,8 +269,6 @@ fn handle_audit(args: sci_fuzz::cli::AuditArgs) -> Result<()> {
         Ok(()) => println!("  ✅ RPC reachable (eth_blockNumber)"),
         Err(e) => eprintln!("  ⚠️  RPC probe failed: {e}"),
     }
-    let target_address: Address = args.address.parse().context("Invalid address format")?;
-
     // Resolve Etherscan API key from CLI flag → env var.
     let api_key = args
         .etherscan_key
@@ -277,32 +276,48 @@ fn handle_audit(args: sci_fuzz::cli::AuditArgs) -> Result<()> {
         .or_else(|| std::env::var("ETHERSCAN_API_KEY").ok())
         .unwrap_or_default();
 
-    let mut abi_val = None;
-    if !api_key.is_empty() {
-        println!();
-        println!(
-            "  🔍 Fetching ABI from Etherscan for {} ({})…",
-            args.address, args.chain
-        );
-        match sci_fuzz::rpc::fetch_etherscan_abi(&args.address, &args.chain, &api_key) {
-            Ok(abi) => {
-                println!("  ✅ ABI retrieved successfully!");
-                abi_val = Some(abi);
-            }
-            Err(e) => {
-                println!("  ⚠️  ABI retrieval failed: {e}");
-            }
-        }
-    }
+    let mut targets: Vec<ContractInfo> = Vec::new();
+    for addr_str in &args.addresses {
+        let target_address: Address = addr_str
+            .parse()
+            .with_context(|| format!("Invalid address format: {addr_str}"))?;
 
-    let target = ContractInfo {
-        address: target_address,
-        deployed_bytecode: Bytes::new(), // In fork mode, we don't need bytecode here, revm will fetch it.
-        creation_bytecode: None,
-        name: Some(format!("AuditTarget_{}", &args.address[..6])),
-        source_path: None,
-        abi: abi_val,
-    };
+        let mut abi_val = None;
+        if !api_key.is_empty() {
+            println!();
+            println!(
+                "  🔍 Fetching ABI from Etherscan for {} ({})…",
+                addr_str, args.chain
+            );
+            match sci_fuzz::rpc::fetch_etherscan_abi(addr_str, &args.chain, &api_key) {
+                Ok(abi) => {
+                    println!("  ✅ ABI retrieved successfully!");
+                    abi_val = Some(abi);
+                }
+                Err(e) => {
+                    println!("  ⚠️  ABI retrieval failed: {e}");
+                }
+            }
+        } else if targets.is_empty() {
+            println!();
+            println!("  ℹ️  No ETHERSCAN_API_KEY — ABIs will be missing unless provided elsewhere.");
+        }
+
+        let short = addr_str
+            .strip_prefix("0x")
+            .unwrap_or(addr_str)
+            .chars()
+            .take(6)
+            .collect::<String>();
+        targets.push(ContractInfo {
+            address: target_address,
+            deployed_bytecode: Bytes::new(),
+            creation_bytecode: None,
+            name: Some(format!("AuditTarget_{short}")),
+            source_path: None,
+            abi: abi_val,
+        });
+    }
 
     let attacker_address = args
         .attacker
@@ -319,12 +334,13 @@ fn handle_audit(args: sci_fuzz::cli::AuditArgs) -> Result<()> {
         max_snapshots: 1024,
         workers: 1, // Audit usually runs single-threaded for stability across network
         seed: rand::random(),
-        targets: vec![target],
+        targets,
         harness: None,
         mode: ExecutorMode::Realistic, // Audits should use realistic mode by default
         rpc_url: Some(rpc_url.clone()),
         rpc_block_number: block,
         attacker_address,
+        ..Default::default()
     };
 
     println!();

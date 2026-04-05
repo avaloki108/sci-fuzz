@@ -145,6 +145,10 @@ pub struct ExecutionResult {
     /// replay; the EVM executor leaves this empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sequence_cumulative_logs: Vec<Log>,
+    /// Executor-backed `static_call` probes at post-transaction state (see
+    /// [`crate::protocol_probes::fill_protocol_probes`]).
+    #[serde(default, skip_serializing_if = "ProtocolProbeReport::is_empty")]
+    pub protocol_probes: ProtocolProbeReport,
 }
 
 impl Default for ExecutionResult {
@@ -158,7 +162,83 @@ impl Default for ExecutionResult {
             dataflow: DataflowWaypoints::new(),
             state_diff: StateDiff::default(),
             sequence_cumulative_logs: Vec::new(),
+            protocol_probes: ProtocolProbeReport::default(),
         }
+    }
+}
+
+// ── Protocol probes (static_call) ───────────────────────────────────────────
+
+/// Result of a single view probe (decoded scalar).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ProbeScalar {
+    U256(U256),
+    Address(Address),
+}
+
+/// Outcome of one `static_call` probe.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ProbeStatus {
+    Ok(ProbeScalar),
+    Reverted,
+    DecodeFailed,
+    Skipped,
+}
+
+/// One ERC-4626 `Deposit` event correlated with `previewDeposit` / `convertToShares` probes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Erc4626DepositProbeRow {
+    pub assets: U256,
+    pub shares_emitted: U256,
+    pub preview_deposit_shares: Option<ProbeStatus>,
+    pub convert_to_shares: Option<ProbeStatus>,
+}
+
+/// One ERC-4626 `Withdraw` event correlated with preview probes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Erc4626WithdrawProbeRow {
+    pub assets: U256,
+    pub shares_burned: U256,
+    pub preview_withdraw_shares: Option<ProbeStatus>,
+    pub preview_redeem_assets: Option<ProbeStatus>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Erc4626ProbeSnapshot {
+    pub asset: Option<ProbeStatus>,
+    pub total_assets: Option<ProbeStatus>,
+    pub deposit_rows: Vec<Erc4626DepositProbeRow>,
+    pub withdraw_rows: Vec<Erc4626WithdrawProbeRow>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Erc20ProbeSnapshot {
+    pub total_supply: Option<ProbeStatus>,
+    pub balance_of_caller: Option<ProbeStatus>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AmmProbeSnapshot {
+    pub reserve0: Option<ProbeStatus>,
+    pub reserve1: Option<ProbeStatus>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContractProbeSnapshot {
+    pub erc4626: Option<Erc4626ProbeSnapshot>,
+    pub erc20: Option<Erc20ProbeSnapshot>,
+    pub amm: Option<AmmProbeSnapshot>,
+}
+
+/// Per-step `static_call` probe bundle attached to an [`ExecutionResult`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProtocolProbeReport {
+    pub per_contract: HashMap<Address, ContractProbeSnapshot>,
+}
+
+impl ProtocolProbeReport {
+    pub fn is_empty(&self) -> bool {
+        self.per_contract.is_empty()
     }
 }
 
@@ -611,6 +691,12 @@ impl Finding {
         if title.starts_with("Economic: ERC-4626 rate shock without Transfer to vault") {
             return "economic-erc4626-rate-jump-no-token-flow".into();
         }
+        if title.starts_with("Economic: ERC-4626 probe previewDeposit vs Deposit event") {
+            return "economic-erc4626-probe-deposit-mismatch".into();
+        }
+        if title.starts_with("Economic: AMM Sync reserves vs getReserves") {
+            return "economic-amm-sync-vs-getreserves".into();
+        }
 
         title.to_string()
     }
@@ -657,10 +743,30 @@ pub struct CampaignConfig {
     /// Optional block number to pin the fork to.
     #[serde(default)]
     pub rpc_block_number: Option<u64>,
+    /// When forking: if `true`, keep the attacker's balance from chain state instead of overwriting it in the overlay DB.
+    #[serde(default)]
+    pub fork_preserve_attacker_balance: bool,
+    /// When forking and [`Self::fork_preserve_attacker_balance`] is `false`: balance written for the attacker (default 100 ETH).
+    #[serde(default = "default_fork_attacker_balance_wei")]
+    pub fork_attacker_balance_wei: U256,
+    /// When forking: copy `eth_getCode` into [`ContractInfo::deployed_bytecode`] for targets with empty bytecode (logs / value dict; execution already uses RPC).
+    #[serde(default = "default_true")]
+    pub fork_hydrate_deployed_bytecode: bool,
+    /// Optional: warn when `eth_chainId` differs (wrong endpoint for intended network).
+    #[serde(default)]
+    pub fork_expected_chain_id: Option<u64>,
     /// Optional funded fuzzer EOA (`msg.sender` pool). When `None`, uses the
     /// default test address `0x42…42`.
     #[serde(default)]
     pub attacker_address: Option<Address>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_fork_attacker_balance_wei() -> U256 {
+    U256::from(100_000_000_000_000_000_000_u128)
 }
 
 impl CampaignConfig {
@@ -688,6 +794,10 @@ impl Default for CampaignConfig {
             mode: ExecutorMode::Fast,
             rpc_url: None,
             rpc_block_number: None,
+            fork_preserve_attacker_balance: false,
+            fork_attacker_balance_wei: default_fork_attacker_balance_wei(),
+            fork_hydrate_deployed_bytecode: true,
+            fork_expected_chain_id: None,
             attacker_address: None,
         }
     }
@@ -864,5 +974,27 @@ mod tests {
             exploit_profit: None,
         };
         assert_eq!(f.failure_class(), "economic-erc20-burn-no-supply");
+
+        let g = Finding {
+            severity: Severity::High,
+            title: "Economic: ERC-4626 probe previewDeposit vs Deposit event (0x0000000000000000000000000000000000000001)"
+                .into(),
+            description: String::new(),
+            contract: Address::ZERO,
+            reproducer: vec![],
+            exploit_profit: None,
+        };
+        assert_eq!(g.failure_class(), "economic-erc4626-probe-deposit-mismatch");
+
+        let h = Finding {
+            severity: Severity::High,
+            title: "Economic: AMM Sync reserves vs getReserves (0x0000000000000000000000000000000000000002)"
+                .into(),
+            description: String::new(),
+            contract: Address::ZERO,
+            reproducer: vec![],
+            exploit_profit: None,
+        };
+        assert_eq!(h.failure_class(), "economic-amm-sync-vs-getreserves");
     }
 }

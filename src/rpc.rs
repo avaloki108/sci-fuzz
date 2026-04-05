@@ -19,7 +19,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use revm::{
     primitives::{
-        AccountInfo, Address as RevmAddress, Bytecode, B256 as RevmB256, U256 as RevmU256,
+        AccountInfo, Address as RevmAddress, BlockEnv, Bytecode, B256 as RevmB256, U256 as RevmU256,
     },
     Database,
 };
@@ -279,6 +279,210 @@ pub fn fork_block_tag_json(block: Option<u64>) -> serde_json::Value {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Chain ID, fork block header, block env alignment
+// ---------------------------------------------------------------------------
+
+/// `eth_chainId` → host chain id (for diagnostics and optional mismatch checks).
+pub fn fetch_eth_chain_id(url: &str) -> Result<u64> {
+    let v = rpc_post(url, "eth_chainId", serde_json::json!([]))?;
+    parse_json_hex_u64(&v).context("eth_chainId: expected hex quantity string")
+}
+
+fn parse_json_hex_u64(v: &serde_json::Value) -> Result<u64> {
+    let s = v
+        .as_str()
+        .ok_or_else(|| anyhow!("expected hex string"))?
+        .trim();
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    u64::from_str_radix(s, 16).context("parse hex u64")
+}
+
+/// Header fields from `eth_getBlockByNumber` used to align [`BlockEnv`] with the fork.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkBlockHeader {
+    pub number: u64,
+    pub timestamp: u64,
+    pub gas_limit: Option<u64>,
+    pub basefee: Option<RevmU256>,
+    pub difficulty: Option<RevmU256>,
+    pub prevrandao: Option<RevmB256>,
+    pub excess_blob_gas: Option<u64>,
+}
+
+/// Fetch full block object for the fork tag (single RPC round-trip).
+pub fn fetch_fork_block_object(url: &str, block: Option<u64>) -> Result<serde_json::Value> {
+    let tag = fork_block_tag_json(block);
+    rpc_post(
+        url,
+        "eth_getBlockByNumber",
+        serde_json::json!([tag, false]),
+    )
+}
+
+/// Parse [`ForkBlockHeader`] from `eth_getBlockByNumber` result object (testable).
+pub fn parse_fork_block_header(v: &serde_json::Value) -> Result<ForkBlockHeader> {
+    let obj = v
+        .as_object()
+        .ok_or_else(|| anyhow!("eth_getBlockByNumber: not an object"))?;
+    let num_hex = obj
+        .get("number")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| anyhow!("eth_getBlockByNumber: missing number"))?;
+    let ts_hex = obj
+        .get("timestamp")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| anyhow!("eth_getBlockByNumber: missing timestamp"))?;
+    let number =
+        u64::from_str_radix(num_hex.trim_start_matches("0x"), 16).context("parse block number")?;
+    let timestamp = u64::from_str_radix(ts_hex.trim_start_matches("0x"), 16)
+        .context("parse block timestamp")?;
+
+    let gas_limit = obj
+        .get("gasLimit")
+        .and_then(json_hex_u64);
+    let basefee = obj
+        .get("baseFeePerGas")
+        .and_then(json_hex_u256);
+    let difficulty = obj
+        .get("difficulty")
+        .and_then(json_hex_u256);
+    let prevrandao = obj
+        .get("mixHash")
+        .and_then(|x| x.as_str())
+        .map(parse_hex_b256)
+        .transpose()?;
+    let excess_blob_gas = obj
+        .get("excessBlobGas")
+        .and_then(json_hex_u64);
+
+    Ok(ForkBlockHeader {
+        number,
+        timestamp,
+        gas_limit,
+        basefee,
+        difficulty,
+        prevrandao,
+        excess_blob_gas,
+    })
+}
+
+fn json_hex_u64(v: &serde_json::Value) -> Option<u64> {
+    let s = v.as_str()?;
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    u64::from_str_radix(s, 16).ok()
+}
+
+fn json_hex_u256(v: &serde_json::Value) -> Option<RevmU256> {
+    let s = v.as_str()?;
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    RevmU256::from_str_radix(s, 16).ok()
+}
+
+fn parse_hex_b256(s: &str) -> Result<RevmB256> {
+    let bytes = hex::decode(s.trim_start_matches("0x")).context("decode mixHash")?;
+    if bytes.len() != 32 {
+        return Err(anyhow!("mixHash: expected 32 bytes"));
+    }
+    Ok(RevmB256::from_slice(&bytes))
+}
+
+/// Best-effort: align revm [`BlockEnv`] with fork header fields. Missing fields keep prior values.
+pub fn merge_fork_header_into_block_env(header: &ForkBlockHeader, be: &mut BlockEnv) {
+    be.number = RevmU256::from(header.number);
+    be.timestamp = RevmU256::from(header.timestamp);
+    if let Some(gl) = header.gas_limit {
+        be.gas_limit = RevmU256::from(gl);
+    }
+    if let Some(bf) = header.basefee {
+        be.basefee = bf;
+    }
+    if let Some(d) = header.difficulty {
+        be.difficulty = d;
+    }
+    if let Some(p) = header.prevrandao {
+        be.prevrandao = Some(p);
+    }
+    if let Some(excess) = header.excess_blob_gas {
+        be.set_blob_excess_gas_and_price(excess, false);
+    }
+}
+
+/// Fetch [`ForkBlockHeader`] from RPC.
+pub fn fetch_fork_block_header_full(url: &str, block: Option<u64>) -> Result<ForkBlockHeader> {
+    let v = fetch_fork_block_object(url, block)?;
+    parse_fork_block_header(&v)
+}
+
+// ---------------------------------------------------------------------------
+// Deployed-target preflight (enriched)
+// ---------------------------------------------------------------------------
+
+/// Heuristic classification of proxy-like runtime code (hints only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyBytecodeHint {
+    None,
+    /// EIP-1167 minimal proxy pattern (45-byte runtime).
+    Eip1167MinimalProxy,
+}
+
+/// Result of validating `eth_getCode` for a predeployed target.
+#[derive(Debug, Clone)]
+pub struct DeployedPreflightResult {
+    /// Raw runtime bytes from the node.
+    pub code: Vec<u8>,
+    pub proxy_hint: ProxyBytecodeHint,
+}
+
+/// EIP-1167 minimal proxy: fixed prefix + 20-byte implementation + fixed suffix (45 bytes).
+pub(crate) const EIP1167_PREFIX: [u8; 10] =
+    [0x36, 0x3d, 0x3d, 0x37, 0x3d, 0x3d, 0x3d, 0x36, 0x3d, 0x73];
+pub(crate) const EIP1167_SUFFIX: [u8; 15] = [
+    0x5a, 0xf4, 0x3d, 0x82, 0x80, 0x3e, 0x90, 0x3d, 0x91, 0x60, 0x2b, 0x57, 0xfd, 0x5b, 0xf3,
+];
+
+/// Classify bytecode for logging / triage (not proof of proxy type).
+pub fn proxy_bytecode_hint(code: &[u8]) -> ProxyBytecodeHint {
+    if code.len() == 45
+        && code.starts_with(&EIP1167_PREFIX)
+        && code.ends_with(&EIP1167_SUFFIX)
+    {
+        return ProxyBytecodeHint::Eip1167MinimalProxy;
+    }
+    ProxyBytecodeHint::None
+}
+
+/// Decode `eth_getCode` hex string to bytes; empty is an error for predeploy checks.
+pub fn parse_runtime_code_hex(code_hex: &str) -> Result<Vec<u8>> {
+    let bytes = hex::decode(code_hex.trim_start_matches("0x")).context("decode code hex")?;
+    if bytes.is_empty() {
+        return Err(anyhow!(
+            "no contract code at this address for the configured fork block (eth_getCode empty)"
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Fetch and validate runtime code; returns size and optional proxy hint.
+pub fn preflight_deployed_target_enriched(
+    url: &str,
+    block: Option<u64>,
+    address: crate::types::Address,
+) -> Result<DeployedPreflightResult> {
+    let addr_str = format!("0x{}", hex::encode(address.as_slice()));
+    let code_hex = rpc_post(
+        url,
+        "eth_getCode",
+        serde_json::json!([&addr_str, fork_block_tag_json(block)]),
+    )?
+    .as_str()
+    .ok_or_else(|| anyhow!("eth_getCode: expected string"))?
+    .to_string();
+    let code = parse_runtime_code_hex(&code_hex)?;
+    let proxy_hint = proxy_bytecode_hint(&code);
+    Ok(DeployedPreflightResult { code, proxy_hint })
+}
+
 fn rpc_post(url: &str, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
     if url.trim().is_empty() {
         return Err(anyhow!("RPC URL is empty"));
@@ -312,24 +516,8 @@ pub fn rpc_probe_url(url: &str) -> Result<()> {
 
 /// Fetch `(block_number, block_timestamp)` for the same fork tag as [`RpcCacheDB`].
 pub fn fetch_fork_block_header(url: &str, block: Option<u64>) -> Result<(u64, u64)> {
-    let tag = fork_block_tag_json(block);
-    let v = rpc_post(url, "eth_getBlockByNumber", serde_json::json!([tag, false]))?;
-    let obj = v
-        .as_object()
-        .ok_or_else(|| anyhow!("eth_getBlockByNumber: not an object"))?;
-    let num_hex = obj
-        .get("number")
-        .and_then(|x| x.as_str())
-        .ok_or_else(|| anyhow!("eth_getBlockByNumber: missing number"))?;
-    let ts_hex = obj
-        .get("timestamp")
-        .and_then(|x| x.as_str())
-        .ok_or_else(|| anyhow!("eth_getBlockByNumber: missing timestamp"))?;
-    let number =
-        u64::from_str_radix(num_hex.trim_start_matches("0x"), 16).context("parse block number")?;
-    let timestamp = u64::from_str_radix(ts_hex.trim_start_matches("0x"), 16)
-        .context("parse block timestamp")?;
-    Ok((number, timestamp))
+    let h = fetch_fork_block_header_full(url, block)?;
+    Ok((h.number, h.timestamp))
 }
 
 /// Ensure `eth_getCode` at `address` is non-empty at the fork block (deployed contract).
@@ -339,20 +527,8 @@ pub fn preflight_deployed_code_nonempty(
     address: crate::types::Address,
 ) -> Result<()> {
     let addr_str = format!("0x{}", hex::encode(address.as_slice()));
-    let code_hex = rpc_post(
-        url,
-        "eth_getCode",
-        serde_json::json!([&addr_str, fork_block_tag_json(block)]),
-    )?
-    .as_str()
-    .ok_or_else(|| anyhow!("eth_getCode: expected string"))?
-    .to_string();
-    let bytes = hex::decode(code_hex.trim_start_matches("0x")).context("decode code")?;
-    if bytes.is_empty() {
-        return Err(anyhow!(
-            "no contract code at {addr_str} for the configured fork block (eth_getCode empty)"
-        ));
-    }
+    preflight_deployed_target_enriched(url, block, address)
+        .map_err(|e| anyhow!("preflight failed for {addr_str}: {e:#}"))?;
     Ok(())
 }
 
@@ -494,6 +670,7 @@ impl Database for FuzzerDatabase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use revm::primitives::{B256 as RevmB256, U256 as RevmU256};
 
     #[test]
     fn etherscan_base_url_mainnet() {
@@ -526,5 +703,63 @@ mod tests {
         b.test_seed_account(addr, AccountInfo::default());
         assert_eq!(a.test_account_cache_len(), 1);
         assert_eq!(b.test_account_cache_len(), 1);
+    }
+
+    #[test]
+    fn parse_fork_block_header_reads_number_timestamp_and_optional_fields() {
+        let v = serde_json::json!({
+            "number": "0xc",
+            "timestamp": "0x3e8",
+            "gasLimit": "0x1c9c380",
+            "baseFeePerGas": "0x3b9aca00",
+            "difficulty": "0x0",
+            "mixHash": "0x0101010101010101010101010101010101010101010101010101010101010101",
+            "excessBlobGas": "0x100"
+        });
+        let h = parse_fork_block_header(&v).unwrap();
+        assert_eq!(h.number, 12);
+        assert_eq!(h.timestamp, 1000);
+        assert_eq!(h.gas_limit, Some(30_000_000));
+        assert_eq!(h.excess_blob_gas, Some(256));
+        assert!(h.basefee.is_some());
+        assert!(h.prevrandao.is_some());
+    }
+
+    #[test]
+    fn merge_fork_header_sets_block_env_fields() {
+        let h = ForkBlockHeader {
+            number: 19_000_000,
+            timestamp: 1_700_000_000,
+            gas_limit: Some(30_000_000),
+            basefee: Some(RevmU256::from(1_000_000_000u64)),
+            difficulty: Some(RevmU256::ZERO),
+            prevrandao: Some(RevmB256::ZERO),
+            excess_blob_gas: Some(0),
+        };
+        let mut be = revm::primitives::BlockEnv::default();
+        merge_fork_header_into_block_env(&h, &mut be);
+        assert_eq!(be.number, RevmU256::from(19_000_000u64));
+        assert_eq!(be.timestamp, RevmU256::from(1_700_000_000u64));
+        assert_eq!(be.gas_limit, RevmU256::from(30_000_000u64));
+    }
+
+    #[test]
+    fn proxy_bytecode_hint_detects_eip1167() {
+        let mut code = Vec::from(EIP1167_PREFIX);
+        code.extend(std::iter::repeat(0xab_u8).take(20));
+        code.extend_from_slice(&EIP1167_SUFFIX);
+        assert_eq!(proxy_bytecode_hint(&code), ProxyBytecodeHint::Eip1167MinimalProxy);
+        assert_eq!(proxy_bytecode_hint(&[0x60, 0x00, 0x60, 0x00]), ProxyBytecodeHint::None);
+    }
+
+    #[test]
+    fn parse_runtime_code_hex_rejects_empty() {
+        assert!(parse_runtime_code_hex("0x").is_err());
+    }
+
+    #[test]
+    fn parse_runtime_code_hex_accepts_nonempty() {
+        let b = parse_runtime_code_hex("0x6000").unwrap();
+        assert_eq!(b, vec![0x60, 0x00]);
     }
 }

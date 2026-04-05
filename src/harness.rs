@@ -29,7 +29,7 @@ pub fn run_setup(executor: &mut EvmExecutor, sender: Address, harness: Address) 
     let result = executor.execute(&tx).context("setUp() execution failed")?;
     if !result.success {
         return Err(anyhow::anyhow!(
-            "setUp() reverted: 0x{}",
+            "setUp() reverted (Forge vm.* cheatcodes are not available in sci-fuzz): 0x{}",
             hex::encode(&result.output)
         ));
     }

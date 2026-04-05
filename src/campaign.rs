@@ -23,11 +23,11 @@ use crate::mutator::TxMutator;
 use crate::oracle::{capture_eth_baseline, OracleEngine};
 use crate::shrinker::SequenceShrinker;
 use crate::snapshot::SnapshotCorpus;
+use crate::economic::ProtocolProfileMap;
 use crate::types::{
-    contract_info_for_mutator, Address, CampaignConfig, ContractInfo, CoverageMap, Finding,
+    contract_info_for_mutator, Address, Bytes, CampaignConfig, ContractInfo, CoverageMap, Finding,
     StateSnapshot, Transaction, U256,
 };
-use revm::primitives::U256 as RevmU256;
 
 /// ABI function names excluded from fuzzing (harness lifecycle; setup runs once at bootstrap).
 const STRIP_HARNESS_LIFECYCLE: &[&str] = &["setUp", "beforeTest", "afterTest"];
@@ -163,15 +163,31 @@ impl Campaign {
         if let Some(ref url) = self.config.rpc_url {
             let url = url.trim();
             crate::rpc::rpc_probe_url(url)?;
-            let (num, ts) = crate::rpc::fetch_fork_block_header(url, self.config.rpc_block_number)?;
+            match crate::rpc::fetch_eth_chain_id(url) {
+                Ok(cid) => {
+                    eprintln!("[campaign] fork: chain_id={cid} (eth_chainId)");
+                    if let Some(expected) = self.config.fork_expected_chain_id {
+                        if expected != cid {
+                            eprintln!(
+                                "[campaign] warning: fork_expected_chain_id={expected} but RPC reports chain_id={cid} — wrong RPC network?"
+                            );
+                        }
+                    }
+                }
+                Err(e) => eprintln!("[campaign] warning: eth_chainId failed: {e:#}"),
+            }
+            let header = crate::rpc::fetch_fork_block_header_full(url, self.config.rpc_block_number)?;
             {
                 let be = executor.block_env_mut();
-                be.number = RevmU256::from(num);
-                be.timestamp = RevmU256::from(ts);
+                crate::rpc::merge_fork_header_into_block_env(&header, be);
             }
             eprintln!(
-                "[campaign] fork: block_number={} timestamp={} (rpc_block tag: {:?})",
-                num, ts, self.config.rpc_block_number
+                "[campaign] fork: block_number={} timestamp={} gas_limit={:?} basefee={:?} (rpc_block tag: {:?})",
+                header.number,
+                header.timestamp,
+                header.gas_limit,
+                header.basefee,
+                self.config.rpc_block_number
             );
         }
 
@@ -183,10 +199,25 @@ impl Campaign {
         if attacker.is_zero() {
             anyhow::bail!("attacker_address must not be zero; leave unset for default 0x42…42");
         }
-        executor.set_balance(attacker, U256::from(100_000_000_000_000_000_000_u128)); // 100 ETH
+        if self.config.rpc_url.is_some() {
+            if self.config.fork_preserve_attacker_balance {
+                eprintln!(
+                    "[campaign] fork: preserving attacker balance from chain (no balance overlay)"
+                );
+            } else {
+                executor.set_balance(attacker, self.config.fork_attacker_balance_wei);
+                eprintln!(
+                    "[campaign] fork: attacker balance set to {} wei",
+                    self.config.fork_attacker_balance_wei
+                );
+            }
+        } else {
+            executor.set_balance(attacker, U256::from(100_000_000_000_000_000_000_u128)); // 100 ETH local
+        }
 
-        // --- Validate deployed-only targets (RPC preflight) ---------------
-        for target in &self.config.targets {
+        // --- Validate / enrich deployed-only targets (RPC preflight) -------
+        let mut work_targets = self.config.targets.clone();
+        for target in &mut work_targets {
             let has_init = target
                 .creation_bytecode
                 .as_ref()
@@ -206,13 +237,44 @@ impl Campaign {
                 if let Some(ref url) = self.config.rpc_url {
                     let u = url.trim();
                     if !u.is_empty() {
-                        crate::rpc::preflight_deployed_code_nonempty(
+                        let pre = crate::rpc::preflight_deployed_target_enriched(
                             u,
                             self.config.rpc_block_number,
                             target.address,
-                        )?;
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "preflight failed for target {}: {e:#}",
+                                target.address
+                            )
+                        })?;
+                        eprintln!(
+                            "[campaign] preflight: {} code_size={} bytes proxy_hint={:?}",
+                            target.address,
+                            pre.code.len(),
+                            pre.proxy_hint
+                        );
+                        if self.config.fork_hydrate_deployed_bytecode {
+                            target.deployed_bytecode = Bytes::from(pre.code);
+                        }
                     }
                 }
+            }
+        }
+
+        if self.config.rpc_url.is_some() {
+            let any_local_deploy = work_targets.iter().any(|t| {
+                let deployment_bytecode = t
+                    .creation_bytecode
+                    .clone()
+                    .filter(|code| !code.is_empty())
+                    .unwrap_or_else(|| t.deployed_bytecode.clone());
+                !deployment_bytecode.is_empty()
+            });
+            if any_local_deploy {
+                eprintln!(
+                    "[campaign] fork: deploying local bytecode onto forked state (not Forge script replay); chain predeploys use code at the pinned block"
+                );
             }
         }
 
@@ -221,7 +283,7 @@ impl Campaign {
         // because they differ from the config addresses.  The mutator and
         // property callers need to target the real on-chain addresses.
         let mut deployed_targets: Vec<ContractInfo> = Vec::new();
-        for target in &self.config.targets {
+        for target in &work_targets {
             let deployment_bytecode = target
                 .creation_bytecode
                 .clone()
@@ -267,7 +329,11 @@ impl Campaign {
             });
 
             crate::harness::run_setup(&mut executor, attacker, deployed_addr)
-                .map_err(|e| anyhow::anyhow!("harness setUp failed: {e}"))?;
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "harness setUp failed (sci-fuzz does not implement Forge vm.* cheatcodes): {e}"
+                    )
+                })?;
             eprintln!(
                 "[campaign] ran setUp() on harness {} ({})",
                 harness.name.as_deref().unwrap_or("?"),
@@ -298,7 +364,10 @@ impl Campaign {
         mutator.add_to_address_pool(attacker);
         let protocol_profiles =
             crate::protocol_semantics::build_protocol_profiles(&deployed_targets);
-        let oracle = OracleEngine::new_with_protocol_profiles(attacker, Some(protocol_profiles));
+        let oracle = OracleEngine::new_with_protocol_profiles(
+            attacker,
+            Some(Arc::clone(&protocol_profiles)),
+        );
 
         // --- Build Echidna property callers at deployed addresses -----------
         let mut property_callers: Vec<EchidnaPropertyCaller> = Vec::new();
@@ -436,6 +505,7 @@ impl Campaign {
                 oracle,
                 property_callers,
                 target_abis,
+                protocol_profiles,
                 attacker,
                 effective_workers,
             );
@@ -568,6 +638,16 @@ impl Campaign {
                     }
                 }
 
+                // --- Protocol probes (post-state static_call) --------------
+                crate::protocol_probes::fill_protocol_probes(
+                    &executor,
+                    attacker,
+                    &protocol_profiles,
+                    &target_abis,
+                    &sequence,
+                    &mut result,
+                );
+
                 // --- Oracle / invariant checks -----------------------------
                 let new_findings = oracle.check(&pre_seq_balances, &result, &sequence);
                 if !new_findings.is_empty() {
@@ -587,6 +667,7 @@ impl Campaign {
                             &oracle,
                             &property_callers,
                             &target_abis,
+                            &protocol_profiles,
                             attacker,
                             &f,
                             &repro,
@@ -727,6 +808,7 @@ impl Campaign {
                         &oracle,
                         &property_callers,
                         &target_abis,
+                        &protocol_profiles,
                         attacker,
                         &f,
                         &sequence,
@@ -813,6 +895,7 @@ fn run_parallel_campaign(
     oracle: OracleEngine,
     property_callers: Vec<EchidnaPropertyCaller>,
     target_abis: HashMap<Address, JsonAbi>,
+    protocol_profiles: ProtocolProfileMap,
     attacker: Address,
     worker_count: usize,
 ) -> anyhow::Result<CampaignReport> {
@@ -839,6 +922,7 @@ fn run_parallel_campaign(
             let oracle = Arc::clone(&oracle);
             let property_callers = Arc::clone(&property_callers);
             let target_abis = Arc::clone(&target_abis);
+            let protocol_profiles = protocol_profiles.clone();
             let config = Arc::clone(&config);
             s.spawn(move || {
                 parallel_worker_loop(
@@ -849,6 +933,7 @@ fn run_parallel_campaign(
                     oracle,
                     property_callers,
                     target_abis,
+                    protocol_profiles,
                     attacker,
                     start,
                 );
@@ -889,6 +974,7 @@ fn parallel_worker_loop(
     oracle: Arc<OracleEngine>,
     property_callers: Arc<Vec<EchidnaPropertyCaller>>,
     target_abis: Arc<HashMap<Address, JsonAbi>>,
+    protocol_profiles: ProtocolProfileMap,
     attacker: Address,
     campaign_start: Instant,
 ) {
@@ -994,6 +1080,15 @@ fn parallel_worker_loop(
                 }
             }
 
+            crate::protocol_probes::fill_protocol_probes(
+                &executor,
+                attacker,
+                &protocol_profiles,
+                target_abis.as_ref(),
+                &sequence,
+                &mut result,
+            );
+
             let new_findings = oracle.check(&pre_seq_balances, &result, &sequence);
             if !new_findings.is_empty() {
                 for mut f in new_findings {
@@ -1006,6 +1101,7 @@ fn parallel_worker_loop(
                         oracle.as_ref(),
                         property_callers.as_slice(),
                         target_abis.as_ref(),
+                        &protocol_profiles,
                         attacker,
                         &f,
                         &repro,
@@ -1099,6 +1195,7 @@ fn parallel_worker_loop(
                     oracle.as_ref(),
                     property_callers.as_slice(),
                     target_abis.as_ref(),
+                    &protocol_profiles,
                     attacker,
                     &f,
                     &sequence,
@@ -1140,6 +1237,7 @@ fn shrink_reproducer(
     oracle: &OracleEngine,
     property_callers: &[EchidnaPropertyCaller],
     target_abis: &HashMap<Address, JsonAbi>,
+    protocol_profiles: &ProtocolProfileMap,
     attacker: Address,
     finding: &Finding,
     sequence: &[Transaction],
@@ -1154,6 +1252,8 @@ fn shrink_reproducer(
             base_db,
             oracle,
             property_callers,
+            target_abis,
+            protocol_profiles,
             attacker,
             &target_failure,
             candidate,
@@ -1169,6 +1269,8 @@ fn reproduces_failure(
     base_snapshot: &CacheDB<FuzzerDatabase>,
     oracle: &OracleEngine,
     property_callers: &[EchidnaPropertyCaller],
+    target_abis: &HashMap<Address, JsonAbi>,
+    protocol_profiles: &ProtocolProfileMap,
     attacker: Address,
     target_failure: &str,
     sequence: &[Transaction],
@@ -1188,6 +1290,15 @@ fn reproduces_failure(
         result.sequence_cumulative_logs = cumulative_logs.clone();
 
         executed.push(tx.clone());
+
+        crate::protocol_probes::fill_protocol_probes(
+            executor,
+            attacker,
+            protocol_profiles,
+            target_abis,
+            &executed,
+            &mut result,
+        );
 
         if oracle
             .check(&pre_seq_balances, &result, &executed)
@@ -1213,7 +1324,8 @@ fn reproduces_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{CampaignConfig, ContractInfo, ExecutorMode, Severity};
+    use crate::types::{Address, Bytes, CampaignConfig, ContractInfo, ExecutorMode, Severity};
+    use std::path::Path;
     use std::time::Duration;
 
     #[test]
@@ -1241,6 +1353,7 @@ mod tests {
             rpc_url: None,
             rpc_block_number: None,
             attacker_address: None,
+            ..Default::default()
         };
         let report = Campaign::new(config)
             .run_with_report()
@@ -1267,6 +1380,7 @@ mod tests {
             rpc_url: None,
             rpc_block_number: None,
             attacker_address: None,
+            ..Default::default()
         };
         let mut campaign = Campaign::new(config);
         let findings = campaign.run().expect("campaign should not error");
@@ -1317,6 +1431,7 @@ mod tests {
             rpc_url: None,
             rpc_block_number: None,
             attacker_address: None,
+            ..Default::default()
         };
         let err = Campaign::new(config)
             .run()
@@ -1325,5 +1440,49 @@ mod tests {
             err.to_string().contains("address is zero"),
             "unexpected err: {err:#}"
         );
+    }
+
+    #[test]
+    fn campaign_runs_with_two_runtime_bytecode_targets() {
+        let bin = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/contracts/control/compiled/PropFalse.bin");
+        let abi_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/contracts/control/compiled/PropFalse.abi");
+        if !bin.exists() || !abi_path.exists() {
+            eprintln!("SKIP: compiled PropFalse fixtures missing");
+            return;
+        }
+        let hex_str = std::fs::read_to_string(&bin).expect("read bin");
+        let bytecode = hex::decode(hex_str.trim()).expect("hex");
+        let abi: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&abi_path).expect("read abi"),
+        )
+        .expect("abi json");
+        let mk = |label: &str| ContractInfo {
+            address: Address::ZERO,
+            deployed_bytecode: Bytes::new(),
+            creation_bytecode: Some(Bytes::from(bytecode.clone())),
+            name: Some(label.into()),
+            source_path: None,
+            abi: Some(abi.clone()),
+        };
+        let config = CampaignConfig {
+            timeout: Duration::from_millis(400),
+            max_execs: Some(24),
+            max_depth: 2,
+            max_snapshots: 16,
+            workers: 1,
+            seed: 7,
+            targets: vec![mk("T0"), mk("T1")],
+            harness: None,
+            mode: ExecutorMode::Fast,
+            rpc_url: None,
+            rpc_block_number: None,
+            attacker_address: None,
+            ..Default::default()
+        };
+        Campaign::new(config)
+            .run()
+            .expect("two deploy targets should complete");
     }
 }

@@ -13,6 +13,7 @@ use crate::protocol_semantics::{
     append_triage_simple, topic_uni_v2_swap, topic_uni_v2_sync, u112_from_word,
     ContractProtocolProfile,
 };
+use crate::protocol_probes::probe_u256;
 use crate::types::{Address, ExecutionResult, Finding, Severity, Transaction, B256, U256};
 
 /// Optional per-address ABI-derived protocol hints (from campaign targets).
@@ -83,6 +84,36 @@ fn deposit_topic() -> B256 {
 
 fn withdraw_topic() -> B256 {
     keccak256(b"Withdraw(address,address,address,uint256,uint256)")
+}
+
+/// `previewDeposit` return vs `Deposit` event shares: allow tiny rounding (>0.1% relative and >3 wei).
+fn materially_divergent_probe_u256(a: U256, b: U256) -> bool {
+    if a == b {
+        return false;
+    }
+    let (min_v, max_v) = if a < b { (a, b) } else { (b, a) };
+    if min_v.is_zero() {
+        return max_v > U256::ZERO;
+    }
+    let diff = max_v - min_v;
+    diff * U256::from(1000u64) > min_v && diff > U256::from(3u64)
+}
+
+fn last_sync_reserves_in_logs(logs: &[crate::types::Log], pair: Address) -> Option<(U256, U256)> {
+    let sync_t = topic_uni_v2_sync();
+    let mut last = None;
+    for log in logs {
+        if log.address != pair {
+            continue;
+        }
+        if log.topics.get(0).copied() != Some(sync_t) || log.data.len() < 64 {
+            continue;
+        }
+        let r0 = u112_from_word(&log.data[..32]);
+        let r1 = u112_from_word(&log.data[32..64]);
+        last = Some((r0, r1));
+    }
+    last
 }
 
 /// `keccak256(abi.encode(holder, uint256(0)))` for `mapping(address => uint256)` at slot 0.
@@ -934,6 +965,167 @@ impl Invariant for UniswapV2StyleSwapReserveOracle {
 }
 
 // ---------------------------------------------------------------------------
+// ERC-4626: previewDeposit (static_call) vs Deposit event shares
+// ---------------------------------------------------------------------------
+
+/// Compares post-state `previewDeposit(assets)` probe to `Deposit` event minted shares.
+pub struct Erc4626PreviewVsDepositEventOracle {
+    pub profiles: Option<ProtocolProfileMap>,
+}
+
+impl Default for Erc4626PreviewVsDepositEventOracle {
+    fn default() -> Self {
+        Self { profiles: None }
+    }
+}
+
+impl Invariant for Erc4626PreviewVsDepositEventOracle {
+    fn name(&self) -> &str {
+        "economic-erc4626-probe-deposit"
+    }
+
+    fn check(
+        &self,
+        _pre_balances: &HashMap<Address, U256>,
+        result: &ExecutionResult,
+        sequence: &[Transaction],
+    ) -> Option<Finding> {
+        if !result.success {
+            return None;
+        }
+        let dep = deposit_topic();
+        for log in &result.logs {
+            if log.topics.get(0).copied() != Some(dep) || log.data.len() < 64 {
+                continue;
+            }
+            let vault = log.address;
+            if suppress_erc4626_rate_gated(lookup_profile(&self.profiles, vault)) {
+                continue;
+            }
+            let assets = U256::from_be_slice(&log.data[..32]);
+            let shares_emitted = U256::from_be_slice(&log.data[32..64]);
+            let Some(snap) = result.protocol_probes.per_contract.get(&vault) else {
+                continue;
+            };
+            let Some(e) = snap.erc4626.as_ref() else {
+                continue;
+            };
+            let Some(row) = e.deposit_rows.iter().find(|r| {
+                r.assets == assets && r.shares_emitted == shares_emitted
+            }) else {
+                continue;
+            };
+            let Some(prev) = row.preview_deposit_shares.as_ref().and_then(probe_u256) else {
+                continue;
+            };
+            if !materially_divergent_probe_u256(prev, shares_emitted) {
+                continue;
+            }
+            let base = format!(
+                "Vault {vault}: `previewDeposit`({assets}) returned {prev} shares (post-state static_call) but `Deposit` event minted {shares_emitted} shares — large divergence.",
+            );
+            let evidence = format!(
+                "previewDeposit(assets) probe vs Deposit event shares; assets={assets} probe_shares={prev} event_shares={shares_emitted}."
+            );
+            let desc = append_triage_simple(
+                base,
+                vault,
+                lookup_profile(&self.profiles, vault),
+                "ERC-4626: previewDeposit should align with minted shares for the same asset amount (barring tiny rounding).",
+                &evidence,
+                "Fee-on-transfer, donation economics, or non-standard vaults can widen gaps; verify with vault code.",
+            );
+            return Some(Finding {
+                severity: Severity::High,
+                title: format!("Economic: ERC-4626 probe previewDeposit vs Deposit event ({vault})"),
+                description: desc,
+                contract: vault,
+                reproducer: sequence.to_vec(),
+                exploit_profit: None,
+            });
+        }
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Uniswap V2: last Sync reserves vs getReserves() (static_call)
+// ---------------------------------------------------------------------------
+
+/// Compares last `Sync` event reserves to post-state `getReserves()` for the same pair.
+pub struct UniswapV2StyleSyncVsGetReservesOracle {
+    pub profiles: Option<ProtocolProfileMap>,
+}
+
+impl Default for UniswapV2StyleSyncVsGetReservesOracle {
+    fn default() -> Self {
+        Self { profiles: None }
+    }
+}
+
+impl Invariant for UniswapV2StyleSyncVsGetReservesOracle {
+    fn name(&self) -> &str {
+        "economic-amm-sync-getreserves"
+    }
+
+    fn check(
+        &self,
+        _pre_balances: &HashMap<Address, U256>,
+        result: &ExecutionResult,
+        sequence: &[Transaction],
+    ) -> Option<Finding> {
+        if !result.success {
+            return None;
+        }
+        for (pair, snap) in &result.protocol_probes.per_contract {
+            let Some(amm) = snap.amm.as_ref() else {
+                continue;
+            };
+            let Some(r0_p) = amm.reserve0.as_ref().and_then(probe_u256) else {
+                continue;
+            };
+            let Some(r1_p) = amm.reserve1.as_ref().and_then(probe_u256) else {
+                continue;
+            };
+            if matches!(
+                lookup_profile(&self.profiles, *pair),
+                Some(pr) if pr.abi_present && !pr.is_amm_pair_like()
+            ) {
+                continue;
+            }
+            let Some((r0_s, r1_s)) = last_sync_reserves_in_logs(&result.logs, *pair) else {
+                continue;
+            };
+            if !materially_divergent_probe_u256(r0_p, r0_s)
+                && !materially_divergent_probe_u256(r1_p, r1_s)
+            {
+                continue;
+            }
+            let base = format!(
+                "Pair {pair}: post-state `getReserves()` returned ({r0_p},{r1_p}) but last `Sync` in this tx logged ({r0_s},{r1_s}) — mismatch between view call and event reserves.",
+            );
+            let desc = append_triage_simple(
+                base,
+                *pair,
+                lookup_profile(&self.profiles, *pair),
+                "AMM: last Sync reserves in the transaction should match end-of-tx getReserves for canonical Uniswap V2–style pairs.",
+                "static_call getReserves vs Sync event data (uint112-expanded).",
+                "Different fork layouts, missing Sync, or non-V2 pairs can mismatch; not a full pool model.",
+            );
+            return Some(Finding {
+                severity: Severity::High,
+                title: format!("Economic: AMM Sync reserves vs getReserves ({pair})"),
+                description: desc,
+                contract: *pair,
+                reproducer: sequence.to_vec(),
+                exploit_profit: None,
+            });
+        }
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ERC-4626: large cumulative rate jump without any ERC-20 Transfer to vault
 // ---------------------------------------------------------------------------
 
@@ -1097,8 +1289,13 @@ impl Invariant for PairwiseStorageDriftOracle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol_semantics::classify_json_abi;
-    use crate::types::{Bytes, Log};
+    use crate::protocol_semantics::{
+        classify_json_abi, topic_uni_v2_sync, ContractProtocolProfile, ProtocolKind,
+    };
+    use crate::types::{
+        AmmProbeSnapshot, Bytes, ContractProbeSnapshot, Erc4626DepositProbeRow, Erc4626ProbeSnapshot,
+        Log, ProbeScalar, ProbeStatus,
+    };
     use alloy_json_abi::JsonAbi;
     use serde_json::json;
     use std::collections::HashMap;
@@ -1418,5 +1615,198 @@ mod tests {
             profiles: Some(Arc::new(m)),
         };
         assert!(inv.check(&HashMap::new(), &r, &[tx]).is_none());
+    }
+
+    fn erc4626_profile_vault(_vault: Address) -> ContractProtocolProfile {
+        let mut p = ContractProtocolProfile::default();
+        p.abi_present = true;
+        p.erc4626_score = 8;
+        p.primary = ProtocolKind::Erc4626Like;
+        p
+    }
+
+    #[test]
+    fn erc4626_probe_preview_vs_deposit_fires_on_divergence() {
+        let vault = Address::repeat_byte(0xD1);
+        let dep = deposit_topic();
+        let log = Log {
+            address: vault,
+            topics: vec![dep, B256::ZERO, B256::ZERO],
+            data: {
+                let mut d = [0u8; 64];
+                d[24..32].copy_from_slice(&100u64.to_be_bytes());
+                d[56..64].copy_from_slice(&10_000u64.to_be_bytes());
+                Bytes::copy_from_slice(&d)
+            },
+        };
+        let row = Erc4626DepositProbeRow {
+            assets: U256::from(100u64),
+            shares_emitted: U256::from(10_000u64),
+            preview_deposit_shares: Some(ProbeStatus::Ok(ProbeScalar::U256(U256::from(
+                100u64,
+            )))),
+            convert_to_shares: None,
+        };
+        let mut snap = ContractProbeSnapshot::default();
+        snap.erc4626 = Some(Erc4626ProbeSnapshot {
+            deposit_rows: vec![row],
+            ..Default::default()
+        });
+        let mut r = ExecutionResult::default();
+        r.success = true;
+        r.logs.push(log);
+        r.protocol_probes.per_contract.insert(vault, snap);
+
+        let mut m = HashMap::new();
+        m.insert(vault, erc4626_profile_vault(vault));
+        let inv = Erc4626PreviewVsDepositEventOracle {
+            profiles: Some(Arc::new(m)),
+        };
+        let f = inv
+            .check(&HashMap::new(), &r, &[tx_dummy()])
+            .expect("finding");
+        assert!(f.title.contains("previewDeposit"));
+        assert!(f.description.contains("previewDeposit"));
+        assert!(f.description.contains("probe"));
+    }
+
+    #[test]
+    fn erc4626_probe_no_finding_when_preview_matches_event() {
+        let vault = Address::repeat_byte(0xD2);
+        let dep = deposit_topic();
+        let log = Log {
+            address: vault,
+            topics: vec![dep, B256::ZERO, B256::ZERO],
+            data: {
+                let mut d = [0u8; 64];
+                d[24..32].copy_from_slice(&100u64.to_be_bytes());
+                d[56..64].copy_from_slice(&100u64.to_be_bytes());
+                Bytes::copy_from_slice(&d)
+            },
+        };
+        let row = Erc4626DepositProbeRow {
+            assets: U256::from(100u64),
+            shares_emitted: U256::from(100u64),
+            preview_deposit_shares: Some(ProbeStatus::Ok(ProbeScalar::U256(U256::from(
+                100u64,
+            )))),
+            convert_to_shares: None,
+        };
+        let mut snap = ContractProbeSnapshot::default();
+        snap.erc4626 = Some(Erc4626ProbeSnapshot {
+            deposit_rows: vec![row],
+            ..Default::default()
+        });
+        let mut r = ExecutionResult::default();
+        r.success = true;
+        r.logs.push(log);
+        r.protocol_probes.per_contract.insert(vault, snap);
+        let mut m = HashMap::new();
+        m.insert(vault, erc4626_profile_vault(vault));
+        let inv = Erc4626PreviewVsDepositEventOracle {
+            profiles: Some(Arc::new(m)),
+        };
+        assert!(inv.check(&HashMap::new(), &r, &[tx_dummy()]).is_none());
+    }
+
+    #[test]
+    fn erc4626_probe_skipped_without_protocol_probes() {
+        let vault = Address::repeat_byte(0xD3);
+        let dep = deposit_topic();
+        let log = Log {
+            address: vault,
+            topics: vec![dep, B256::ZERO, B256::ZERO],
+            data: {
+                let mut d = [0u8; 64];
+                d[24..32].copy_from_slice(&100u64.to_be_bytes());
+                d[56..64].copy_from_slice(&100u64.to_be_bytes());
+                Bytes::copy_from_slice(&d)
+            },
+        };
+        let mut r = ExecutionResult::default();
+        r.success = true;
+        r.logs.push(log);
+        let mut m = HashMap::new();
+        m.insert(vault, erc4626_profile_vault(vault));
+        let inv = Erc4626PreviewVsDepositEventOracle {
+            profiles: Some(Arc::new(m)),
+        };
+        assert!(inv.check(&HashMap::new(), &r, &[tx_dummy()]).is_none());
+    }
+
+    fn amm_profile_pair(_pair: Address) -> ContractProtocolProfile {
+        let mut p = ContractProtocolProfile::default();
+        p.abi_present = true;
+        p.amm_score = 8;
+        p.primary = ProtocolKind::AmmPairLike;
+        p
+    }
+
+    #[test]
+    fn amm_sync_vs_getreserves_fires_on_mismatch() {
+        let pair = Address::repeat_byte(0xA5);
+        let sync_t = topic_uni_v2_sync();
+        let log = Log {
+            address: pair,
+            topics: vec![sync_t],
+            data: {
+                let mut data = [0u8; 64];
+                data[31] = 99;
+                data[63] = 99;
+                Bytes::copy_from_slice(&data)
+            },
+        };
+        let mut snap = ContractProbeSnapshot::default();
+        snap.amm = Some(AmmProbeSnapshot {
+            reserve0: Some(ProbeStatus::Ok(ProbeScalar::U256(U256::from(10u64)))),
+            reserve1: Some(ProbeStatus::Ok(ProbeScalar::U256(U256::from(10u64)))),
+        });
+        let mut r = ExecutionResult::default();
+        r.success = true;
+        r.logs.push(log);
+        r.protocol_probes.per_contract.insert(pair, snap);
+
+        let mut m = HashMap::new();
+        m.insert(pair, amm_profile_pair(pair));
+        let inv = UniswapV2StyleSyncVsGetReservesOracle {
+            profiles: Some(Arc::new(m)),
+        };
+        let f = inv
+            .check(&HashMap::new(), &r, &[tx_dummy()])
+            .expect("finding");
+        assert!(f.title.contains("getReserves"));
+        assert!(f.description.contains("getReserves"));
+        assert!(f.description.contains("Sync"));
+    }
+
+    #[test]
+    fn amm_sync_vs_getreserves_quiet_when_reserves_match() {
+        let pair = Address::repeat_byte(0xA6);
+        let sync_t = topic_uni_v2_sync();
+        let log = Log {
+            address: pair,
+            topics: vec![sync_t],
+            data: {
+                let mut data = [0u8; 64];
+                data[31] = 10;
+                data[63] = 10;
+                Bytes::copy_from_slice(&data)
+            },
+        };
+        let mut snap = ContractProbeSnapshot::default();
+        snap.amm = Some(AmmProbeSnapshot {
+            reserve0: Some(ProbeStatus::Ok(ProbeScalar::U256(U256::from(10u64)))),
+            reserve1: Some(ProbeStatus::Ok(ProbeScalar::U256(U256::from(10u64)))),
+        });
+        let mut r = ExecutionResult::default();
+        r.success = true;
+        r.logs.push(log);
+        r.protocol_probes.per_contract.insert(pair, snap);
+        let mut m = HashMap::new();
+        m.insert(pair, amm_profile_pair(pair));
+        let inv = UniswapV2StyleSyncVsGetReservesOracle {
+            profiles: Some(Arc::new(m)),
+        };
+        assert!(inv.check(&HashMap::new(), &r, &[tx_dummy()]).is_none());
     }
 }
