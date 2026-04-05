@@ -344,6 +344,56 @@ impl Finding {
         self.reproducer.len().hash(&mut h);
         h.finish()
     }
+
+    /// A sequence-length-independent identifier for the underlying failure.
+    ///
+    /// This is intentionally coarser than [`dedup_hash`](Self::dedup_hash):
+    /// shrinkers and replay checks use it to ask "did we preserve the same
+    /// bug class on the same contract?" even if the exact title text changes
+    /// as values shrink.
+    pub fn failure_id(&self) -> String {
+        format!("{}:{}", self.contract, self.failure_class())
+    }
+
+    /// Returns `true` when both findings represent the same failure class on
+    /// the same contract, ignoring reproducer length.
+    pub fn same_root_cause_as(&self, other: &Finding) -> bool {
+        self.contract == other.contract && self.failure_class() == other.failure_class()
+    }
+
+    fn failure_class(&self) -> String {
+        let title = self.title.as_str();
+
+        if title.starts_with("Unexpected balance increase of ") {
+            return "balance-increase".into();
+        }
+        if title == "Unexpected revert" {
+            return "unexpected-revert".into();
+        }
+        if title.starts_with("Possible selfdestruct of ") {
+            return "selfdestruct".into();
+        }
+        if title == "Echidna property violation" {
+            return "echidna-assertion-event".into();
+        }
+        if title == "Assertion failure (Panic 0x01)" {
+            return "echidna-panic-0x01".into();
+        }
+        if let Some(name) = title
+            .strip_prefix("Echidna property `")
+            .and_then(|rest| rest.strip_suffix("` violated"))
+        {
+            return format!("echidna-static:{name}");
+        }
+        if title.starts_with("Large token mint at ") {
+            return "erc20-large-mint".into();
+        }
+        if title.starts_with("Large token burn at ") {
+            return "erc20-large-burn".into();
+        }
+
+        title.to_string()
+    }
 }
 
 // ── Campaign Config ──────────────────────────────────────────────────────────
@@ -479,5 +529,28 @@ mod tests {
         let json = serde_json::to_string(&cm).expect("serialize");
         let restored: CoverageMap = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(restored.len(), 2);
+    }
+
+    #[test]
+    fn finding_failure_id_ignores_dynamic_balance_amounts() {
+        let a = Finding {
+            severity: Severity::Critical,
+            title: "Unexpected balance increase of 10 wei".into(),
+            description: String::new(),
+            contract: Address::ZERO,
+            reproducer: vec![],
+            exploit_profit: Some(U256::from(10u64)),
+        };
+        let b = Finding {
+            severity: Severity::Critical,
+            title: "Unexpected balance increase of 999 wei".into(),
+            description: String::new(),
+            contract: Address::ZERO,
+            reproducer: vec![Transaction::default()],
+            exploit_profit: Some(U256::from(999u64)),
+        };
+
+        assert!(a.same_root_cause_as(&b));
+        assert_eq!(a.failure_id(), b.failure_id());
     }
 }

@@ -41,6 +41,7 @@ pub mod snapshot;
 
 pub mod feedback;
 pub mod mutator;
+pub mod shrinker;
 
 // ── Invariant / oracle system ───────────────────────────────────────────
 
@@ -69,6 +70,7 @@ pub mod cli;
 pub use campaign::Campaign;
 pub use error::{Error, Result};
 pub use evm::EvmExecutor;
+pub use shrinker::SequenceShrinker;
 pub use types::{
     Address, Bytes, CampaignConfig, ContractInfo, CoverageMap, ExecutionResult, Finding, Log,
     Severity, StateDiff, StateSnapshot, Transaction, B256, U256,

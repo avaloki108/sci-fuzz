@@ -22,6 +22,7 @@ The name stands for **S**mart **C**ontract **I**nvariant **Fuzz**er. The thesis 
 - **Value dictionary** — seeded from EVM bytecode (PUSH1–PUSH32 operand extraction) and grown from execution results (return data, log topics, storage writes)
 - **5 invariant checkers**: BalanceIncrease, UnexpectedRevert, SelfDestruct, EchidnaProperty (log-based assertion detection), ERC20Supply (mint/burn monitoring)
 - **Real Echidna property calling** — `EchidnaPropertyCaller` discovers `echidna_*` functions from ABI, calls them via `static_call` after each sequence, checks bool returns. This is the actual Echidna workflow, not just log watching.
+- **Deterministic sequence shrinking** — findings are replayed from the same pre-sequence snapshot and reduced by prefix/suffix elimination, whole-tx removal, calldata-word reduction, `msg.value` reduction, and sender simplification
 - **Benchmark matrix** — 81 entries mapping EF/CF contracts to expected vulnerability types, with file-existence and category-coverage validation tests
 - **133 benchmark contracts** from EF/CF covering reentrancy, selfdestruct, overflow, cross-function attacks, property tests, and assertion tests
 
@@ -31,7 +32,7 @@ Honesty matters more than marketing. These are real gaps:
 
 - **No Solidity compiler integration.** You cannot point sci-fuzz at a `.sol` file yet. Contracts must be pre-compiled to bytecode.
 - **No edge coverage yet.** sci-fuzz now records real per-instruction hitcounts from revm and feeds those into `CoverageFeedback`, but it does not yet record exact edge coverage (`prev_pc -> current_pc`) or perform block/sequence-level path canonicalization.
-- **No sequence shrinking.** When a violation is found, the reproducer is the full transaction sequence. There is no minimization pass to reduce it.
+- **Shrinking is still a first pass.** The shrinker is deterministic and useful today, but it is not yet a full semantic reducer: it does not reason about ABI types, storage dependencies, or minimal base-state snapshots, and it does not guarantee globally minimal sequences.
 - **No multi-worker parallelism.** The fuzzing loop is single-threaded. The `workers` config field exists but is not wired.
 - **No Foundry project integration.** The `project.rs` module parses directory structure but does not invoke `forge build` or consume Foundry artifacts.
 - **No on-chain forking.** The `audit` subcommand exists in the CLI but is not implemented.
@@ -145,7 +146,7 @@ None of these are done yet. Until they are, this is a working prototype, not a p
 | Metric | Value |
 |--------|-------|
 | Rust source | ~5,500 lines across 13 modules |
-| Unit tests | 103 passing |
+| Unit tests | 106 passing |
 | Benchmark contracts | 133 (from EF/CF) |
 | Benchmark matrix entries | 81 with expected bug types |
 | Dependencies | revm 19.7, alloy-primitives 0.8, clap 4, serde, rand, tiny-keccak |

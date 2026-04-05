@@ -16,6 +16,7 @@ use revm::db::{CacheDB, EmptyDB};
 use crate::invariant::EchidnaPropertyCaller;
 use crate::mutator::TxMutator;
 use crate::oracle::OracleEngine;
+use crate::shrinker::SequenceShrinker;
 use crate::snapshot::SnapshotCorpus;
 use crate::types::{
     Address, CampaignConfig, ContractInfo, CoverageMap, Finding, StateSnapshot, Transaction,
@@ -298,7 +299,15 @@ impl Campaign {
                         // Attach the reproducer sequence.
                         let mut repro = sequence.clone();
                         repro.push(tx.clone());
-                        f.reproducer = repro;
+                        f.reproducer = shrink_reproducer(
+                            &mut executor,
+                            &db_snapshot,
+                            &oracle,
+                            &property_callers,
+                            attacker,
+                            &f,
+                            &repro,
+                        );
                         tracing::warn!(
                             severity = %f.severity,
                             title = %f.title,
@@ -395,7 +404,15 @@ impl Campaign {
                     );
                 }
                 for mut f in prop_findings {
-                    f.reproducer = sequence.clone();
+                    f.reproducer = shrink_reproducer(
+                        &mut executor,
+                        &db_snapshot,
+                        &oracle,
+                        &property_callers,
+                        attacker,
+                        &f,
+                        &sequence,
+                    );
                     tracing::warn!(
                         severity = %f.severity,
                         title = %f.title,
@@ -453,6 +470,72 @@ impl Campaign {
     }
 }
 
+fn shrink_reproducer(
+    executor: &mut EvmExecutor,
+    base_db: &CacheDB<EmptyDB>,
+    oracle: &OracleEngine,
+    property_callers: &[EchidnaPropertyCaller],
+    attacker: Address,
+    finding: &Finding,
+    sequence: &[Transaction],
+) -> Vec<Transaction> {
+    let shrinker = SequenceShrinker::new();
+    let original_state = executor.snapshot();
+    let target_failure = finding.failure_id();
+
+    let shrunk = shrinker.shrink(sequence, |candidate| {
+        reproduces_failure(
+            executor,
+            base_db,
+            oracle,
+            property_callers,
+            attacker,
+            &target_failure,
+            candidate,
+        )
+    });
+
+    executor.restore(original_state);
+    shrunk
+}
+
+fn reproduces_failure(
+    executor: &mut EvmExecutor,
+    base_db: &CacheDB<EmptyDB>,
+    oracle: &OracleEngine,
+    property_callers: &[EchidnaPropertyCaller],
+    attacker: Address,
+    target_failure: &str,
+    sequence: &[Transaction],
+) -> bool {
+    executor.restore(base_db.clone());
+
+    let mut executed: Vec<Transaction> = Vec::with_capacity(sequence.len());
+    for tx in sequence {
+        let result = match executor.execute(tx) {
+            Ok(result) => result,
+            Err(_) => return false,
+        };
+
+        executed.push(tx.clone());
+
+        if oracle
+            .check(&result, &executed)
+            .iter()
+            .any(|candidate| candidate.failure_id() == target_failure)
+        {
+            return true;
+        }
+    }
+
+    property_callers.iter().any(|caller| {
+        caller
+            .check_properties(executor, attacker, &executed)
+            .iter()
+            .any(|candidate| candidate.failure_id() == target_failure)
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -460,7 +543,7 @@ impl Campaign {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::CampaignConfig;
+    use crate::types::{CampaignConfig, Severity};
     use std::time::Duration;
 
     #[test]
