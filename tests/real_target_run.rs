@@ -12,7 +12,6 @@
 //! We also test PropMulti (one good + one bad property) and PropStateful
 //! (two-step deposit→withdraw drain) as progressively harder targets.
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -26,7 +25,7 @@ use sci_fuzz::mutator::TxMutator;
 use sci_fuzz::oracle::OracleEngine;
 use sci_fuzz::snapshot::SnapshotCorpus;
 use sci_fuzz::types::{
-    Address, Bytes, CampaignConfig, ContractInfo, CoverageMap, Finding, Severity, StateSnapshot,
+    Address, Bytes, CampaignConfig, ContractInfo, ExecutorMode, Finding, StateSnapshot,
     Transaction, U256,
 };
 
@@ -428,6 +427,9 @@ fn campaign_with_real_target() {
         workers: 1,
         seed: 54321,
         targets: vec![target],
+        mode: ExecutorMode::Fast,
+        rpc_url: None,
+        rpc_block_number: None,
     };
 
     let mut campaign = sci_fuzz::campaign::Campaign::new(config);
@@ -578,6 +580,9 @@ fn campaign_solves_prop_stateful() {
         workers: 1,
         seed: 77777,
         targets: vec![target],
+        mode: ExecutorMode::Fast,
+        rpc_url: None,
+        rpc_block_number: None,
     };
 
     let mut campaign = sci_fuzz::campaign::Campaign::new(config);

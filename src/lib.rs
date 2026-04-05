@@ -53,6 +53,10 @@ pub mod oracle;
 
 pub mod campaign;
 
+// ── On-chain forking & Etherscan integration ────────────────────────────
+
+pub mod rpc;
+
 // ── Benchmark scoreboard ────────────────────────────────────────────────
 
 pub mod benchmark;

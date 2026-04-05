@@ -6,12 +6,14 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
+use alloy_json_abi::JsonAbi;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 
 use crate::evm::EvmExecutor;
 use crate::feedback::CoverageFeedback;
+use crate::rpc::FuzzerDatabase;
 use revm::db::{CacheDB, EmptyDB};
 
 use crate::invariant::EchidnaPropertyCaller;
@@ -98,9 +100,29 @@ impl Campaign {
     /// Run the fuzzing loop and return both findings and execution metrics.
     pub fn run_with_report(&mut self) -> anyhow::Result<CampaignReport> {
         let mut rng = StdRng::seed_from_u64(self.config.seed);
-        let mut executor = EvmExecutor::new();
+        // --- 1. Set up the Executor ----------------------------------------
+        let mut executor = if let Some(ref url) = self.config.rpc_url {
+            let rpc_db = crate::rpc::RpcCacheDB::new(url, self.config.rpc_block_number)?;
+            EvmExecutor::new_with_db(FuzzerDatabase::Rpc(rpc_db))
+        } else {
+            EvmExecutor::new()
+        };
+        executor.set_mode(self.config.mode);
+
         let mut feedback = CoverageFeedback::new();
         let mut snapshots = SnapshotCorpus::new(self.config.max_snapshots);
+
+        let target_abis: HashMap<Address, JsonAbi> = self
+            .config
+            .targets
+            .iter()
+            .filter_map(|t| {
+                t.abi
+                    .clone()
+                    .and_then(|v| serde_json::from_value(v).ok())
+                    .map(|abi| (t.address, abi))
+            })
+            .collect();
 
         // --- Set up attacker address with some ETH -------------------------
         let attacker = Address::repeat_byte(0x42);
@@ -204,7 +226,7 @@ impl Campaign {
         snapshots.add(initial_snapshot);
 
         // --- Persistent DB snapshots for stateful exploration ---------------
-        let mut saved_dbs: HashMap<u64, CacheDB<EmptyDB>> = HashMap::new();
+        let mut saved_dbs: HashMap<u64, CacheDB<FuzzerDatabase>> = HashMap::new();
         saved_dbs.insert(0, executor.snapshot());
 
         // --- Calibration phase: run each target's functions once to
@@ -390,6 +412,7 @@ impl Campaign {
                             &db_snapshot,
                             &oracle,
                             &property_callers,
+                            &target_abis,
                             attacker,
                             &f,
                             &repro,
@@ -414,6 +437,19 @@ impl Campaign {
                 // --- Feedback: is the result interesting? ------------------
                 let cov = result.coverage.clone();
                 let df = result.dataflow.clone();
+
+                // Seed the mutator's value dictionary with storage values observed
+                // during this execution — these are potential pool reserve amounts
+                // that the flashloan mutator can propose as borrow sizes.
+                if !result.state_diff.storage_writes.is_empty() {
+                    let reserve_candidates: Vec<crate::types::U256> = result
+                        .state_diff
+                        .storage_writes
+                        .values()
+                        .flat_map(|slots| slots.values().copied())
+                        .collect();
+                    mutator.dict.seed_from_storage_reserves(&reserve_candidates);
+                }
 
                 // Track successful state-changing transactions.
                 if result.success && !result.state_diff.storage_writes.is_empty() {
@@ -515,6 +551,7 @@ impl Campaign {
                         &db_snapshot,
                         &oracle,
                         &property_callers,
+                        &target_abis,
                         attacker,
                         &f,
                         &sequence,
@@ -596,14 +633,15 @@ impl Campaign {
 
 fn shrink_reproducer(
     executor: &mut EvmExecutor,
-    base_db: &CacheDB<EmptyDB>,
+    base_db: &CacheDB<FuzzerDatabase>,
     oracle: &OracleEngine,
     property_callers: &[EchidnaPropertyCaller],
+    target_abis: &HashMap<Address, JsonAbi>,
     attacker: Address,
     finding: &Finding,
     sequence: &[Transaction],
 ) -> Vec<Transaction> {
-    let shrinker = SequenceShrinker::new();
+    let shrinker = SequenceShrinker::new().with_abis(target_abis.clone());
     let original_state = executor.snapshot();
     let target_failure = finding.failure_id();
 
@@ -625,14 +663,14 @@ fn shrink_reproducer(
 
 fn reproduces_failure(
     executor: &mut EvmExecutor,
-    base_db: &CacheDB<EmptyDB>,
+    base_snapshot: &CacheDB<FuzzerDatabase>,
     oracle: &OracleEngine,
     property_callers: &[EchidnaPropertyCaller],
     attacker: Address,
     target_failure: &str,
     sequence: &[Transaction],
 ) -> bool {
-    executor.restore(base_db.clone());
+    executor.restore(base_snapshot.clone());
 
     let mut executed: Vec<Transaction> = Vec::with_capacity(sequence.len());
     for tx in sequence {
@@ -667,8 +705,9 @@ fn reproduces_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{CampaignConfig, Severity};
+    use crate::types::{CampaignConfig, Severity, ExecutorMode};
     use std::time::Duration;
+
 
     #[test]
     fn empty_campaign_completes() {
@@ -680,6 +719,9 @@ mod tests {
             workers: 1,
             seed: 42,
             targets: Vec::new(),
+            mode: ExecutorMode::Realistic,
+            rpc_url: None,
+            rpc_block_number: None,
         };
         let mut campaign = Campaign::new(config);
         let findings = campaign.run().expect("campaign should not error");

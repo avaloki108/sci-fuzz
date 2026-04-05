@@ -57,6 +57,14 @@ impl Invariant for BalanceIncrease {
         sequence: &[Transaction],
     ) -> Option<Finding> {
         let &(_old_reported, new) = result.state_diff.balance_changes.get(&self.attacker)?;
+
+        // Ignore balance increases if a flashloan was active in the sequence.
+        // The FlashloanEconomicOracle handles flashloan-based profit validation.
+        use crate::flashloan::MOCK_FLASHLOAN_POOL;
+        if sequence.iter().any(|tx| tx.to == Some(MOCK_FLASHLOAN_POOL)) {
+            return None;
+        }
+
         let old = pre_balances
             .get(&self.attacker)
             .copied()
@@ -382,6 +390,107 @@ impl EchidnaPropertyCaller {
 }
 
 // ---------------------------------------------------------------------------
+// Built-in: FlashloanEconomicOracle
+// ---------------------------------------------------------------------------
+
+/// Detects when a flashloan-wrapped sequence results in net profit for the
+/// attacker after accounting for the loan fee.
+///
+/// The oracle watches for sequences containing both a `BORROW` and `REPAY`
+/// to the [`MOCK_FLASHLOAN_POOL`] address and checks: if the attacker's
+/// post-sequence balance exceeds their pre-sequence balance, the difference
+/// is pure profit — a strong signal of an exploitable logic flaw.
+pub struct FlashloanEconomicOracle {
+    /// Address monitored for anomalous profit.
+    pub attacker: Address,
+    /// Minimum net profit (in wei) above loan fee that triggers a finding.
+    pub min_profit: U256,
+}
+
+impl Invariant for FlashloanEconomicOracle {
+    fn name(&self) -> &str {
+        "flashloan-economic-oracle"
+    }
+
+    fn check(
+        &self,
+        pre_balances: &HashMap<Address, U256>,
+        result: &ExecutionResult,
+        sequence: &[Transaction],
+    ) -> Option<Finding> {
+        use crate::flashloan::{BORROW_SELECTOR, REPAY_SELECTOR, MOCK_FLASHLOAN_POOL};
+
+        // Only fire on sequences that contain a complete flashloan scaffold (borrow AND repay).
+        let has_borrow = sequence.iter().any(|tx| {
+            tx.to == Some(MOCK_FLASHLOAN_POOL)
+                && tx.data.len() >= 4
+                && tx.data[..4] == BORROW_SELECTOR
+        });
+        let has_repay = sequence.iter().any(|tx| {
+            tx.to == Some(MOCK_FLASHLOAN_POOL)
+                && tx.data.len() >= 4
+                && tx.data[..4] == REPAY_SELECTOR
+        });
+
+        if !has_borrow || !has_repay {
+            return None;
+        }
+
+        // Extract borrowed amount from the first borrow tx.
+        let borrowed = sequence
+            .iter()
+            .find(|tx| {
+                tx.to == Some(MOCK_FLASHLOAN_POOL)
+                    && tx.data.len() >= 36
+                    && tx.data[..4] == BORROW_SELECTOR
+            })
+            .map(|tx| U256::from_be_slice(&tx.data[4..36]))
+            .unwrap_or(U256::ZERO);
+
+        // The fee the attacker had to repay (0.1% approximation).
+        let fee = borrowed / U256::from(1000u64);
+
+        // Compare attacker balance before vs after the sequence.
+        let pre = pre_balances
+            .get(&self.attacker)
+            .copied()
+            .unwrap_or(U256::ZERO);
+        let &(_old, post) = result
+            .state_diff
+            .balance_changes
+            .get(&self.attacker)?;
+
+        if post <= pre {
+            return None;
+        }
+
+        // net = (post - pre) - fee
+        let gross_profit = post - pre;
+        if gross_profit <= fee {
+            return None;
+        }
+        let net_profit = gross_profit - fee;
+        if net_profit < self.min_profit {
+            return None;
+        }
+
+        Some(Finding {
+            severity: Severity::Critical,
+            title: format!("Flashloan-assisted net profit of {net_profit} wei"),
+            description: format!(
+                "Attacker {} extracted {net_profit} wei net profit in a flashloan sequence of {} txs \
+                 (borrowed {borrowed}, fee {fee}, gross gain {gross_profit}).",
+                self.attacker,
+                sequence.len(),
+            ),
+            contract: self.attacker,
+            reproducer: sequence.to_vec(),
+            exploit_profit: Some(net_profit),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Built-in: ERC20SupplyInvariant
 // ---------------------------------------------------------------------------
 
@@ -510,6 +619,11 @@ impl InvariantRegistry {
         reg.add(Box::new(UnexpectedRevert));
         reg.add(Box::new(SelfDestructDetector));
         reg.add(Box::new(EchidnaProperty));
+        reg.add(Box::new(FlashloanEconomicOracle {
+            attacker,
+            // Only fire when profit > 1 wei after accounting for the fee.
+            min_profit: U256::from(1u64),
+        }));
         reg
     }
 
@@ -664,7 +778,9 @@ mod tests {
     #[test]
     fn registry_with_defaults_has_four() {
         let reg = InvariantRegistry::with_defaults(Address::ZERO);
-        assert_eq!(reg.len(), 4);
+        // 5 defaults: BalanceIncrease, UnexpectedRevert, SelfDestructDetector,
+        //              EchidnaProperty, FlashloanEconomicOracle
+        assert_eq!(reg.len(), 5);
         assert!(!reg.is_empty());
     }
 
@@ -847,8 +963,8 @@ mod tests {
         let attacker = Address::repeat_byte(0x99);
         let tokens = vec![Address::repeat_byte(0xA1), Address::repeat_byte(0xA2)];
         let reg = InvariantRegistry::with_erc20(attacker, &tokens);
-        // 4 defaults + 2 token invariants
-        assert_eq!(reg.len(), 6);
+        // 5 defaults + 2 token invariants
+        assert_eq!(reg.len(), 7);
     }
 
     // -- EchidnaPropertyCaller tests ------------------------------------------

@@ -207,6 +207,23 @@ impl ValueDictionary {
         }
     }
 
+    /// Seed the dictionary from on-chain storage reads (e.g. pool reserves).
+    ///
+    /// This is the bridge between the dataflow waypoint tracker and the
+    /// flashloan mutator: whenever the fuzzer observes an `SLOAD` from a
+    /// storage slot that looks like a large reserve value, we add that value
+    /// to the uint dictionary so the flashloan mutator can propose borrow
+    /// amounts that match real reserve sizes.
+    pub fn seed_from_storage_reserves(&mut self, values: &[U256]) {
+        // Heuristic: only add values that are >= 1e6 wei (ignores boolean/enum slots).
+        let min_reserve = U256::from(1_000_000u64);
+        for &v in values {
+            if v >= min_reserve && !self.uint_values.contains(&v) {
+                self.uint_values.push(v);
+            }
+        }
+    }
+
     /// Pick a random uint256 — biased toward dictionary values.
     pub fn random_uint(&self, rng: &mut impl Rng) -> U256 {
         if !self.uint_values.is_empty() && rng.gen_bool(0.8) {
@@ -354,8 +371,8 @@ pub struct TxMutator {
     payable_selectors: HashSet<[u8; 4]>,
     /// Pool of known addresses (senders, contracts, constants).
     address_pool: Vec<Address>,
-    /// Value dictionary for smarter mutations.
-    dict: ValueDictionary,
+    /// Dictionary of interesting values seeded from operations.
+    pub dict: ValueDictionary,
 }
 
 impl TxMutator {

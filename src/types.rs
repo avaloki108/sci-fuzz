@@ -8,6 +8,19 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
 
+/// Executor mode controlling how strictly EVM rules are enforced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ExecutorMode {
+    /// Minimal checks — best for exploration. Disables balance checks,
+    /// gas limits, EIP-3607, base fee. This is the default.
+    #[default]
+    Fast,
+    /// Enforce balance/value plausibility. Still disables gas price but
+    /// checks that callers have sufficient balance for `msg.value`.
+    /// Best for validation and reducing false positives.
+    Realistic,
+}
+
 // ── Re-exports ───────────────────────────────────────────────────────────────
 // Consumers can `use sci_fuzz::types::{Address, U256, …}` without pulling in
 // alloy-primitives directly.
@@ -524,6 +537,15 @@ pub struct CampaignConfig {
     pub seed: u64,
     /// Contracts under test.
     pub targets: Vec<ContractInfo>,
+    /// Executor mode (Fast vs Realistic).
+    #[serde(default)]
+    pub mode: ExecutorMode,
+    /// Optional RPC URL for forking state during audits.
+    #[serde(default)]
+    pub rpc_url: Option<String>,
+    /// Optional block number to pin the fork to.
+    #[serde(default)]
+    pub rpc_block_number: Option<u64>,
 }
 
 impl Default for CampaignConfig {
@@ -536,6 +558,9 @@ impl Default for CampaignConfig {
             workers: 1,
             seed: 0,
             targets: Vec::new(),
+            mode: ExecutorMode::Fast,
+            rpc_url: None,
+            rpc_block_number: None,
         }
     }
 }

@@ -7,16 +7,31 @@
 //! - reduce `msg.value`
 //! - reduce calldata words while preserving selectors when present
 
+use alloy_dyn_abi::{DynSolValue, JsonAbiExt};
+use alloy_json_abi::JsonAbi;
+use std::collections::HashMap;
+
 use crate::types::{Address, Bytes, Transaction, U256};
 
 /// Deterministic reducer for transaction sequences.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct SequenceShrinker;
+#[derive(Debug, Default, Clone)]
+pub struct SequenceShrinker {
+    /// Optional ABIs for target contracts, enabling semantic parameter shrinking.
+    pub target_abis: HashMap<Address, JsonAbi>,
+}
 
 impl SequenceShrinker {
     /// Create a new sequence shrinker.
     pub fn new() -> Self {
-        Self
+        Self {
+            target_abis: HashMap::new(),
+        }
+    }
+
+    /// Set ABIs for semantic shrinking.
+    pub fn with_abis(mut self, abis: HashMap<Address, JsonAbi>) -> Self {
+        self.target_abis = abis;
+        self
     }
 
     /// Shrink `sequence` while `fails(candidate)` remains true.
@@ -45,6 +60,10 @@ impl SequenceShrinker {
                 continue;
             }
             if let Some(next) = self.try_simplify_transactions(&current, &mut fails) {
+                current = next;
+                continue;
+            }
+            if let Some(next) = self.try_reorder_transactions(&current, &mut fails) {
                 current = next;
                 continue;
             }
@@ -133,11 +152,124 @@ impl SequenceShrinker {
             if let Some(candidate) = self.try_simplify_value(current, idx, fails) {
                 return Some(candidate);
             }
+            // Try semantic simplification first if ABI is available
+            if let Some(candidate) = self.try_simplify_calldata_semantic(current, idx, fails) {
+                return Some(candidate);
+            }
+            // Fall back to byte-level word shrinking
             if let Some(candidate) = self.try_simplify_calldata(current, idx, fails) {
                 return Some(candidate);
             }
         }
         None
+    }
+
+    fn try_reorder_transactions<F>(
+        &self,
+        current: &[Transaction],
+        fails: &mut F,
+    ) -> Option<Vec<Transaction>>
+    where
+        F: FnMut(&[Transaction]) -> bool,
+    {
+        if current.len() < 2 {
+            return None;
+        }
+
+        // Try swapping adjacent transactions.
+        for i in 0..current.len() - 1 {
+            let mut candidate = current.to_vec();
+            candidate.swap(i, i + 1);
+            if fails(&candidate) {
+                return Some(candidate);
+            }
+        }
+
+        None
+    }
+
+    fn try_simplify_calldata_semantic<F>(
+        &self,
+        current: &[Transaction],
+        idx: usize,
+        fails: &mut F,
+    ) -> Option<Vec<Transaction>>
+    where
+        F: FnMut(&[Transaction]) -> bool,
+    {
+        let tx = &current[idx];
+        let target = tx.to?;
+        let abi = self.target_abis.get(&target)?;
+        let data = &tx.data;
+
+        if data.len() < 4 {
+            return None;
+        }
+
+        let selector = &data[..4];
+        let function = abi
+            .functions()
+            .find(|f| f.selector().as_slice() == selector)?;
+
+        let decoded = function.abi_decode_input(&data[4..], true).ok()?;
+        
+        for p_idx in 0..decoded.len() {
+            let mut params = decoded.clone();
+            for simplified_param in self.shrink_dyn_sol_value(&decoded[p_idx]) {
+                if simplified_param == decoded[p_idx] {
+                    continue;
+                }
+                params[p_idx] = simplified_param;
+                let mut candidate = current.to_vec();
+                candidate[idx].data = Bytes::from(function.abi_encode_input(&params).ok()?);
+                if fails(&candidate) {
+                    return Some(candidate);
+                }
+            }
+        }
+
+        None
+    }
+
+    fn shrink_dyn_sol_value(&self, value: &DynSolValue) -> Vec<DynSolValue> {
+        let mut out = Vec::new();
+        match value {
+            DynSolValue::Uint(v, bits) => {
+                let shrunk_u256 = shrink_u256_candidates(*v);
+                for cand in shrunk_u256 {
+                    out.push(DynSolValue::Uint(cand, *bits));
+                }
+            }
+            DynSolValue::Int(v, bits) => {
+                use alloy_primitives::I256;
+                out.push(DynSolValue::Int(I256::ZERO, *bits));
+                if *v != I256::ZERO {
+                    out.push(DynSolValue::Int(I256::from_raw(U256::from(1u64)), *bits));
+                }
+            }
+            DynSolValue::Bool(b) => {
+                if *b {
+                    out.push(DynSolValue::Bool(false));
+                }
+            }
+            DynSolValue::Address(a) => {
+                if *a != Address::ZERO {
+                    out.push(DynSolValue::Address(Address::ZERO));
+                }
+            }
+            DynSolValue::Array(items) | DynSolValue::FixedArray(items) => {
+                if !items.is_empty() {
+                    out.push(DynSolValue::Array(Vec::new()));
+                }
+            }
+            DynSolValue::Bytes(b) => {
+                if !b.is_empty() {
+                    out.push(DynSolValue::Bytes(Vec::new()));
+                }
+            }
+            _ => {}
+        }
+        out
     }
 
     fn try_simplify_sender<F>(

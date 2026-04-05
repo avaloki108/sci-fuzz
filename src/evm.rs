@@ -21,26 +21,11 @@ use revm::{
 };
 
 use crate::types::{
-    Address, Bytes, CoverageMap, ExecutionResult, Log, StateDiff, Transaction, U256,
+    Address, Bytes, CoverageMap, ExecutorMode, ExecutionResult, Log, StateDiff, Transaction, U256,
 };
+use crate::rpc::FuzzerDatabase;
 
 // ---------------------------------------------------------------------------
-// ExecutorMode
-// ---------------------------------------------------------------------------
-
-/// Executor mode controlling how strictly EVM rules are enforced.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ExecutorMode {
-    /// Minimal checks — best for exploration. Disables balance checks,
-    /// gas limits, EIP-3607, base fee. This is the default.
-    #[default]
-    Fast,
-    /// Enforce balance/value plausibility. Still disables gas price but
-    /// checks that callers have sufficient balance for `msg.value`.
-    /// Best for validation and reducing false positives.
-    Realistic,
-}
-
 // ---------------------------------------------------------------------------
 // CoverageInspector
 // ---------------------------------------------------------------------------
@@ -85,18 +70,18 @@ impl<DB: Database> Inspector<DB> for CoverageInspector {
 // EvmExecutor
 // ---------------------------------------------------------------------------
 
-/// Thin wrapper around a revm [`CacheDB<EmptyDB>`] that provides a
+/// Thin wrapper around a revm [`CacheDB<FuzzerDatabase>`] that provides a
 /// fuzzer-friendly interface for EVM execution.
+#[derive(Debug, Clone)]
 pub struct EvmExecutor {
     /// In-memory account/storage database.
-    db: CacheDB<EmptyDB>,
-    /// Block-level environment shared across transactions.
-    block_env: BlockEnv,
-    /// Monotonic nonce used to derive deterministic `CREATE` addresses when
-    /// deploying contracts.
-    deploy_nonce: u64,
-    /// Controls how strictly EVM rules are enforced during execution.
-    mode: ExecutorMode,
+    pub db: CacheDB<FuzzerDatabase>,
+    /// Global execution block environment.
+    pub block_env: BlockEnv,
+    /// Counter for sequential address generation.
+    pub deploy_nonce: u64,
+    /// Execution strictness.
+    pub mode: ExecutorMode,
 }
 
 impl EvmExecutor {
@@ -104,13 +89,18 @@ impl EvmExecutor {
 
     /// Create a fresh executor with an empty state and sensible block defaults.
     pub fn new() -> Self {
+        Self::new_with_db(FuzzerDatabase::Empty(EmptyDB::default()))
+    }
+
+    /// Create an executor from an existing base state (e.g. a forked RPC DB).
+    pub fn new_with_db(base: FuzzerDatabase) -> Self {
         let mut block_env = BlockEnv::default();
         block_env.number = RevmU256::from(1u64);
         block_env.timestamp = RevmU256::from(1u64);
         block_env.gas_limit = RevmU256::from(30_000_000u64);
 
         Self {
-            db: CacheDB::new(EmptyDB::default()),
+            db: CacheDB::new(base),
             block_env,
             deploy_nonce: 0,
             mode: ExecutorMode::Fast,
@@ -193,7 +183,6 @@ impl EvmExecutor {
 
         let sel = &tx.data[..4];
         let amount = U256::from_be_slice(&tx.data[4..36]);
-        let pre_balances = self.snapshot_balances();
         let mut balance_changes = HashMap::new();
 
         if sel == crate::flashloan::BORROW_SELECTOR {
@@ -308,12 +297,12 @@ impl EvmExecutor {
     // -- Snapshots ----------------------------------------------------------
 
     /// Clone the entire database for later restoration.
-    pub fn snapshot(&self) -> CacheDB<EmptyDB> {
+    pub fn snapshot(&self) -> CacheDB<FuzzerDatabase> {
         self.db.clone()
     }
 
     /// Restore the database from a previous snapshot.
-    pub fn restore(&mut self, db: CacheDB<EmptyDB>) {
+    pub fn restore(&mut self, db: CacheDB<FuzzerDatabase>) {
         self.db = db;
     }
 

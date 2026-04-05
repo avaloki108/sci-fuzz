@@ -4,7 +4,10 @@
 
 use std::process;
 
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
+use sci_fuzz::types::{Address, Bytes, CampaignConfig, ContractInfo, ExecutorMode};
+use sci_fuzz::campaign::Campaign;
+use sci_fuzz::project::Project;
 
 #[cfg(feature = "cli")]
 use clap::Parser;
@@ -165,6 +168,9 @@ fn handle_forge(args: sci_fuzz::cli::ForgeArgs) -> Result<()> {
         workers: args.workers,
         seed: args.seed.unwrap_or_else(|| rand::random()),
         targets,
+        mode: sci_fuzz::types::ExecutorMode::Fast,
+        rpc_url: args.fork_url,
+        rpc_block_number: args.fork_block,
     };
 
     let mut campaign = Campaign::new(config);
@@ -190,12 +196,149 @@ fn handle_forge(args: sci_fuzz::cli::ForgeArgs) -> Result<()> {
 
 #[cfg(feature = "cli")]
 fn handle_audit(args: sci_fuzz::cli::AuditArgs) -> Result<()> {
+    // Load .env if present (best-effort; ignore errors).
+    let _ = dotenvy_load();
+
     println!("⚡ sci-fuzz audit");
     println!("  address   : {}", args.address);
     println!("  chain     : {}", args.chain);
-    println!("  templates : {:?}", args.templates);
+    println!("  timeout   : {}s", args.timeout);
+    println!("  flashloan : {}", args.flashloan);
     println!();
-    println!("  (on-chain audit not yet implemented — coming soon)");
+
+    // Resolve RPC URL from CLI flag → env var.
+    let rpc_url = args
+        .rpc_url
+        .clone()
+        .or_else(|| std::env::var("ETH_RPC_URL").ok());
+
+    let block = args.block_number.or_else(|| {
+        std::env::var("FORK_BLOCK_NUMBER")
+            .ok()
+            .and_then(|s| s.parse().ok())
+    });
+
+    if let Some(ref url) = rpc_url {
+        println!("  rpc        : {url}");
+        if let Some(b) = block {
+            println!("  fork-block: {b}");
+        }
+        println!();
+        println!("  ℹ️  RpcCacheDB fork configured (will lazy-load state on first access).");
+        // Validate the RPC URL is reachable; just warn on failure.
+        match sci_fuzz::rpc::RpcCacheDB::new(url, block) {
+            Ok(_) => println!("  ✅ RPC connection OK"),
+            Err(e) => println!("  ⚠️  RPC init warning: {e}"),
+        }
+    } else {
+        println!("  ⚠️  No RPC URL provided. Set ETH_RPC_URL or pass --rpc-url.");
+    }
+    let target_address: Address = args.address.parse().context("Invalid address format")?;
+    
+    // Resolve Etherscan API key from CLI flag → env var.
+    let api_key = args
+        .etherscan_key
+        .clone()
+        .or_else(|| std::env::var("ETHERSCAN_API_KEY").ok())
+        .unwrap_or_default();
+
+    let mut abi_val = None;
+    if !api_key.is_empty() {
+        println!();
+        println!("  🔍 Fetching ABI from Etherscan for {} ({})…", args.address, args.chain);
+        match sci_fuzz::rpc::fetch_etherscan_abi(&args.address, &args.chain, &api_key) {
+            Ok(abi) => {
+                println!("  ✅ ABI retrieved successfully!");
+                abi_val = Some(abi);
+            }
+            Err(e) => {
+                println!("  ⚠️  ABI retrieval failed: {e}");
+            }
+        }
+    }
+
+    let target = ContractInfo {
+        address: target_address,
+        deployed_bytecode: Bytes::new(), // In fork mode, we don't need bytecode here, revm will fetch it.
+        creation_bytecode: None,
+        name: Some(format!("AuditTarget_{}", &args.address[..6])),
+        source_path: None,
+        abi: abi_val,
+    };
+
+    // --- Build Campaign Configuration --------------------------------------
+    let config = CampaignConfig {
+        timeout: std::time::Duration::from_secs(args.timeout),
+        max_execs: None,
+        max_depth: 32,
+        max_snapshots: 1024,
+        workers: 1, // Audit usually runs single-threaded for stability across network
+        seed: rand::random(),
+        targets: vec![target],
+        mode: ExecutorMode::Realistic, // Audits should use realistic mode by default
+        rpc_url: rpc_url.clone(),
+        rpc_block_number: block,
+    };
+
+    println!();
+    println!("🚀 Starting audit campaign...");
+    println!("   Mode      : {:?}", config.mode);
+    println!("   Timeout   : {}s", args.timeout);
+    if args.flashloan {
+        println!("   Flashloan : Enabled (Mock Pool 0x{})", hex::encode(sci_fuzz::flashloan::MOCK_FLASHLOAN_POOL.as_slice()));
+    }
+    println!();
+
+    let mut campaign = Campaign::new(config);
+    let findings = campaign.run()?;
+
+    println!();
+    if findings.is_empty() {
+        println!("✅ No vulnerabilities discovered.");
+    } else {
+        println!("🐛 FOUND {} POSSIBLE VULNERABILITIES:", findings.len());
+        for (i, f) in findings.iter().enumerate() {
+            println!("   [{}] {} -- severity: {}", i + 1, f.title, f.severity);
+            println!("        {}", f.description);
+            if let Some(profit) = f.exploit_profit {
+                println!("        💰 Estimated Profit: {} wei", profit);
+            }
+            println!();
+        }
+        
+        if let Some(out_dir) = args.output {
+            std::fs::create_dir_all(&out_dir)?;
+            for f in findings {
+                let path = f.save_to_dir(&out_dir)?;
+                println!("   💾 Saved finding to: {}", path.display());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Best-effort load of a `.env` file (project root or CWD).
+#[cfg(feature = "cli")]
+fn dotenvy_load() -> anyhow::Result<()> {
+    let candidates = [".env", "../.env"];
+    for path in &candidates {
+        if std::path::Path::new(path).exists() {
+            for line in std::fs::read_to_string(path)?.lines() {
+                let line = line.trim();
+                if line.starts_with('#') || line.is_empty() {
+                    continue;
+                }
+                if let Some((key, val)) = line.split_once('=') {
+                    // Don't override already-set env vars.
+                    if std::env::var(key.trim()).is_err() {
+                        std::env::set_var(key.trim(), val.trim());
+                    }
+                }
+            }
+            break;
+        }
+    }
     Ok(())
 }
 

@@ -297,6 +297,9 @@ fn run_sci_fuzz_case(case: &BenchmarkCase, seed: u64) -> ScorecardEntry {
         workers: 1,
         seed,
         targets: case.targets.clone(),
+        mode: crate::types::ExecutorMode::Fast,
+        rpc_url: None,
+        rpc_block_number: None,
     };
 
     let mut campaign = Campaign::new(config);
