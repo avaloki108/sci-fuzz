@@ -128,6 +128,48 @@ pub struct Project {
     pub out_dir: Option<PathBuf>,
 }
 
+/// Runtime contracts to deploy first, plus an optional Foundry test harness
+/// (`setUp()`) selected from `test/` artifacts.
+#[derive(Debug, Clone)]
+pub struct FuzzBootstrap {
+    /// Non-test contracts (typically `src/`). May be empty when only a harness
+    /// is available (test-only repositories).
+    pub runtime_targets: Vec<ContractInfo>,
+    /// At most one harness: deployed after [`Self::runtime_targets`], then
+    /// `setUp()` is run by the campaign.
+    pub harness: Option<ContractInfo>,
+}
+
+/// Returns true if the JSON ABI declares `function setUp()` with no parameters.
+pub fn abi_has_set_up(abi: &serde_json::Value) -> bool {
+    let Some(arr) = abi.as_array() else {
+        return false;
+    };
+    arr.iter().any(|entry| {
+        entry.get("type").and_then(|t| t.as_str()) == Some("function")
+            && entry.get("name").and_then(|n| n.as_str()) == Some("setUp")
+            && entry
+                .get("inputs")
+                .and_then(|i| i.as_array())
+                .map(|a| a.is_empty())
+                .unwrap_or(false)
+    })
+}
+
+/// True if any ABI function name starts with `echidna_`.
+pub fn abi_has_echidna_property(abi: &serde_json::Value) -> bool {
+    let Some(arr) = abi.as_array() else {
+        return false;
+    };
+    arr.iter().any(|entry| {
+        entry.get("type").and_then(|t| t.as_str()) == Some("function")
+            && entry
+                .get("name")
+                .and_then(|n| n.as_str())
+                .is_some_and(|n| n.starts_with("echidna_"))
+    })
+}
+
 impl Project {
     /// Load a Foundry project from a directory
     pub fn load(root: impl AsRef<Path>) -> Result<Self> {
@@ -198,14 +240,9 @@ impl Project {
         Ok(contracts)
     }
 
-    /// Select the first-pass set of fuzzable targets from compiled artifacts.
-    ///
-    /// Current policy:
-    /// - require non-empty deployed/runtime bytecode
-    /// - always exclude obvious script artifacts
-    /// - prefer non-test contracts
-    /// - within the remaining set, prefer contracts under `src/`
-    pub fn select_fuzz_targets(&self) -> Vec<ContractInfo> {
+    /// Select runtime (non-test) fuzz targets — same rules as the historical
+    /// [`Self::select_fuzz_targets`].
+    pub fn select_runtime_targets(&self) -> Vec<ContractInfo> {
         let mut candidates: Vec<ContractInfo> = self
             .contracts
             .values()
@@ -225,31 +262,84 @@ impl Project {
         candidates
     }
 
+    /// Backward-compatible alias for [`Self::select_runtime_targets`].
+    pub fn select_fuzz_targets(&self) -> Vec<ContractInfo> {
+        self.select_runtime_targets()
+    }
+
+    /// Test/harness contracts that declare `setUp()`, have creation bytecode,
+    /// and are not scripts.
+    pub fn select_harness_candidates(&self) -> Vec<ContractInfo> {
+        let mut candidates: Vec<ContractInfo> = self
+            .contracts
+            .values()
+            .filter(|c| !c.deployed_bytecode.is_empty())
+            .filter(|c| !is_script_artifact(c))
+            .filter(|c| is_test_artifact(c))
+            .filter(|c| {
+                c.creation_bytecode
+                    .as_ref()
+                    .map(|b| !b.is_empty())
+                    .unwrap_or(false)
+            })
+            .filter(|c| c.abi.as_ref().is_some_and(abi_has_set_up))
+            .cloned()
+            .collect();
+
+        candidates.sort_by_key(|c| harness_sort_key(c));
+        candidates
+    }
+
+    /// Build [`FuzzBootstrap`]: runtime targets plus at most one harness
+    /// (prefers an `echidna_*` harness when available).
+    pub fn prepare_fuzz_bootstrap(&self) -> Result<FuzzBootstrap> {
+        let runtime_targets = self.select_runtime_targets();
+        let mut harness_candidates = self.select_harness_candidates();
+        harness_candidates.sort_by_key(|c| {
+            let prefers_echidna = c
+                .abi
+                .as_ref()
+                .map(|a| abi_has_echidna_property(a))
+                .unwrap_or(false);
+            (
+                !prefers_echidna,
+                harness_sort_key(c),
+            )
+        });
+
+        let harness = harness_candidates.into_iter().next();
+
+        if runtime_targets.is_empty() && harness.is_none() {
+            return Err(Error::Project(format!(
+                "No fuzzable contracts or harnesses in {} after artifact ingestion",
+                self.get_out_dir().display()
+            )));
+        }
+
+        Ok(FuzzBootstrap {
+            runtime_targets,
+            harness,
+        })
+    }
+
     /// End-to-end Foundry project loading for fuzzing:
-    /// load config, run `forge build`, ingest artifacts, and select targets.
+    /// load config, run `forge build`, ingest artifacts, and build a bootstrap plan.
     pub fn build_and_select_targets(
         root: impl AsRef<Path>,
-    ) -> Result<(Self, Vec<ContractInfo>, usize)> {
+    ) -> Result<(Self, FuzzBootstrap, usize)> {
         Self::build_and_select_targets_with_program(root, "forge")
     }
 
     fn build_and_select_targets_with_program(
         root: impl AsRef<Path>,
         program: impl AsRef<OsStr>,
-    ) -> Result<(Self, Vec<ContractInfo>, usize)> {
+    ) -> Result<(Self, FuzzBootstrap, usize)> {
         let mut project = Self::load(root)?;
         project.build_with_program(program)?;
         let artifact_count = project.load_artifacts_from_out()?.len();
-        let targets = project.select_fuzz_targets();
+        let bootstrap = project.prepare_fuzz_bootstrap()?;
 
-        if targets.is_empty() {
-            return Err(Error::Project(format!(
-                "No fuzzable contracts found in {} after artifact ingestion",
-                project.get_out_dir().display()
-            )));
-        }
-
-        Ok((project, targets, artifact_count))
+        Ok((project, bootstrap, artifact_count))
     }
 
     /// Discover contracts in the project
@@ -727,6 +817,10 @@ fn target_sort_key(contract: &ContractInfo) -> (u8, String, String) {
     )
 }
 
+fn harness_sort_key(contract: &ContractInfo) -> (u8, String, String) {
+    target_sort_key(contract)
+}
+
 /// Try to detect the contract type from source code or bytecode
 /// Heuristic contract classification based on function selectors in bytecode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1017,15 +1111,16 @@ mod tests {
             ),
         );
 
-        let (_project, targets, artifact_count) =
+        let (_project, bootstrap, artifact_count) =
             Project::build_and_select_targets_with_program(dir.path(), &forge_script).unwrap();
 
         assert_eq!(artifact_count, 1);
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].name.as_deref(), Some("Vault"));
+        assert_eq!(bootstrap.runtime_targets.len(), 1);
+        assert!(bootstrap.harness.is_none());
+        assert_eq!(bootstrap.runtime_targets[0].name.as_deref(), Some("Vault"));
 
         let config = crate::types::CampaignConfig {
-            targets,
+            targets: bootstrap.runtime_targets,
             ..crate::types::CampaignConfig::default()
         };
         assert_eq!(config.targets.len(), 1);

@@ -1,9 +1,10 @@
 //! Snapshot corpus for sci-fuzz.
 //!
 //! Manages a bounded collection of [`StateSnapshot`]s, each representing a
-//! point-in-time EVM world state.  Snapshots are weighted by coverage
-//! *novelty* — pairs `(address, pc)` that appear in fewer snapshots score
-//! higher — so the fuzzer naturally gravitates toward under-explored states.
+//! point-in-time EVM world state. Snapshots are weighted by coverage
+//! *novelty* — `(address, (prev_pc, current_pc))` edges that appear in fewer
+//! snapshots score higher — so the fuzzer gravitates toward under-explored
+//! control-flow transitions.
 //!
 //! On top of pure novelty scoring, an AFL++-style **power schedule** adjusts
 //! the energy (fuzzing budget) assigned to each snapshot based on how often it
@@ -125,7 +126,7 @@ impl SnapshotCorpus {
     /// energy.
     ///
     /// Energy combines the novelty score (inverse frequency of each
-    /// `(address, pc)` pair) with power-scheduling metadata — see
+    /// `(address, edge)` pair) with power-scheduling metadata — see
     /// [`compute_energy`](Self::compute_energy) for the full formula.
     ///
     /// Returns `None` only when the corpus is empty.
@@ -204,7 +205,7 @@ impl SnapshotCorpus {
     /// AFL++-style power schedule.
     ///
     /// The base signal comes from the coverage novelty score (inverse
-    /// frequency of `(address, pc)` pairs).  On top of that several
+    /// frequency of `(address, edge)` pairs). On top of that several
     /// metadata-driven adjustments are applied:
     ///
     /// * **New-bits bonus** — snapshots that discovered many fresh coverage
@@ -252,16 +253,16 @@ impl SnapshotCorpus {
 
     /// Compute a novelty score for every snapshot in the corpus.
     ///
-    /// For each `(address, pc)` pair across the entire corpus we count how
-    /// many snapshots include it.  A snapshot's score is the sum of
+    /// For each `(address, edge)` pair across the entire corpus we count how
+    /// many snapshots include it. A snapshot's score is the sum of
     /// `1.0 / count` over all its pairs, plus a baseline of `1.0`.
     fn novelty_scores(&self) -> Vec<f64> {
         // Step 1 — count how many snapshots cover each (address, edge) pair.
         let mut pair_counts: HashMap<(Address, (usize, usize)), usize> = HashMap::new();
         for snap in &self.snapshots {
-            for (addr, pcs) in &snap.coverage.map {
-                for &pc in pcs.keys() {
-                    *pair_counts.entry((*addr, pc)).or_insert(0) += 1;
+            for (addr, edges) in &snap.coverage.map {
+                for &edge in edges.keys() {
+                    *pair_counts.entry((*addr, edge)).or_insert(0) += 1;
                 }
             }
         }
@@ -271,9 +272,9 @@ impl SnapshotCorpus {
             .iter()
             .map(|snap| {
                 let mut score = 1.0_f64; // baseline so empty-coverage snapshots survive
-                for (addr, pcs) in &snap.coverage.map {
-                    for &pc in pcs.keys() {
-                        let count = pair_counts.get(&(*addr, pc)).copied().unwrap_or(1);
+                for (addr, edges) in &snap.coverage.map {
+                    for &edge in edges.keys() {
+                        let count = pair_counts.get(&(*addr, edge)).copied().unwrap_or(1);
                         score += 1.0 / count as f64;
                     }
                 }
@@ -292,7 +293,7 @@ mod tests {
     use super::*;
     use crate::types::StateSnapshot;
 
-    /// Helper — build a minimal snapshot whose coverage hits the given PCs
+    /// Helper — build a minimal snapshot whose coverage hits the given edges
     /// at [`Address::ZERO`].
     fn snapshot_with_pcs(pcs: &[(usize, usize)]) -> StateSnapshot {
         let mut snap = StateSnapshot::default();

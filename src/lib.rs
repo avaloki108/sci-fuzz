@@ -66,6 +66,9 @@ pub mod scoreboard;
 
 pub mod project;
 
+/// Foundry harness `setUp()` execution helpers (`run_setup`, selector).
+pub mod harness;
+
 // ── CLI (feature-gated) ─────────────────────────────────────────────────
 
 #[cfg(feature = "cli")]
@@ -85,7 +88,9 @@ pub use scoreboard::{
     BenchmarkEngine, BenchmarkStatus, MultiSeedSummary, Scoreboard, ScorecardEntry,
 };
 pub use shrinker::SequenceShrinker;
+pub use project::{abi_has_echidna_property, abi_has_set_up, FuzzBootstrap};
 pub use types::{
-    Address, Bytes, CampaignConfig, ContractInfo, CoverageMap, ExecutionResult, Finding, Log,
-    Severity, StateDiff, StateSnapshot, Transaction, B256, U256,
+    contract_info_for_mutator, strip_abi_functions_named, Address, Bytes, CampaignConfig,
+    ContractInfo, CoverageMap, ExecutionResult, Finding, Log, Severity, StateDiff, StateSnapshot,
+    Transaction, B256, U256,
 };

@@ -53,6 +53,39 @@ pub struct ContractInfo {
     pub abi: Option<serde_json::Value>,
 }
 
+/// Clone `contract` and replace its ABI with one that omits named functions
+/// (e.g. `setUp`) so the mutator does not generate setup calls mid-campaign.
+/// Other uses (e.g. `echidna_*` discovery) should keep the original [`ContractInfo::abi`].
+pub fn contract_info_for_mutator(contract: &ContractInfo, strip_names: &[&str]) -> ContractInfo {
+    let abi = contract.abi.as_ref().and_then(|a| strip_abi_functions_named(a, strip_names));
+    ContractInfo {
+        address: contract.address,
+        deployed_bytecode: contract.deployed_bytecode.clone(),
+        creation_bytecode: contract.creation_bytecode.clone(),
+        name: contract.name.clone(),
+        source_path: contract.source_path.clone(),
+        abi,
+    }
+}
+
+/// Return a copy of a JSON ABI array with `function` entries whose `name` is
+/// in `strip_names` removed.
+pub fn strip_abi_functions_named(abi: &serde_json::Value, strip_names: &[&str]) -> Option<serde_json::Value> {
+    let arr = abi.as_array()?;
+    let filtered: Vec<serde_json::Value> = arr
+        .iter()
+        .filter(|entry| {
+            if entry.get("type").and_then(|t| t.as_str()) != Some("function") {
+                return true;
+            }
+            let name = entry.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            !strip_names.contains(&name)
+        })
+        .cloned()
+        .collect();
+    Some(serde_json::Value::Array(filtered))
+}
+
 // ── Transaction ──────────────────────────────────────────────────────────────
 
 /// A transaction to execute against the EVM.
@@ -95,7 +128,7 @@ pub struct ExecutionResult {
     pub gas_used: u64,
     /// Event logs emitted during execution.
     pub logs: Vec<Log>,
-    /// Real EVM instruction hitcounts collected during this execution.
+    /// Per-edge control-flow coverage for this execution (see [`CoverageMap`]).
     pub coverage: CoverageMap,
     /// Dataflow waypoints reached during execution.
     pub dataflow: DataflowWaypoints,
@@ -168,7 +201,7 @@ pub struct StateSnapshot {
     pub block_number: u64,
     /// Block timestamp at the time of the snapshot.
     pub timestamp: u64,
-    /// Cumulative code coverage at this point.
+    /// Cumulative control-flow edge coverage at this point.
     pub coverage: CoverageMap,
     /// Dataflow waypoints reached across this snapshot's history.
     pub dataflow: DataflowWaypoints,
@@ -191,10 +224,14 @@ impl Default for StateSnapshot {
 
 // ── Coverage Map ─────────────────────────────────────────────────────────────
 
-/// Tracks real EVM instruction hitcounts for each contract address.
+/// Per-contract control-flow edge coverage with raw hitcounts.
+///
+/// Each key is a directed edge `(prev_pc, current_pc)` within that contract's
+/// bytecode (attributed execution context). Hitcounts accumulate per edge when
+/// the same transition is taken multiple times (e.g. loops).
 #[derive(Debug, Clone, Default)]
 pub struct CoverageMap {
-    /// contract address → (prev_pc, current_pc) edge → raw hitcount.
+    /// Contract address → `(prev_pc, current_pc)` edge → raw transition count.
     pub map: HashMap<Address, HashMap<(usize, usize), u32>>,
 }
 
@@ -535,8 +572,16 @@ pub struct CampaignConfig {
     pub workers: usize,
     /// Deterministic seed for the PRNG.
     pub seed: u64,
-    /// Contracts under test.
+    /// Runtime contracts to deploy first (typically `src/` artifacts). Does not
+    /// include the optional harness — that is deployed after these when
+    /// [`Self::harness`] is set.
     pub targets: Vec<ContractInfo>,
+    /// Optional Foundry-style test harness (`test/` artifact with `setUp()`).
+    /// When set, it is deployed after [`Self::targets`], then `setUp()` is
+    /// executed once before the campaign root snapshot. Fuzzing and property
+    /// checks use the merged deployed list (runtime + harness).
+    #[serde(default)]
+    pub harness: Option<ContractInfo>,
     /// Executor mode (Fast vs Realistic).
     #[serde(default)]
     pub mode: ExecutorMode,
@@ -558,6 +603,7 @@ impl Default for CampaignConfig {
             workers: 1,
             seed: 0,
             targets: Vec::new(),
+            harness: None,
             mode: ExecutorMode::Fast,
             rpc_url: None,
             rpc_block_number: None,
@@ -639,6 +685,7 @@ mod tests {
         assert!(cfg.timeout.as_secs() > 0);
         assert!(cfg.max_depth > 0);
         assert!(cfg.max_snapshots > 0);
+        assert!(cfg.harness.is_none());
     }
 
     #[test]

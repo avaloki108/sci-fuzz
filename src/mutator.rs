@@ -694,6 +694,12 @@ impl TxMutator {
         self.selectors.len()
     }
 
+    /// Returns true if `sel` was registered from a contract ABI (used to
+    /// assert harness lifecycle functions like `setUp` are not fuzzed).
+    pub fn has_abi_selector(&self, sel: [u8; 4]) -> bool {
+        self.selectors.contains(&sel)
+    }
+
     /// Add an address to the sender/address pool.
     ///
     /// Use this to ensure the fuzzer generates transactions from funded

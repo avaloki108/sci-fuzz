@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::evm::EvmExecutor;
 use crate::feedback::CoverageFeedback;
 use crate::rpc::FuzzerDatabase;
-use revm::db::{CacheDB, EmptyDB};
+use revm::db::CacheDB;
 
 use crate::invariant::EchidnaPropertyCaller;
 use crate::mutator::TxMutator;
@@ -22,8 +22,12 @@ use crate::oracle::OracleEngine;
 use crate::shrinker::SequenceShrinker;
 use crate::snapshot::SnapshotCorpus;
 use crate::types::{
-    Address, CampaignConfig, ContractInfo, CoverageMap, Finding, StateSnapshot, Transaction, U256,
+    contract_info_for_mutator, Address, CampaignConfig, ContractInfo, CoverageMap, Finding,
+    StateSnapshot, Transaction, U256,
 };
+
+/// ABI function names excluded from fuzzing (harness lifecycle; setup runs once at bootstrap).
+const STRIP_HARNESS_LIFECYCLE: &[&str] = &["setUp", "beforeTest", "afterTest"];
 
 /// deposit() selector: keccak256("deposit()")[..4] = 0xd0e30db0
 const DEPOSIT_SEL: [u8; 4] = [0xd0, 0xe3, 0x0d, 0xb0];
@@ -112,18 +116,6 @@ impl Campaign {
         let mut feedback = CoverageFeedback::new();
         let mut snapshots = SnapshotCorpus::new(self.config.max_snapshots);
 
-        let target_abis: HashMap<Address, JsonAbi> = self
-            .config
-            .targets
-            .iter()
-            .filter_map(|t| {
-                t.abi
-                    .clone()
-                    .and_then(|v| serde_json::from_value(v).ok())
-                    .map(|abi| (t.address, abi))
-            })
-            .collect();
-
         // --- Set up attacker address with some ETH -------------------------
         let attacker = Address::repeat_byte(0x42);
         executor.set_balance(attacker, U256::from(100_000_000_000_000_000_000_u128)); // 100 ETH
@@ -156,11 +148,57 @@ impl Campaign {
             }
         }
 
+        // --- Optional Foundry harness: deploy, then setUp() -----------------
+        if let Some(ref harness) = self.config.harness {
+            let deployment_bytecode = harness
+                .creation_bytecode
+                .clone()
+                .filter(|code| !code.is_empty())
+                .unwrap_or_else(|| harness.deployed_bytecode.clone());
+
+            if deployment_bytecode.is_empty() {
+                anyhow::bail!("harness contract has no bytecode to deploy");
+            }
+
+            let deployed_addr = executor.deploy(attacker, deployment_bytecode)?;
+            deployed_targets.push(ContractInfo {
+                address: deployed_addr,
+                deployed_bytecode: harness.deployed_bytecode.clone(),
+                creation_bytecode: harness.creation_bytecode.clone(),
+                name: harness.name.clone(),
+                source_path: harness.source_path.clone(),
+                abi: harness.abi.clone(),
+            });
+
+            crate::harness::run_setup(&mut executor, attacker, deployed_addr)
+                .map_err(|e| anyhow::anyhow!("harness setUp failed: {e}"))?;
+            eprintln!(
+                "[campaign] ran setUp() on harness {} ({})",
+                harness.name.as_deref().unwrap_or("?"),
+                deployed_addr
+            );
+        }
+
+        // --- JSON ABIs at deployed addresses (shrinker / oracles) ------------
+        let target_abis: HashMap<Address, JsonAbi> = deployed_targets
+            .iter()
+            .filter_map(|t| {
+                t.abi
+                    .clone()
+                    .and_then(|v| serde_json::from_value(v).ok())
+                    .map(|abi| (t.address, abi))
+            })
+            .collect();
+
         // --- Build sub-systems using DEPLOYED addresses --------------------
         // Add the attacker to each target's address pool so the mutator
         // generates transactions FROM the funded attacker, not just from
         // the contract address (which would send ETH to itself).
-        let mut mutator = TxMutator::new(deployed_targets.clone());
+        let mutator_targets: Vec<ContractInfo> = deployed_targets
+            .iter()
+            .map(|c| contract_info_for_mutator(c, STRIP_HARNESS_LIFECYCLE))
+            .collect();
+        let mut mutator = TxMutator::new(mutator_targets);
         mutator.add_to_address_pool(attacker);
         let mut oracle = OracleEngine::new(attacker);
 
@@ -719,6 +757,7 @@ mod tests {
             workers: 1,
             seed: 42,
             targets: Vec::new(),
+            harness: None,
             mode: ExecutorMode::Realistic,
             rpc_url: None,
             rpc_block_number: None,

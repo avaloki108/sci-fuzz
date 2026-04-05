@@ -24,6 +24,7 @@ The name stands for **S**mart **C**ontract **I**nvariant **Fuzz**er. The thesis 
 - **Real Echidna property calling** — `EchidnaPropertyCaller` discovers `echidna_*` functions from ABI, calls them via `static_call` after each sequence, checks bool returns. This is the actual Echidna workflow, not just log watching.
 - **Deterministic sequence shrinking** — findings are replayed from the same pre-sequence snapshot and reduced by prefix/suffix elimination, whole-tx removal, calldata-word reduction, `msg.value` reduction, and sender simplification
 - **Foundry artifact ingestion** — `sci-fuzz forge --project /path/to/project` runs `forge build`, parses standard `out/` artifacts, extracts ABI plus creation/runtime bytecode, and hands selected contracts to the existing campaign
+- **Foundry harness / `setUp()` (first pass)** — the engine classifies `src/` runtime contracts vs `test/` harness candidates (ABI must include parameterless `setUp()` and creation bytecode). It deploys runtime targets first, then at most one harness (preferring a contract whose ABI also lists `echidna_*` properties), executes `setUp()` once through revm, then records the root snapshot and starts calibration/fuzzing. Lifecycle functions `setUp`, `beforeTest`, and `afterTest` are stripped from the mutator’s ABI so setup is not randomly re-invoked during fuzzing; `echidna_*` discovery still uses the full ABI on the deployed harness
 - **Structured benchmark pipeline** — `sci-fuzz benchmark` runs repeatable multi-seed benchmark cases, records first-hit / repro / finding metrics, and emits stable CSV + JSON result files plus grouped summaries
 - **Comparison schema for Echidna / Forge** — benchmark rows now include `engine` and `status`, so the same artifact format can hold measured sci-fuzz runs alongside honest `unavailable` / `skipped` external comparison rows
 - **Benchmark matrix** — 81 entries mapping EF/CF contracts to expected vulnerability types, with file-existence and category-coverage validation tests
@@ -36,17 +37,18 @@ Honesty matters more than marketing. These are real gaps:
 - **No edge coverage yet.** sci-fuzz now records real per-instruction hitcounts from revm and feeds those into `CoverageFeedback`, but it does not yet record exact edge coverage (`prev_pc -> current_pc`) or perform block/sequence-level path canonicalization.
 - **Shrinking is still a first pass.** The shrinker is deterministic and useful today, but it is not yet a full semantic reducer: it does not reason about ABI types, storage dependencies, or minimal base-state snapshots, and it does not guarantee globally minimal sequences.
 - **No multi-worker parallelism.** The fuzzing loop is single-threaded. The `workers` config field exists but is not wired.
-- **Foundry integration is still partial.** Project mode now invokes `forge build` and ingests standard artifacts from `out/`, but it does not execute setup scripts, deploy script flows, imported invariant harnesses, or library-specific bootstrapping.
+- **Foundry integration gaps after harness setup.** Script-based deploy flows, library-specific bootstrapping, and Forge cheatcodes (`vm.*`) are not implemented. Harness `setUp` must be plain Solidity (deploy, calls, storage); tests that rely on the Forge cheatcode VM may revert or behave incorrectly. There is still no `StdInvariant` / `targetContract` import path or parity with Foundry’s invariant runner.
 - **External comparison execution is still partial.** `sci-fuzz benchmark` has a real measured path for sci-fuzz and a stable comparison schema for Echidna / Forge, but it does not yet orchestrate those tools end-to-end on shared targets. Their rows are reported as `unavailable` or `skipped`, never faked.
 - **No on-chain forking.** The `audit` subcommand exists in the CLI but is not implemented.
 - **Partial Echidna compatibility.** `EchidnaPropertyCaller` implements the core workflow (discover echidna_* functions, call them, check bool return). `EchidnaProperty` detects assertion events in logs. Neither handles revert/assert distinction with full Echidna fidelity, and the property-harness workflow (targetContract, configurable test limits, shrinking) is not implemented.
-- **No Foundry fork/invariant parity.** There is no Foundry fork-mode execution, no `StdInvariant` harness import path, and no parity claim with Foundry's invariant runner.
+- **No Foundry fork-mode fuzzing.** Forked RPC state exists for the audit path only; project-mode fuzzing does not mirror Foundry’s forked test execution.
 - **The 207k execs/sec number is a smoke test.** It measures empty-target throughput. Real contracts with storage and complex logic will run at 1–5k execs/sec. The number demonstrates low framework overhead, not security-testing strength.
 
 ## Architecture
 
 ```text
 campaign.rs    main loop: calibrate → select snapshot → generate/mutate → execute → check → learn
+harness.rs     Foundry-style setUp() selector + one-shot setup execution on the revm executor
 evm.rs         revm 19.7 wrapper: execute, deploy, static_call, snapshot/restore, Fast/Realistic modes, instruction coverage inspector
 snapshot.rs    state corpus: novelty-weighted selection, power scheduling metadata, auto-pruning over real coverage
 feedback.rs    AFL++ hitcount bucketing (8 classes), virgin-bits tracking, real-hitcount ingestion

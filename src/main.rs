@@ -4,10 +4,9 @@
 
 use std::process;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use sci_fuzz::types::{Address, Bytes, CampaignConfig, ContractInfo, ExecutorMode};
 use sci_fuzz::campaign::Campaign;
-use sci_fuzz::project::Project;
 
 #[cfg(feature = "cli")]
 use clap::Parser;
@@ -152,10 +151,21 @@ fn handle_forge(args: sci_fuzz::cli::ForgeArgs) -> Result<()> {
     println!("found project: {}", project_root.display());
     println!("running forge build...");
 
-    let (_project, targets, artifact_count) = Project::build_and_select_targets(&project_root)?;
+    let (_project, bootstrap, artifact_count) = Project::build_and_select_targets(&project_root)?;
 
     println!("discovered {} artifact(s)", artifact_count);
-    println!("selected {} fuzz target(s)", targets.len());
+    println!(
+        "selected {} runtime fuzz target(s){}",
+        bootstrap.runtime_targets.len(),
+        if let Some(ref h) = bootstrap.harness {
+            format!(
+                " + harness {}",
+                h.name.as_deref().unwrap_or("(unnamed)")
+            )
+        } else {
+            String::new()
+        }
+    );
     println!("starting campaign...");
     println!();
 
@@ -167,7 +177,8 @@ fn handle_forge(args: sci_fuzz::cli::ForgeArgs) -> Result<()> {
         max_snapshots: args.max_snapshots,
         workers: args.workers,
         seed: args.seed.unwrap_or_else(|| rand::random()),
-        targets,
+        targets: bootstrap.runtime_targets,
+        harness: bootstrap.harness,
         mode: sci_fuzz::types::ExecutorMode::Fast,
         rpc_url: args.fork_url,
         rpc_block_number: args.fork_block,
@@ -275,6 +286,7 @@ fn handle_audit(args: sci_fuzz::cli::AuditArgs) -> Result<()> {
         workers: 1, // Audit usually runs single-threaded for stability across network
         seed: rand::random(),
         targets: vec![target],
+        harness: None,
         mode: ExecutorMode::Realistic, // Audits should use realistic mode by default
         rpc_url: rpc_url.clone(),
         rpc_block_number: block,

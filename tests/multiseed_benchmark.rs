@@ -27,6 +27,7 @@ use rand::{Rng, SeedableRng};
 
 use sci_fuzz::evm::EvmExecutor;
 use sci_fuzz::invariant::EchidnaPropertyCaller;
+use sci_fuzz::rpc::FuzzerDatabase;
 use sci_fuzz::mutator::TxMutator;
 use sci_fuzz::oracle::OracleEngine;
 use sci_fuzz::scoreboard::{MultiSeedSummary, Scoreboard, ScorecardEntry};
@@ -77,7 +78,7 @@ struct BenchmarkHarness {
     feedback: sci_fuzz::feedback::CoverageFeedback,
     rng: StdRng,
     attacker: Address,
-    initial_db: revm::db::CacheDB<revm::db::EmptyDB>,
+    initial_db: revm::db::CacheDB<FuzzerDatabase>,
 }
 
 impl BenchmarkHarness {

@@ -30,16 +30,21 @@ use crate::rpc::FuzzerDatabase;
 // CoverageInspector
 // ---------------------------------------------------------------------------
 
-/// Collects real per-instruction hitcounts directly from revm.
+/// Collects per-edge control-flow coverage `(prev_pc -> current_pc)` from revm.
 ///
-/// We attribute coverage to the currently executing contract address exposed by
-/// the interpreter input. This is truthful execution coverage, though
-/// `DELEGATECALL` frames are attributed to the storage target rather than the
-/// library bytecode address.
+/// Edges are attributed to [`Interpreter::contract.bytecode_address`] when set,
+/// else [`Interpreter::contract.target_address`] (so `DELEGATECALL` maps to the
+/// storage contract). When the attributed address changes between steps (e.g.
+/// `CALL` into another contract), `prev_pc` is reset so we never record a false
+/// edge from the caller's last PC to the callee's first PC under the callee's
+/// address.
 #[derive(Debug, Clone, Default)]
 struct CoverageInspector {
     coverage: CoverageMap,
     prev_pc: Option<usize>,
+    /// Last contract address we attributed coverage to; used to reset `prev_pc`
+    /// on cross-contract execution context switches.
+    last_coverage_address: Option<Address>,
     dataflow: crate::types::DataflowWaypoints,
 }
 
@@ -49,10 +54,15 @@ impl<DB: Database> Inspector<DB> for CoverageInspector {
             .contract
             .bytecode_address
             .unwrap_or(interp.contract.target_address);
-        
+
+        if self.last_coverage_address != Some(address) {
+            self.prev_pc = None;
+            self.last_coverage_address = Some(address);
+        }
+
         let current_pc = interp.program_counter();
         let prev = self.prev_pc.unwrap_or(current_pc);
-        
+
         self.coverage.record_hit(address, prev, current_pc);
         self.prev_pc = Some(current_pc);
 
@@ -846,8 +856,9 @@ mod tests {
         assert!(result.success, "fast mode should allow unfunded transfer");
     }
 
+    /// Branches that take different jumps yield disjoint `(prev_pc, current_pc)` edges.
     #[test]
-    fn execute_collects_branch_sensitive_instruction_coverage() {
+    fn execute_collects_branch_sensitive_edge_coverage() {
         let mut exec = EvmExecutor::new();
         let caller = Address::with_last_byte(0x21);
         let target = Address::with_last_byte(0x12);
@@ -965,5 +976,80 @@ mod tests {
             feedback.record_from_coverage_map(&four_iterations.coverage),
             "higher loop hitcounts should move existing PCs into new AFL buckets"
         );
+    }
+
+    /// Contract A runs padding then `CALL`s B; B is a single `STOP`. Edges
+    /// recorded under B must not use A's program counter as `prev_pc` for the
+    /// callee's first steps (regression for cross-contract edge stitching).
+    #[test]
+    fn coverage_resets_prev_pc_on_contract_boundary() {
+        let mut exec = EvmExecutor::new();
+        let ext = Address::with_last_byte(0x50);
+        let contract_a = Address::with_last_byte(0xAA);
+        let contract_b = Address::with_last_byte(0xBB);
+        exec.set_balance(ext, U256::from(1_000_000u64));
+
+        let code_b = Bytecode::new_legacy(Bytes::from(vec![0x00]));
+        exec.insert_account_info(
+            contract_b,
+            AccountInfo {
+                code: Some(code_b),
+                ..Default::default()
+            },
+        );
+
+        let mut code_a = Vec::new();
+        for _ in 0..15 {
+            code_a.extend_from_slice(&[0x60, 0x00]);
+        }
+        code_a.extend_from_slice(&[
+            0x60, 0x00, // retSize
+            0x60, 0x00, // retOffset
+            0x60, 0x00, // argsSize
+            0x60, 0x00, // argsOffset
+            0x60, 0x00, // value
+        ]);
+        code_a.push(0x73);
+        code_a.extend_from_slice(contract_b.as_slice());
+        code_a.extend_from_slice(&[0x61, 0xff, 0xff]);
+        code_a.push(0xf1);
+        code_a.push(0x00);
+
+        let code_a = Bytecode::new_legacy(Bytes::from(code_a));
+        exec.insert_account_info(
+            contract_a,
+            AccountInfo {
+                code: Some(code_a),
+                ..Default::default()
+            },
+        );
+
+        let r = exec
+            .execute(&Transaction {
+                sender: ext,
+                to: Some(contract_a),
+                data: Bytes::new(),
+                value: U256::ZERO,
+                gas_limit: 1_000_000,
+            })
+            .expect("CALL execution");
+
+        assert!(r.success, "CALL into B should succeed");
+        let b_map = r
+            .coverage
+            .map
+            .get(&contract_b)
+            .expect("callee B should have coverage");
+        let max_b_pc = 0usize;
+        for (&(prev_pc, curr_pc), _) in b_map.iter() {
+            assert!(
+                prev_pc <= max_b_pc,
+                "B bytecode only occupies PC 0; got prev_pc={prev_pc} curr_pc={curr_pc}"
+            );
+            assert!(
+                curr_pc <= max_b_pc,
+                "B bytecode only occupies PC 0; got prev_pc={prev_pc} curr_pc={curr_pc}"
+            );
+        }
     }
 }

@@ -207,10 +207,10 @@ pub fn plan_for_foundry_project(
     max_depth: u32,
     max_execs: Option<u64>,
 ) -> crate::Result<Vec<BenchmarkPlanEntry>> {
-    let (_project, targets, _artifact_count) = Project::build_and_select_targets(root)?;
+    let (_project, bootstrap, _artifact_count) = Project::build_and_select_targets(root)?;
     let mut cases = Vec::new();
 
-    for target in targets {
+    for target in bootstrap.runtime_targets {
         let target_matches = target_name
             .map(|needle| target.name.as_deref() == Some(needle))
             .unwrap_or(true);
@@ -297,6 +297,7 @@ fn run_sci_fuzz_case(case: &BenchmarkCase, seed: u64) -> ScorecardEntry {
         workers: 1,
         seed,
         targets: case.targets.clone(),
+        harness: None,
         mode: crate::types::ExecutorMode::Fast,
         rpc_url: None,
         rpc_block_number: None,

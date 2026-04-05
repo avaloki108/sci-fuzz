@@ -2,20 +2,19 @@
 //!
 //! This module implements two key algorithms ported from AFL / LibAFL:
 //!
-//! 1. **Hitcount bucketing** — instead of tracking only *whether* a program
-//!    counter was reached, we track *how many times* it was hit and classify
-//!    the raw count into power-of-two buckets (1, 2, 4, 8, 16, 32, 64, 128).
-//!    A transition between buckets (e.g. a loop executing 3 times vs 8 times)
-//!    counts as new coverage.
+//! 1. **Hitcount bucketing** — for each control-flow edge `(prev_pc, current_pc)`
+//!    (per attributed contract address), we track how many times that edge
+//!    was taken and classify the raw count into power-of-two buckets
+//!    (1, 2, 4, 8, 16, 32, 64, 128). A transition between buckets (e.g. a loop
+//!    executing 3 times vs 8 times) counts as new coverage.
 //!
-//! 2. **Virgin bits tracking** — a global map of `(address, pc, bucket)`
-//!    triples that have *never* been observed.  When an execution produces a
+//! 2. **Virgin bits tracking** — a global map of `(address, edge, bucket)`
+//!    triples that have *never* been observed. When an execution produces a
 //!    triple absent from the virgin map the input is considered novel and
 //!    should be retained in the corpus.
 //!
-//! Together these give the fuzzer a much richer signal than simple
-//! "was this PC hit?" coverage, especially for contracts with loops,
-//! mapping iterations, and variable-length array processing.
+//! Together these give a richer signal than simple “was this PC hit?” coverage,
+//! especially for loops and divergent branches (different edges).
 //!
 //! # References
 //!
@@ -79,32 +78,31 @@ pub fn bucket(count: u32) -> u8 {
 
 /// Enhanced coverage feedback with hitcount bucketing and virgin bits.
 ///
-/// Rather than recording a flat set of `(address, pc)` pairs, this struct
-/// tracks the *bucketed hitcount* for each pair.  A new bucket for a
-/// previously-seen PC is still considered novel coverage — this lets the
-/// fuzzer distinguish e.g. "loop ran once" from "loop ran 20 times".
+/// Tracks the *bucketed hitcount* for each `(address, (prev_pc, current_pc))`
+/// edge. A new bucket for a previously-seen edge is still novel — e.g.
+/// “loop ran once” vs “loop ran 20 times” on the same back-edge.
 ///
 /// # Virgin bits
 ///
-/// The `seen_bits` map records every `(address, pc, bucket)` triple that has
-/// been observed across the entire campaign.  An execution is *interesting*
-/// whenever it produces at least one triple **not** present in `seen_bits`.
+/// The `seen_bits` map records every `(address, edge, bucket)` triple observed
+/// across the campaign. An execution is *interesting* when it produces at least
+/// one triple **not** present in `seen_bits`.
 #[derive(Debug, Clone)]
 pub struct CoverageFeedback {
-    /// Every `(address, pc)` → set of buckets that **have** been seen.
+    /// Every `(address, edge)` → set of buckets that **have** been seen.
     /// A new bucket value for a known key, or a brand-new key, both
     /// constitute novel coverage.
     seen_bits: HashMap<(Address, (usize, usize)), HashSet<u8>>,
 
     /// Accumulated raw hitcounts across the entire campaign (for stats /
-    /// reporting).  Values are the *maximum* hitcount observed for each
+    /// reporting). Values are the *maximum* hitcount observed for each
     /// `(address, edge)` pair.
     global_hitcounts: HashMap<(Address, (usize, usize)), u32>,
 
     /// Dataflow waypoints observed globally.
     seen_dataflow: HashMap<Address, HashSet<crate::types::U256>>,
 
-    /// Total unique `(address, pc, bucket)` triples discovered so far.
+    /// Total unique `(address, edge, bucket)` triples discovered so far.
     total_bits: usize,
 
     /// Whether the most recent call to [`record`](Self::record) or
@@ -126,7 +124,7 @@ impl CoverageFeedback {
     }
 
     /// Read-only check: would `hitcounts` produce at least one novel
-    /// `(address, edge, bucket)` triple?
+    /// `(address, (prev_pc, current_pc), bucket)` triple?
     ///
     /// This does **not** mutate the feedback state — call
     /// [`record`](Self::record) afterwards to actually merge.
@@ -151,7 +149,7 @@ impl CoverageFeedback {
     /// Merge `hitcounts` into the global state.
     ///
     /// Returns `true` when at least one previously-unseen
-    /// `(address, pc, bucket)` triple was discovered.
+    /// `(address, edge, bucket)` triple was discovered.
     pub fn record(&mut self, hitcounts: &HashMap<(Address, (usize, usize)), u32>) -> bool {
         let mut novel = false;
 
@@ -211,7 +209,7 @@ impl CoverageFeedback {
         novel
     }
 
-    /// Total number of unique `(address, pc, bucket)` triples discovered.
+    /// Total number of unique `(address, edge, bucket)` triples discovered.
     pub fn total_coverage(&self) -> usize {
         self.total_bits
     }
