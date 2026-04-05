@@ -24,13 +24,13 @@ use rand::{Rng, SeedableRng};
 
 use sci_fuzz::evm::EvmExecutor;
 use sci_fuzz::feedback::CoverageFeedback;
-use sci_fuzz::invariant::{EchidnaPropertyCaller, InvariantRegistry};
+use sci_fuzz::invariant::EchidnaPropertyCaller;
 use sci_fuzz::mutator::TxMutator;
 use sci_fuzz::oracle::OracleEngine;
 use sci_fuzz::scoreboard::{Scoreboard, ScorecardEntry};
 use sci_fuzz::snapshot::SnapshotCorpus;
 use sci_fuzz::types::{
-    Address, Bytes, CampaignConfig, ContractInfo, Finding, Severity, StateSnapshot, Transaction,
+    Address, Bytes, ContractInfo, Finding, Severity, StateSnapshot, Transaction,
     U256,
 };
 

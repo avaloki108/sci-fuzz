@@ -20,7 +20,7 @@ The name stands for **S**mart **C**ontract **I**nvariant **Fuzz**er. The thesis 
 - **RPC-backed fork / deployed-state execution** — When [`CampaignConfig::rpc_url`](src/types.rs) is set, the campaign builds an [`RpcCacheDB`](src/rpc.rs) (`eth_getBalance`, `eth_getCode`, `eth_getTransactionCount`, `eth_getStorageAt` at a pinned block or `latest`), probes the endpoint (`eth_blockNumber`), aligns [`BlockEnv`](src/evm.rs) with `eth_getBlockByNumber`, and uses the forked DB as the **campaign root**. Targets with **no** creation/runtime bytecode are treated as **already deployed** at the configured address; the engine checks `eth_getCode` before fuzzing. **Not** a Forge cheatcode VM: no `vm.*` semantics. [`RpcCacheDB::code_by_hash`](src/rpc.rs) is a stub (empty); execution relies on bytecode in account info / `CacheDB` overlays — rare `code_by_hash`-only lookups may misbehave.
 - **Project-mode fork (first pass)** — `sci-fuzz forge --fork-url … --fork-block …` sets `rpc_url` / `rpc_block_number`. If `--fork-url` is omitted, `[profile.default] eth_rpc_url` from `foundry.toml` is used when present. CLI overrides `foundry.toml`.
 - **Audit deployed contracts** — `sci-fuzz audit <address> --rpc-url …` **requires** an RPC URL (`ETH_RPC_URL` or `--rpc-url`). Optional Etherscan ABI fetch; warns when targets have no ABI.
-- **Attacker / sender model** — Default funded EOA is `0x4242…4242` (100 ETH), overwritten in the executor DB. On a fork that address may already exist on-chain; use `--attacker` (`forge` / `audit`) or [`CampaignConfig::attacker_address`](src/types.rs) to pick another EOA.
+- **Attacker / sender model** — [`CampaignConfig::resolved_attacker`](src/types.rs) is the funded EOA: optional [`CampaignConfig::attacker_address`](src/types.rs), else default `0x4242…4242` (100 ETH seeded in the executor DB). CLI `--attacker` on `forge` / `audit` sets that field. The same address is used for deploy/setup, mutator sender pool, Echidna property `static_call` context, and balance/profit oracles.
 - **Multi-worker parallel campaign (local in-memory DB)** — Implemented in `campaign.rs` as `run_parallel_campaign`: after calibration, one OS thread per worker (`parallel_worker_loop`), each with its **own** `EvmExecutor`. Shared resources — coverage feedback, snapshot corpus, saved DB snapshots, finding dedupe, aggregated `CampaignReport` counters — sit behind **mutexes** and are updated from all workers.
   - **RPC mode:** If `rpc_url` is set, the campaign **forces `workers = 1`**. Fork/RPC-backed state is not shared safely across threads.
   - **Reproducibility:** With `workers > 1`, **scheduling is not fully reproducible** across runs (thread interleaving differs).
@@ -29,7 +29,7 @@ The name stands for **S**mart **C**ontract **I**nvariant **Fuzz**er. The thesis 
 - **Calibration phase** — runs seed transactions before the main loop to establish coverage baselines and populate the value dictionary
 - **ABI-aware mutation** — extracts function selectors from ABI JSON, generates typed arguments (uint256, address, bool, bytes32), mutates with bit-flip, byte-replace, selector-swap, value-change, sender-swap
 - **Value dictionary** — seeded from EVM bytecode (PUSH1–PUSH32 operand extraction) and grown from execution results (return data, log topics, storage writes)
-- **Core invariant checkers** (always registered): BalanceIncrease, UnexpectedRevert, SelfDestruct, EchidnaProperty (log-based assertion detection), FlashloanEconomicOracle (profit after mock flashloan scaffold)
+- **Core invariant checkers** (always registered): BalanceIncrease, UnexpectedRevert, SelfDestruct, EchidnaProperty (log-based assertion detection), FlashloanEconomicOracle (profit after mock flashloan scaffold). ETH balance baselines for profit-style checks are **per sequence**: captured immediately before executing the sequence (after restoring the selected snapshot), not once at campaign start — so non-root corpus snapshots compare against the correct pre-sequence balances.
 - **Exploit-grade economic oracles** ([`economic.rs`](src/economic.rs)), all on execution evidence (logs + per-tx `state_diff`, plus **sequence-cumulative logs** where noted):
   - ERC-4626 impossible `Deposit` / `Withdraw` event tuples (assets/shares consistency).
   - ERC-20 **mint** and **burn** (large `Transfer` from/to `address(0)`) without an OpenZeppelin-style `_totalSupply` storage write (slot 2 heuristic) — supply ledger vs event mismatch.
@@ -75,7 +75,7 @@ feedback.rs    AFL++ hitcount bucketing (8 classes), virgin-bits tracking, real-
 mutator.rs     ABI-aware generation, 5 mutation strategies, value dictionary, bytecode constant extraction
 economic.rs    exploit-oriented economic invariants (ERC-4626, ERC-20 accounting, optional lending drift)
 invariant.rs   Invariant trait + default registry + EchidnaPropertyCaller
-oracle.rs      routes execution results through invariant registry
+oracle.rs      routes execution results through invariant registry; balance baselines supplied per `check` (see `capture_eth_baseline`)
 types.rs       core types built on alloy-primitives (Address, U256, B256); ExecutionResult includes sequence_cumulative_logs
 scoreboard.rs  stable benchmark result / summary schema + CSV / JSON writers
 benchmark.rs   benchmark case loading, sci-fuzz measurement, comparison scaffolding
@@ -239,8 +239,8 @@ Until the shared-target comparison rows become measured rather than scaffolded, 
 
 | Metric | Value |
 |--------|-------|
-| Rust source | ~5,500 lines across 13 modules |
-| Unit tests | 130+ passing |
+| Rust source | ~12,000 lines in `src/` (20+ modules) |
+| Unit tests | 130+ passing (`cargo test --lib`) |
 | Benchmark contracts | 133 (from EF/CF) |
 | Benchmark matrix entries | 81 with expected bug types |
 | Dependencies | revm 19.7, alloy-primitives 0.8, clap 4, serde, rand, tiny-keccak |
