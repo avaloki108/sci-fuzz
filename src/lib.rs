@@ -29,6 +29,9 @@
 pub mod error;
 pub mod types;
 
+/// Ordered dynamic path hashing (per-tx and per-sequence).
+pub mod path_id;
+
 // ── EVM execution layer ─────────────────────────────────────────────────
 
 pub mod evm;
@@ -100,6 +103,8 @@ pub use campaign::Campaign;
 pub use campaign::{CampaignFindingRecord, CampaignReport};
 pub use error::{Error, Result};
 pub use evm::EvmExecutor;
+pub use feedback::PathFeedback;
+pub use path_id::{fold_sequence, native_flashloan_path_id, tx_path_id_from_stream};
 pub use project::{abi_has_echidna_property, abi_has_set_up, FuzzBootstrap};
 pub use scoreboard::{
     BenchmarkEngine, BenchmarkStatus, MultiSeedSummary, Scoreboard, ScorecardEntry,

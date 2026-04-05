@@ -20,9 +20,11 @@ use revm::{
     Database, DatabaseCommit, DatabaseRef, Evm, EvmContext, Inspector,
 };
 
+use crate::path_id::{native_flashloan_path_id, PathStreamHasher};
 use crate::rpc::FuzzerDatabase;
 use crate::types::{
-    Address, Bytes, CoverageMap, ExecutionResult, ExecutorMode, Log, StateDiff, Transaction, U256,
+    Address, Bytes, CoverageMap, ExecutionResult, ExecutorMode, Log, StateDiff, Transaction, B256,
+    U256,
 };
 
 // ---------------------------------------------------------------------------
@@ -41,6 +43,8 @@ use crate::types::{
 #[derive(Debug, Clone, Default)]
 struct CoverageInspector {
     coverage: CoverageMap,
+    /// Ordered edge stream for [`ExecutionResult::tx_path_id`].
+    path: PathStreamHasher,
     prev_pc: Option<usize>,
     /// Last contract address we attributed coverage to; used to reset `prev_pc`
     /// on cross-contract execution context switches.
@@ -64,6 +68,7 @@ impl<DB: Database> Inspector<DB> for CoverageInspector {
         let prev = self.prev_pc.unwrap_or(current_pc);
 
         self.coverage.record_hit(address, prev, current_pc);
+        self.path.mix_edge(address, prev, current_pc);
         self.prev_pc = Some(current_pc);
 
         let op = interp.current_opcode();
@@ -173,8 +178,10 @@ impl EvmExecutor {
         let ResultAndState { result, state } = evm
             .transact()
             .map_err(|e| anyhow!("EVM transact error: {e:?}"))?;
-        let coverage = evm.context.external.coverage.clone();
-        let dataflow = evm.context.external.dataflow.clone();
+        let ext = &evm.context.external;
+        let tx_path_id = ext.path.finalize();
+        let coverage = ext.coverage.clone();
+        let dataflow = ext.dataflow.clone();
 
         // Commit state changes into the CacheDB.
         drop(evm); // release mutable borrow on self.db
@@ -182,14 +189,18 @@ impl EvmExecutor {
 
         // Convert the revm result into our own type.
         let exec_result =
-            self.convert_result(&result, &state, &pre_balances, coverage, dataflow)?;
+            self.convert_result(&result, &state, &pre_balances, coverage, dataflow, tx_path_id)?;
         Ok(exec_result)
     }
 
     /// Simulate a mock flashloan `borrow` or `repay` interaction natively.
     fn execute_mock_flashloan(&mut self, tx: &Transaction) -> Result<ExecutionResult> {
+        let synthetic_path = native_flashloan_path_id();
         if tx.data.len() < 36 {
-            return Ok(ExecutionResult::default());
+            return Ok(ExecutionResult {
+                tx_path_id: synthetic_path,
+                ..Default::default()
+            });
         }
 
         let sel = &tx.data[..4];
@@ -206,6 +217,7 @@ impl EvmExecutor {
             if old < amount {
                 return Ok(ExecutionResult {
                     success: false,
+                    tx_path_id: synthetic_path,
                     ..Default::default()
                 });
             }
@@ -213,11 +225,15 @@ impl EvmExecutor {
             self.set_balance(tx.sender, new);
             balance_changes.insert(tx.sender, (old, new));
         } else {
-            return Ok(ExecutionResult::default());
+            return Ok(ExecutionResult {
+                tx_path_id: synthetic_path,
+                ..Default::default()
+            });
         }
 
         Ok(ExecutionResult {
             success: true,
+            tx_path_id: synthetic_path,
             state_diff: crate::types::StateDiff {
                 storage_writes: HashMap::new(),
                 balance_changes,
@@ -418,6 +434,7 @@ impl EvmExecutor {
         pre_balances: &HashMap<Address, U256>,
         coverage: CoverageMap,
         dataflow: crate::types::DataflowWaypoints,
+        tx_path_id: B256,
     ) -> Result<ExecutionResult> {
         let (success, gas_used, output, logs) = match result {
             RevmResult::Success {
@@ -461,6 +478,7 @@ impl EvmExecutor {
             state_diff,
             sequence_cumulative_logs: Vec::new(),
             protocol_probes: Default::default(),
+            tx_path_id,
         })
     }
 
@@ -691,6 +709,32 @@ mod tests {
 
         let result = exec.execute(&tx).expect("execution should succeed");
         assert!(result.success);
+    }
+
+    #[test]
+    fn replay_same_tx_yields_same_tx_path_id() {
+        let mut exec = EvmExecutor::new();
+        let caller = Address::with_last_byte(0x01);
+        let target = Address::with_last_byte(0x22);
+        exec.set_balance(caller, U256::from(1_000_000u64));
+        let code = Bytecode::new_legacy(Bytes::from(vec![0x00]));
+        exec.insert_account_info(
+            target,
+            AccountInfo {
+                code: Some(code),
+                ..Default::default()
+            },
+        );
+        let tx = Transaction {
+            sender: caller,
+            to: Some(target),
+            data: Bytes::new(),
+            value: U256::ZERO,
+            gas_limit: 1_000_000,
+        };
+        let id1 = exec.execute(&tx).expect("e1").tx_path_id;
+        let id2 = exec.execute(&tx).expect("e2").tx_path_id;
+        assert_eq!(id1, id2);
     }
 
     #[test]

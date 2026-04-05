@@ -47,6 +47,8 @@ pub struct PowerMetadata {
     pub calibrated: bool,
     /// Handicap: lower priority if this snapshot rarely produces new coverage.
     pub handicap: u32,
+    /// Times this snapshot was first retained due to path-only novelty (ordered path ID).
+    pub path_bits: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -231,6 +233,9 @@ impl SnapshotCorpus {
 
         // Boost for high new_bits.
         energy *= 1.0 + (meta.new_bits as f64 * 0.5);
+
+        // Small boost when the snapshot was discovered via path-order novelty alone.
+        energy *= 1.0 + (meta.path_bits as f64 * 0.04);
 
         // Penalty for over-exploration.
         if meta.n_fuzz > 0 {
@@ -572,6 +577,7 @@ mod tests {
         assert_eq!(meta.avg_exec_us, 0);
         assert!(!meta.calibrated);
         assert_eq!(meta.handicap, 0);
+        assert_eq!(meta.path_bits, 0);
     }
 
     #[test]

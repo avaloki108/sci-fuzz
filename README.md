@@ -14,6 +14,7 @@ The name stands for **S**mart **C**ontract **I**nvariant **Fuzz**er. The thesis 
 
 - **EVM execution** via revm 19.7 with snapshot/restore (CacheDB cloning)
 - **Per-contract control-flow edge coverage** via a revm inspector that records `(prev_pc, current_pc)` transitions (per attributed contract) with raw hitcounts during execution
+- **Ordered path IDs (per tx and per sequence)** — [`ExecutionResult::tx_path_id`](src/types.rs) fingerprints the **order** of dynamic edges via a rolling hash finalized with `keccak256` (see [`path_id.rs`](src/path_id.rs)), using the same `(contract, prev_pc, current_pc)` attribution as coverage. The campaign combines successive tx path IDs into a sequence-level ID for novelty. [`PathFeedback`](src/feedback.rs) records first-seen tx/sequence path hashes with **bounded** FIFO-capped sets (default 50k each). Corpus snapshots can gain a small energy multiplier via [`PowerMetadata::path_bits`](src/snapshot.rs) when retained primarily for path-order novelty. **Not** a full exported BB trace; not a separate call-stack key beyond today’s bytecode/target attribution; hash collisions are possible in theory; in **multi-worker** mode each thread has its own executor while path state merges into shared feedback; **fork** mode uses the same machinery at `workers = 1`.
 - **Dual executor modes**: `Fast` (all safety checks off, best for exploration) and `Realistic` (balance enforcement on, reduces false positives from impossible states)
 - **AFL++ hitcount bucketing** — tracks not just "was this edge taken?" but which hitcount bucket (1, 2, 4, 8, 16, 32, 64, 128+), using real transition hitcounts from the executor so loop iteration differences count as new coverage
 - **Power scheduling** — snapshot selection weighted by novelty × new-bits boost × depth bonus ÷ √exploration-count, ported from LibAFL's power schedule and now driven by real execution coverage instead of storage-write heuristics
@@ -57,7 +58,7 @@ The name stands for **S**mart **C**ontract **I**nvariant **Fuzz**er. The thesis 
 
 Honesty matters more than marketing. These are real gaps:
 
-- **No block- or sequence-level path IDs yet.** Coverage is keyed by `(contract, prev_pc, current_pc)` edges with AFL-style bucketing on each edge’s hitcount. There is no canonical basic-block trace, call-stack-aware edge key, or transaction-sequence fingerprint yet — different dynamic paths that share the same edge multiset can look identical to the engine.
+- **Path IDs are a compact fingerprint, not a perfect trace.** Full canonical basic-block traces, call-depth-indexed edge keys beyond the current contract attribution, and a global path database are still out of scope. Path novelty uses bounded caches — under extreme uniqueness pressure, older path IDs may be evicted and re-novel. Native mock-flashloan txs use a deterministic synthetic path ID (no bytecode inspector).
 - **Shrinking is still a first pass.** The shrinker is deterministic and useful today, but it is not yet a full semantic reducer: it does not reason about ABI types, storage dependencies, or minimal base-state snapshots, and it does not guarantee globally minimal sequences.
 - **No distributed fuzzing** — still the case: parallel workers are threads in one process only; there is no multi-machine corpus or coordinator (see multi-worker **Scope** above).
 - **Foundry integration gaps after harness setup.** Script-based deploy flows, library-specific bootstrapping, and Forge cheatcodes (`vm.*`) are not implemented. Harness `setUp` must be plain Solidity (deploy, calls, storage); tests that rely on the Forge cheatcode VM may revert or behave incorrectly — error strings from sci-fuzz mention the lack of `vm.*`. There is still no `StdInvariant` / `targetContract` import path or parity with Foundry’s invariant runner.
@@ -73,16 +74,17 @@ Honesty matters more than marketing. These are real gaps:
 ```text
 campaign.rs    main loop: calibrate → (optional) parallel workers → shared corpus/feedback → execute → check → learn
 harness.rs     Foundry-style setUp() selector + one-shot setup execution on the revm executor
-evm.rs         revm 19.7 wrapper: execute, deploy, static_call, snapshot/restore, Fast/Realistic modes, edge coverage inspector
+evm.rs         revm 19.7 wrapper: execute, deploy, static_call, snapshot/restore, Fast/Realistic modes, edge coverage + ordered path stream
+path_id.rs     rolling path hash, per-sequence fold, native-flashloan synthetic id
 snapshot.rs    state corpus: novelty-weighted selection, power scheduling metadata, auto-pruning over real coverage
-feedback.rs    AFL++ hitcount bucketing (8 classes), virgin-bits tracking, real-hitcount ingestion
+feedback.rs    AFL++ hitcount bucketing (8 classes), virgin-bits tracking, bounded path-ID novelty
 mutator.rs     ABI-aware generation, 5 mutation strategies, value dictionary, bytecode constant extraction
 economic.rs    exploit-oriented economic invariants (ERC-4626, ERC-20 accounting, AMM swap/sync sanity, optional lending drift, probe-informed checks)
 protocol_probes.rs  post-tx static_call probes (ERC-4626 / ERC-20 / AMM) into ExecutionResult
 protocol_semantics.rs  best-effort ABI/event protocol classification and triage helpers for economic oracles
 invariant.rs   Invariant trait + default registry + EchidnaPropertyCaller
 oracle.rs      routes execution results through invariant registry; balance baselines supplied per `check` (see `capture_eth_baseline`)
-types.rs       core types built on alloy-primitives (Address, U256, B256); ExecutionResult includes sequence_cumulative_logs and protocol_probes
+types.rs       core types built on alloy-primitives (Address, U256, B256); ExecutionResult includes tx_path_id, sequence_cumulative_logs, protocol_probes
 scoreboard.rs  stable benchmark result / summary schema + CSV / JSON writers
 benchmark.rs   benchmark case loading, sci-fuzz measurement, comparison scaffolding
 cli.rs         clap-based CLI: benchmark, forge, audit, test, ci, diff, version

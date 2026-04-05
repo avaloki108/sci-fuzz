@@ -149,6 +149,9 @@ pub struct ExecutionResult {
     /// [`crate::protocol_probes::fill_protocol_probes`]).
     #[serde(default, skip_serializing_if = "ProtocolProbeReport::is_empty")]
     pub protocol_probes: ProtocolProbeReport,
+    /// Ordered dynamic control-flow path fingerprint for this transaction (see [`crate::path_id`]).
+    #[serde(default)]
+    pub tx_path_id: B256,
 }
 
 impl Default for ExecutionResult {
@@ -163,6 +166,7 @@ impl Default for ExecutionResult {
             state_diff: StateDiff::default(),
             sequence_cumulative_logs: Vec::new(),
             protocol_probes: ProtocolProbeReport::default(),
+            tx_path_id: B256::ZERO,
         }
     }
 }

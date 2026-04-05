@@ -738,6 +738,7 @@ mod tests {
             },
             sequence_cumulative_logs: Vec::new(),
             protocol_probes: Default::default(),
+            tx_path_id: crate::types::B256::ZERO,
         }
     }
 
@@ -888,6 +889,7 @@ mod tests {
             },
             sequence_cumulative_logs: Vec::new(),
             protocol_probes: Default::default(),
+            tx_path_id: crate::types::B256::ZERO,
         }
     }
 

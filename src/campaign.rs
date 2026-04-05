@@ -14,7 +14,8 @@ use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 
 use crate::evm::EvmExecutor;
-use crate::feedback::CoverageFeedback;
+use crate::feedback::{CoverageFeedback, PathFeedback};
+use crate::path_id::fold_sequence;
 use crate::rpc::FuzzerDatabase;
 use revm::db::CacheDB;
 
@@ -25,8 +26,8 @@ use crate::shrinker::SequenceShrinker;
 use crate::snapshot::SnapshotCorpus;
 use crate::economic::ProtocolProfileMap;
 use crate::types::{
-    contract_info_for_mutator, Address, Bytes, CampaignConfig, ContractInfo, CoverageMap, Finding,
-    StateSnapshot, Transaction, U256,
+    contract_info_for_mutator, Address, B256, Bytes, CampaignConfig, ContractInfo, CoverageMap,
+    Finding, StateSnapshot, Transaction, U256,
 };
 
 /// ABI function names excluded from fuzzing (harness lifecycle; setup runs once at bootstrap).
@@ -60,6 +61,7 @@ fn executor_block_meta(executor: &EvmExecutor) -> (u64, u64) {
 /// Shared fuzzing state for multi-worker campaigns (mutex-protected).
 struct SharedCampaignInner {
     feedback: CoverageFeedback,
+    path_feedback: PathFeedback,
     snapshots: SnapshotCorpus,
     saved_dbs: HashMap<u64, CacheDB<FuzzerDatabase>>,
     mutator: TxMutator,
@@ -192,6 +194,7 @@ impl Campaign {
         }
 
         let mut feedback = CoverageFeedback::new();
+        let mut path_feedback = PathFeedback::new();
         let mut snapshots = SnapshotCorpus::new(self.config.max_snapshots);
 
         // --- Set up attacker address with some ETH -------------------------
@@ -459,8 +462,13 @@ impl Campaign {
 
                 let novel_cov = feedback.record_from_coverage_map(&cov);
                 let novel_df = feedback.record_dataflow(&df);
+                let seq_path = fold_sequence(B256::ZERO, result.tx_path_id, 0);
+                let novel_tx_path = path_feedback.record_tx_path(&result.tx_path_id);
+                let novel_seq_path = path_feedback.record_sequence_path(&seq_path);
+                let path_only =
+                    (novel_tx_path || novel_seq_path) && !novel_cov && !novel_df;
 
-                if novel_cov || novel_df {
+                if novel_cov || novel_df || novel_tx_path || novel_seq_path {
                     let (bn, ts) = executor_block_meta(&executor);
                     let snap = StateSnapshot {
                         id: 0,
@@ -476,6 +484,9 @@ impl Campaign {
                     snapshots.update_metadata(snap_id, |m| {
                         m.calibrated = true;
                         m.new_bits = cov.len() as u32;
+                        if path_only {
+                            m.path_bits = m.path_bits.saturating_add(1);
+                        }
                     });
                 }
             }
@@ -490,6 +501,7 @@ impl Campaign {
         if effective_workers > 1 {
             let inner = SharedCampaignInner {
                 feedback,
+                path_feedback,
                 snapshots,
                 saved_dbs,
                 mutator,
@@ -604,8 +616,9 @@ impl Campaign {
             let mut reached_exec_budget = false;
             let mut sequence: Vec<Transaction> = Vec::with_capacity(final_sequence.len());
             let mut cumulative_logs: Vec<crate::types::Log> = Vec::new();
+            let mut sequence_path_id = B256::ZERO;
 
-            for tx in final_sequence {
+            for (step_idx, tx) in final_sequence.into_iter().enumerate() {
                 let mut result = match executor.execute(&tx) {
                     Ok(r) => r,
                     Err(_) => continue,
@@ -711,9 +724,16 @@ impl Campaign {
                     successful_state_changes += 1;
                 }
 
+                sequence_path_id =
+                    fold_sequence(sequence_path_id, result.tx_path_id, step_idx as u32);
+
                 let novel_cov = feedback.record_from_coverage_map(&cov);
                 let novel_df = feedback.record_dataflow(&df);
-                let is_novel = novel_cov || novel_df;
+                let novel_tx_path = path_feedback.record_tx_path(&result.tx_path_id);
+                let novel_seq_path = path_feedback.record_sequence_path(&sequence_path_id);
+                let path_only =
+                    (novel_tx_path || novel_seq_path) && !novel_cov && !novel_df;
+                let is_novel = novel_cov || novel_df || novel_tx_path || novel_seq_path;
                 if is_novel {
                     // Store a snapshot of this state for future exploration.
                     let (bn, ts) = executor_block_meta(&executor);
@@ -728,6 +748,11 @@ impl Campaign {
                         dataflow: df,
                     };
                     let snap_id = snapshots.add(snap);
+                    if path_only {
+                        snapshots.update_metadata(snap_id, |m| {
+                            m.path_bits = m.path_bits.saturating_add(1);
+                        });
+                    }
 
                     // If this tx changed state, persist the DB so future
                     // iterations can start from this post-tx state.
@@ -1048,8 +1073,9 @@ fn parallel_worker_loop(
         let mut reached_exec_budget = false;
         let mut sequence: Vec<Transaction> = Vec::with_capacity(final_sequence.len());
         let mut cumulative_logs: Vec<crate::types::Log> = Vec::new();
+        let mut sequence_path_id = B256::ZERO;
 
-        for tx in final_sequence {
+        for (step_idx, tx) in final_sequence.into_iter().enumerate() {
             if campaign_start.elapsed() >= config.timeout {
                 reached_exec_budget = true;
                 break;
@@ -1127,6 +1153,9 @@ fn parallel_worker_loop(
             let cov = result.coverage.clone();
             let df = result.dataflow.clone();
 
+            sequence_path_id =
+                fold_sequence(sequence_path_id, result.tx_path_id, step_idx as u32);
+
             {
                 let mut g = shared.lock().expect("shared mutex poisoned");
                 if !result.state_diff.storage_writes.is_empty() {
@@ -1143,7 +1172,11 @@ fn parallel_worker_loop(
 
                 let novel_cov = g.feedback.record_from_coverage_map(&cov);
                 let novel_df = g.feedback.record_dataflow(&df);
-                if novel_cov || novel_df {
+                let novel_tx_path = g.path_feedback.record_tx_path(&result.tx_path_id);
+                let novel_seq_path = g.path_feedback.record_sequence_path(&sequence_path_id);
+                let path_only =
+                    (novel_tx_path || novel_seq_path) && !novel_cov && !novel_df;
+                if novel_cov || novel_df || novel_tx_path || novel_seq_path {
                     let (bn, ts) = executor_block_meta(&executor);
                     let snap = StateSnapshot {
                         id: 0,
@@ -1156,6 +1189,11 @@ fn parallel_worker_loop(
                         dataflow: df,
                     };
                     let snap_id = g.snapshots.add(snap);
+                    if path_only {
+                        g.snapshots.update_metadata(snap_id, |m| {
+                            m.path_bits = m.path_bits.saturating_add(1);
+                        });
+                    }
                     if result.success
                         && !result.state_diff.storage_writes.is_empty()
                         && g.saved_dbs.len() < 64

@@ -21,9 +21,9 @@
 //! * AFL `COUNT_CLASS_LOOKUP` — <https://github.com/google/AFL>
 //! * LibAFL `HitcountsMapObserver` — `libafl/src/observers/map/hitcount_map.rs`
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::types::{Address, CoverageMap};
+use crate::types::{Address, B256, CoverageMap};
 
 // ---------------------------------------------------------------------------
 // Hitcount bucketing
@@ -226,6 +226,79 @@ impl CoverageFeedback {
 }
 
 impl Default for CoverageFeedback {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Path feedback (bounded novelty for ordered path IDs)
+// ---------------------------------------------------------------------------
+
+/// Default max distinct tx- and sequence-path IDs retained per category.
+pub const DEFAULT_PATH_FEEDBACK_CAP: usize = 50_000;
+
+/// Tracks first-seen per-transaction and per-sequence path fingerprints with FIFO eviction.
+///
+/// Used alongside [`CoverageFeedback`]: edge multiset novelty can be false while path
+/// order novelty is true.
+#[derive(Debug, Clone)]
+pub struct PathFeedback {
+    seen_tx: HashSet<B256>,
+    order_tx: VecDeque<B256>,
+    seen_seq: HashSet<B256>,
+    order_seq: VecDeque<B256>,
+    cap_tx: usize,
+    cap_seq: usize,
+}
+
+impl PathFeedback {
+    pub fn new() -> Self {
+        Self::with_caps(DEFAULT_PATH_FEEDBACK_CAP, DEFAULT_PATH_FEEDBACK_CAP)
+    }
+
+    pub fn with_caps(cap_tx: usize, cap_seq: usize) -> Self {
+        Self {
+            seen_tx: HashSet::new(),
+            order_tx: VecDeque::new(),
+            seen_seq: HashSet::new(),
+            order_seq: VecDeque::new(),
+            cap_tx: cap_tx.max(1),
+            cap_seq: cap_seq.max(1),
+        }
+    }
+
+    fn insert_bounded(
+        set: &mut HashSet<B256>,
+        order: &mut VecDeque<B256>,
+        cap: usize,
+        id: B256,
+    ) -> bool {
+        if set.contains(&id) {
+            return false;
+        }
+        set.insert(id);
+        order.push_back(id);
+        while set.len() > cap {
+            if let Some(old) = order.pop_front() {
+                set.remove(&old);
+            }
+        }
+        true
+    }
+
+    /// Returns `true` the first time this `tx_path_id` is seen (within the cap).
+    pub fn record_tx_path(&mut self, id: &B256) -> bool {
+        Self::insert_bounded(&mut self.seen_tx, &mut self.order_tx, self.cap_tx, *id)
+    }
+
+    /// Returns `true` the first time this sequence path id is seen (within the cap).
+    pub fn record_sequence_path(&mut self, id: &B256) -> bool {
+        Self::insert_bounded(&mut self.seen_seq, &mut self.order_seq, self.cap_seq, *id)
+    }
+}
+
+impl Default for PathFeedback {
     fn default() -> Self {
         Self::new()
     }
@@ -498,5 +571,50 @@ mod tests {
             "1 hit then 3 hits should cross into a new bucket"
         );
         assert_eq!(fb.global_coverage().get(&(addr, (7, 8))), Some(&3));
+    }
+
+    #[test]
+    fn path_novelty_without_edge_novelty() {
+        use crate::path_id::tx_path_id_from_stream;
+        let addr = Address::ZERO;
+        let stream_a = vec![
+            (addr, 0, 1),
+            (addr, 1, 2),
+            (addr, 0, 1),
+            (addr, 1, 2),
+        ];
+        let stream_b = vec![
+            (addr, 0, 1),
+            (addr, 0, 1),
+            (addr, 1, 2),
+            (addr, 1, 2),
+        ];
+        let mut cov_a = CoverageMap::new();
+        for &(a, p, c) in &stream_a {
+            cov_a.record_hit(a, p, c);
+        }
+        let mut cov_b = CoverageMap::new();
+        for &(a, p, c) in &stream_b {
+            cov_b.record_hit(a, p, c);
+        }
+
+        let id_a = tx_path_id_from_stream(&stream_a);
+        let id_b = tx_path_id_from_stream(&stream_b);
+        assert_ne!(id_a, id_b);
+
+        let mut hc_b = HashMap::new();
+        for (a, edges) in &cov_b.map {
+            for (&e, &c) in edges {
+                hc_b.insert((*a, e), c);
+            }
+        }
+
+        let mut fb = CoverageFeedback::new();
+        assert!(fb.record_from_coverage_map(&cov_a));
+        assert!(!fb.is_interesting(&hc_b));
+
+        let mut pf = PathFeedback::new();
+        assert!(pf.record_tx_path(&id_a));
+        assert!(pf.record_tx_path(&id_b));
     }
 }
