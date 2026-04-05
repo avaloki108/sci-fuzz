@@ -182,10 +182,7 @@ impl BenchmarkHarness {
                         sequence.push(tx.clone());
 
                         // Oracle checks (BalanceIncrease, SelfDestruct, …).
-                        for mut f in self
-                            .oracle
-                            .check(&pre_seq_balances, &result, &sequence)
-                        {
+                        for mut f in self.oracle.check(&pre_seq_balances, &result, &sequence) {
                             let mut repro = sequence.clone();
                             f.reproducer = repro;
                             let h = f.dedup_hash();

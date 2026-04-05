@@ -10,7 +10,8 @@ use tiny_keccak::{Hasher, Keccak};
 use crate::economic::{
     Erc20BalanceStorageWithoutTransferOracle, Erc20BurnWithoutSupplyWriteOracle,
     Erc20MintWithoutSupplyWriteOracle, Erc4626EventAnomalyOracle, Erc4626ExchangeRateJumpOracle,
-    Erc4626SameTransactionDepositRateSpreadOracle, Erc4626WithdrawRateJumpOracle,
+    Erc4626RateJumpWithoutTokenFlowOracle, Erc4626SameTransactionDepositRateSpreadOracle,
+    Erc4626WithdrawRateJumpOracle, ProtocolProfileMap, UniswapV2StyleSwapReserveOracle,
 };
 use crate::types::{Address, ExecutionResult, Finding, Severity, Transaction, B256, U256};
 
@@ -613,6 +614,16 @@ impl InvariantRegistry {
 
     /// Convenience constructor that registers the built-in invariants.
     pub fn with_defaults(attacker: Address) -> Self {
+        Self::with_defaults_and_profiles(attacker, None)
+    }
+
+    /// Like [`Self::with_defaults`] but attaches optional ABI-derived protocol profiles for economic triage and gating.
+    pub fn with_defaults_and_profiles(
+        attacker: Address,
+        profiles: Option<ProtocolProfileMap>,
+    ) -> Self {
+        let pmap = profiles;
+
         let mut reg = Self::new();
         reg.add(Box::new(BalanceIncrease {
             attacker,
@@ -626,15 +637,41 @@ impl InvariantRegistry {
             // Only fire when profit > 1 wei after accounting for the fee.
             min_profit: U256::from(1u64),
         }));
-        reg.add(Box::new(Erc4626EventAnomalyOracle));
-        reg.add(Box::new(Erc20MintWithoutSupplyWriteOracle::default()));
-        reg.add(Box::new(Erc20BalanceStorageWithoutTransferOracle));
-        reg.add(Box::new(Erc4626ExchangeRateJumpOracle::default()));
-        reg.add(Box::new(Erc20BurnWithoutSupplyWriteOracle::default()));
-        reg.add(Box::new(Erc4626WithdrawRateJumpOracle::default()));
-        reg.add(Box::new(
-            Erc4626SameTransactionDepositRateSpreadOracle::default(),
-        ));
+        reg.add(Box::new(Erc4626EventAnomalyOracle {
+            profiles: pmap.clone(),
+        }));
+        reg.add(Box::new(Erc20MintWithoutSupplyWriteOracle {
+            min_mint: crate::economic::MIN_LARGE_TOKEN_MOVE,
+            total_supply_slot: crate::economic::OZ_ERC20_TOTAL_SUPPLY_SLOT,
+            profiles: pmap.clone(),
+        }));
+        reg.add(Box::new(Erc20BalanceStorageWithoutTransferOracle {
+            profiles: pmap.clone(),
+        }));
+        reg.add(Box::new(Erc4626ExchangeRateJumpOracle {
+            max_multiplier: U256::from(5u64),
+            profiles: pmap.clone(),
+        }));
+        reg.add(Box::new(Erc20BurnWithoutSupplyWriteOracle {
+            min_burn: crate::economic::MIN_LARGE_TOKEN_MOVE,
+            total_supply_slot: crate::economic::OZ_ERC20_TOTAL_SUPPLY_SLOT,
+            profiles: pmap.clone(),
+        }));
+        reg.add(Box::new(Erc4626WithdrawRateJumpOracle {
+            max_multiplier: U256::from(5u64),
+            profiles: pmap.clone(),
+        }));
+        reg.add(Box::new(Erc4626SameTransactionDepositRateSpreadOracle {
+            max_multiplier: U256::from(5u64),
+            profiles: pmap.clone(),
+        }));
+        reg.add(Box::new(UniswapV2StyleSwapReserveOracle {
+            profiles: pmap.clone(),
+        }));
+        reg.add(Box::new(Erc4626RateJumpWithoutTokenFlowOracle {
+            max_multiplier: U256::from(5u64),
+            profiles: pmap,
+        }));
         reg
     }
 
@@ -793,8 +830,9 @@ mod tests {
         // BalanceIncrease, UnexpectedRevert, SelfDestructDetector, EchidnaProperty,
         // FlashloanEconomicOracle, Erc4626EventAnomaly, Erc20MintWithoutSupplyWrite,
         // Erc20BalanceStorageWithoutTransfer, Erc4626ExchangeRateJump,
-        // Erc20BurnWithoutSupplyWrite, Erc4626WithdrawRateJump, Erc4626SameTransactionDepositRateSpread
-        assert_eq!(reg.len(), 12);
+        // Erc20BurnWithoutSupplyWrite, Erc4626WithdrawRateJump, Erc4626SameTransactionDepositRateSpread,
+        // UniswapV2StyleSwapReserve, Erc4626RateJumpWithoutTokenFlow
+        assert_eq!(reg.len(), 14);
         assert!(!reg.is_empty());
     }
 
@@ -978,8 +1016,8 @@ mod tests {
         let attacker = Address::repeat_byte(0x99);
         let tokens = vec![Address::repeat_byte(0xA1), Address::repeat_byte(0xA2)];
         let reg = InvariantRegistry::with_erc20(attacker, &tokens);
-        // 12 defaults + 2 ERC20Supply invariants
-        assert_eq!(reg.len(), 14);
+        // 14 defaults + 2 ERC20Supply invariants
+        assert_eq!(reg.len(), 16);
     }
 
     // -- EchidnaPropertyCaller tests ------------------------------------------

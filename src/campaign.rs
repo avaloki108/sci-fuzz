@@ -296,7 +296,9 @@ impl Campaign {
             .collect();
         let mut mutator = TxMutator::new(mutator_targets);
         mutator.add_to_address_pool(attacker);
-        let oracle = OracleEngine::new(attacker);
+        let protocol_profiles =
+            crate::protocol_semantics::build_protocol_profiles(&deployed_targets);
+        let oracle = OracleEngine::new_with_protocol_profiles(attacker, Some(protocol_profiles));
 
         // --- Build Echidna property callers at deployed addresses -----------
         let mut property_callers: Vec<EchidnaPropertyCaller> = Vec::new();

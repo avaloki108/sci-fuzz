@@ -47,11 +47,18 @@ pub mod shrinker;
 // ── Invariant / oracle system ───────────────────────────────────────────
 
 pub mod economic;
+pub mod protocol_semantics;
 pub use economic::{
     Erc20BalanceStorageWithoutTransferOracle, Erc20BurnWithoutSupplyWriteOracle,
     Erc20MintWithoutSupplyWriteOracle, Erc4626EventAnomalyOracle, Erc4626ExchangeRateJumpOracle,
-    Erc4626SameTransactionDepositRateSpreadOracle, Erc4626WithdrawRateJumpOracle,
-    PairwiseStorageDriftOracle, MIN_LARGE_TOKEN_MOVE, OZ_ERC20_TOTAL_SUPPLY_SLOT,
+    Erc4626RateJumpWithoutTokenFlowOracle, Erc4626SameTransactionDepositRateSpreadOracle,
+    Erc4626WithdrawRateJumpOracle, PairwiseStorageDriftOracle, ProtocolProfileMap,
+    UniswapV2StyleSwapReserveOracle, MIN_LARGE_TOKEN_MOVE, OZ_ERC20_TOTAL_SUPPLY_SLOT,
+};
+pub use protocol_semantics::{
+    build_protocol_profiles, classify_json_abi, topic_erc20_transfer, topic_erc4626_deposit,
+    topic_erc4626_withdraw, topic_uni_v2_swap, topic_uni_v2_sync, ContractProtocolProfile,
+    ProtocolKind,
 };
 pub mod invariant;
 pub mod oracle;

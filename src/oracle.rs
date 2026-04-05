@@ -50,12 +50,20 @@ impl OracleEngine {
         }
     }
 
-    /// Create an engine with a caller-supplied invariant registry.
-    pub fn with_invariants(attacker: Address, registry: InvariantRegistry) -> Self {
+    /// Default invariants plus optional ABI-derived protocol profiles (see [`crate::protocol_semantics::build_protocol_profiles`]).
+    pub fn new_with_protocol_profiles(
+        attacker: Address,
+        profiles: Option<crate::economic::ProtocolProfileMap>,
+    ) -> Self {
         Self {
-            registry,
+            registry: InvariantRegistry::with_defaults_and_profiles(attacker, profiles),
             attacker,
         }
+    }
+
+    /// Create an engine with a caller-supplied invariant registry.
+    pub fn with_invariants(attacker: Address, registry: InvariantRegistry) -> Self {
+        Self { registry, attacker }
     }
 
     /// Run every registered invariant against an execution result.

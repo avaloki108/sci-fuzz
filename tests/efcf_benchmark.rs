@@ -30,8 +30,7 @@ use sci_fuzz::oracle::OracleEngine;
 use sci_fuzz::scoreboard::{Scoreboard, ScorecardEntry};
 use sci_fuzz::snapshot::SnapshotCorpus;
 use sci_fuzz::types::{
-    Address, Bytes, ContractInfo, Finding, Severity, StateSnapshot, Transaction,
-    U256,
+    Address, Bytes, ContractInfo, Finding, Severity, StateSnapshot, Transaction, U256,
 };
 
 // ---------------------------------------------------------------------------
@@ -176,9 +175,8 @@ impl BenchmarkLoop {
                         sequence.push(tx.clone());
 
                         // Oracle checks.
-                        let oracle_findings = self
-                            .oracle
-                            .check(&pre_seq_balances, &result, &sequence);
+                        let oracle_findings =
+                            self.oracle.check(&pre_seq_balances, &result, &sequence);
                         for mut f in oracle_findings {
                             f.reproducer = sequence.clone();
                             let h = f.dedup_hash();

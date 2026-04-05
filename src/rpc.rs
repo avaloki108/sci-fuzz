@@ -313,12 +313,10 @@ pub fn rpc_probe_url(url: &str) -> Result<()> {
 /// Fetch `(block_number, block_timestamp)` for the same fork tag as [`RpcCacheDB`].
 pub fn fetch_fork_block_header(url: &str, block: Option<u64>) -> Result<(u64, u64)> {
     let tag = fork_block_tag_json(block);
-    let v = rpc_post(
-        url,
-        "eth_getBlockByNumber",
-        serde_json::json!([tag, false]),
-    )?;
-    let obj = v.as_object().ok_or_else(|| anyhow!("eth_getBlockByNumber: not an object"))?;
+    let v = rpc_post(url, "eth_getBlockByNumber", serde_json::json!([tag, false]))?;
+    let obj = v
+        .as_object()
+        .ok_or_else(|| anyhow!("eth_getBlockByNumber: not an object"))?;
     let num_hex = obj
         .get("number")
         .and_then(|x| x.as_str())
@@ -327,8 +325,8 @@ pub fn fetch_fork_block_header(url: &str, block: Option<u64>) -> Result<(u64, u6
         .get("timestamp")
         .and_then(|x| x.as_str())
         .ok_or_else(|| anyhow!("eth_getBlockByNumber: missing timestamp"))?;
-    let number = u64::from_str_radix(num_hex.trim_start_matches("0x"), 16)
-        .context("parse block number")?;
+    let number =
+        u64::from_str_radix(num_hex.trim_start_matches("0x"), 16).context("parse block number")?;
     let timestamp = u64::from_str_radix(ts_hex.trim_start_matches("0x"), 16)
         .context("parse block timestamp")?;
     Ok((number, timestamp))

@@ -605,6 +605,12 @@ impl Finding {
         if title.starts_with("Economic: ERC-4626 same-tx Deposit rate spread") {
             return "economic-erc4626-same-tx-deposit-spread".into();
         }
+        if title.starts_with("Economic: AMM swap exceeds Sync reserves") {
+            return "economic-amm-swap-reserve-bounds".into();
+        }
+        if title.starts_with("Economic: ERC-4626 rate shock without Transfer to vault") {
+            return "economic-erc4626-rate-jump-no-token-flow".into();
+        }
 
         title.to_string()
     }

@@ -32,12 +32,17 @@ fn balance_increase_fires_with_root_state_baseline() {
 
     let mut result = ExecutionResult::default();
     let new_bal = ten_eth + U256::from(10_000u64);
-    result.state_diff.balance_changes.insert(attacker, (ten_eth, new_bal));
+    result
+        .state_diff
+        .balance_changes
+        .insert(attacker, (ten_eth, new_bal));
 
     let seq = vec![empty_tx(attacker)];
     let findings = oracle.check(&pre, &result, &seq);
     assert!(
-        findings.iter().any(|f| f.title.contains("balance increase")),
+        findings
+            .iter()
+            .any(|f| f.title.contains("balance increase")),
         "expected BalanceIncrease finding; got {:?}",
         findings
     );
@@ -54,7 +59,10 @@ fn stale_campaign_root_baseline_does_not_false_positive_on_snapshot_state() {
     let ten_eth = wei_eth(10);
     let tiny_gain = U256::from(500u64);
     let new_bal = ten_eth + tiny_gain;
-    result.state_diff.balance_changes.insert(attacker, (ten_eth, new_bal));
+    result
+        .state_diff
+        .balance_changes
+        .insert(attacker, (ten_eth, new_bal));
 
     let seq = vec![empty_tx(attacker)];
 
