@@ -11,14 +11,16 @@ use anyhow::{anyhow, Context as _, Result};
 
 use revm::{
     db::{CacheDB, EmptyDB},
+    inspector_handle_register,
+    interpreter::Interpreter,
     primitives::{
         AccountInfo, BlockEnv, ExecutionResult as RevmResult, Output, ResultAndState, SpecId,
         TxKind, U256 as RevmU256,
     },
-    DatabaseCommit, DatabaseRef, Evm,
+    Database, DatabaseCommit, DatabaseRef, Evm, EvmContext, Inspector,
 };
 
-use crate::types::{Address, Bytes, ExecutionResult, Log, StateDiff, Transaction, U256};
+use crate::types::{Address, Bytes, CoverageMap, ExecutionResult, Log, StateDiff, Transaction, U256};
 
 // ---------------------------------------------------------------------------
 // ExecutorMode
@@ -35,6 +37,32 @@ pub enum ExecutorMode {
     /// checks that callers have sufficient balance for `msg.value`.
     /// Best for validation and reducing false positives.
     Realistic,
+}
+
+// ---------------------------------------------------------------------------
+// CoverageInspector
+// ---------------------------------------------------------------------------
+
+/// Collects real per-instruction hitcounts directly from revm.
+///
+/// We attribute coverage to the currently executing contract address exposed by
+/// the interpreter input. This is truthful execution coverage, though
+/// `DELEGATECALL` frames are attributed to the storage target rather than the
+/// library bytecode address.
+#[derive(Debug, Clone, Default)]
+struct CoverageInspector {
+    coverage: CoverageMap,
+}
+
+impl<DB: Database> Inspector<DB> for CoverageInspector {
+    fn step(&mut self, interp: &mut Interpreter, _context: &mut EvmContext<DB>) {
+        let address = interp
+            .contract
+            .bytecode_address
+            .unwrap_or(interp.contract.target_address);
+        self.coverage
+            .record_hit(address, interp.program_counter());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -90,8 +118,10 @@ impl EvmExecutor {
 
         let mut evm = Evm::builder()
             .with_db(&mut self.db)
+            .with_external_context(CoverageInspector::default())
             .with_block_env(self.block_env.clone())
             .with_spec_id(SpecId::CANCUN)
+            .append_handler_register(inspector_handle_register)
             .modify_cfg_env(|cfg| match self.mode {
                 ExecutorMode::Fast => {
                     cfg.disable_balance_check = true;
@@ -120,13 +150,14 @@ impl EvmExecutor {
         let ResultAndState { result, state } = evm
             .transact()
             .map_err(|e| anyhow!("EVM transact error: {e:?}"))?;
+        let coverage = evm.context.external.coverage.clone();
 
         // Commit state changes into the CacheDB.
         drop(evm); // release mutable borrow on self.db
         self.db.commit(state.clone());
 
         // Convert the revm result into our own type.
-        let exec_result = self.convert_result(&result, &state, &pre_balances)?;
+        let exec_result = self.convert_result(&result, &state, &pre_balances, coverage)?;
         Ok(exec_result)
     }
 
@@ -315,6 +346,7 @@ impl EvmExecutor {
         result: &RevmResult,
         state: &revm::primitives::EvmState,
         pre_balances: &HashMap<Address, U256>,
+        coverage: CoverageMap,
     ) -> Result<ExecutionResult> {
         let (success, gas_used, output, logs) = match result {
             RevmResult::Success {
@@ -353,6 +385,7 @@ impl EvmExecutor {
             output,
             gas_used,
             logs: our_logs,
+            coverage,
             state_diff,
         })
     }
@@ -497,6 +530,7 @@ pub use revm::primitives::Bytecode as RevmBytecode;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feedback::CoverageFeedback;
     use crate::types::B256;
     use revm::primitives::{AccountInfo, Bytecode};
 
@@ -557,7 +591,7 @@ mod tests {
     fn execute_simple_call() {
         let mut exec = EvmExecutor::new();
         let caller = Address::with_last_byte(0x01);
-        let target = Address::with_last_byte(0x02);
+        let target = Address::with_last_byte(0x22);
 
         // Fund the caller.
         exec.set_balance(caller, U256::from(1_000_000u64));
@@ -754,5 +788,126 @@ mod tests {
 
         let result = exec.execute(&tx).expect("fast mode should not error");
         assert!(result.success, "fast mode should allow unfunded transfer");
+    }
+
+    #[test]
+    fn execute_collects_branch_sensitive_instruction_coverage() {
+        let mut exec = EvmExecutor::new();
+        let caller = Address::with_last_byte(0x21);
+        let target = Address::with_last_byte(0x12);
+        exec.set_balance(caller, U256::from(10u64));
+
+        // A tiny loop whose first branch depends on CALLVALUE:
+        // value=0 exits immediately, value>0 executes the loop body.
+        let code = Bytecode::new_legacy(Bytes::from(vec![
+            0x34, // CALLVALUE
+            0x5b, // loop: JUMPDEST
+            0x80, // DUP1
+            0x15, // ISZERO
+            0x60, 0x0e, // PUSH1 end
+            0x57, // JUMPI
+            0x60, 0x01, // PUSH1 1
+            0x90, // SWAP1
+            0x03, // SUB
+            0x60, 0x01, // PUSH1 loop
+            0x56, // JUMP
+            0x5b, // end: JUMPDEST
+            0x00, // STOP
+        ]));
+        exec.insert_account_info(
+            target,
+            AccountInfo {
+                code: Some(code),
+                ..Default::default()
+            },
+        );
+
+        let zero_value = exec
+            .execute(&Transaction {
+                sender: caller,
+                to: Some(target),
+                data: Bytes::new(),
+                value: U256::ZERO,
+                gas_limit: 1_000_000,
+            })
+            .expect("zero-value call should execute");
+        let nonzero_value = exec
+            .execute(&Transaction {
+                sender: caller,
+                to: Some(target),
+                data: Bytes::new(),
+                value: U256::from(1u64),
+                gas_limit: 1_000_000,
+            })
+            .expect("non-zero-value call should execute");
+
+        assert_eq!(zero_value.coverage.hitcount(target, 7), 0);
+        assert!(zero_value.coverage.hitcount(target, 14) > 0);
+
+        assert!(nonzero_value.coverage.hitcount(target, 7) > 0);
+        assert!(nonzero_value.coverage.hitcount(target, 9) > 0);
+    }
+
+    #[test]
+    fn execute_collects_real_hitcounts_for_feedback_buckets() {
+        let mut exec = EvmExecutor::new();
+        let caller = Address::with_last_byte(0x11);
+        let target = Address::with_last_byte(0x12);
+        exec.set_balance(caller, U256::from(100u64));
+
+        // Loop `CALLVALUE` times:
+        // CALLVALUE; JUMPDEST; DUP1; ISZERO; PUSH1 end; JUMPI;
+        // PUSH1 1; SWAP1; SUB; PUSH1 loop; JUMP; JUMPDEST; STOP
+        let code = Bytecode::new_legacy(Bytes::from(vec![
+            0x34, // CALLVALUE
+            0x5b, // loop: JUMPDEST
+            0x80, // DUP1
+            0x15, // ISZERO
+            0x60, 0x0e, // PUSH1 end
+            0x57, // JUMPI
+            0x60, 0x01, // PUSH1 1
+            0x90, // SWAP1
+            0x03, // SUB
+            0x60, 0x01, // PUSH1 loop
+            0x56, // JUMP
+            0x5b, // end: JUMPDEST
+            0x00, // STOP
+        ]));
+        exec.insert_account_info(
+            target,
+            AccountInfo {
+                code: Some(code),
+                ..Default::default()
+            },
+        );
+
+        let one_iteration = exec
+            .execute(&Transaction {
+                sender: caller,
+                to: Some(target),
+                data: Bytes::new(),
+                value: U256::from(1u64),
+                gas_limit: 1_000_000,
+            })
+            .expect("1-iteration loop should execute");
+        let four_iterations = exec
+            .execute(&Transaction {
+                sender: caller,
+                to: Some(target),
+                data: Bytes::new(),
+                value: U256::from(4u64),
+                gas_limit: 1_000_000,
+            })
+            .expect("4-iteration loop should execute");
+
+        assert_eq!(one_iteration.coverage.hitcount(target, 1), 2);
+        assert_eq!(four_iterations.coverage.hitcount(target, 1), 5);
+
+        let mut feedback = CoverageFeedback::new();
+        assert!(feedback.record_from_coverage_map(&one_iteration.coverage));
+        assert!(
+            feedback.record_from_coverage_map(&four_iterations.coverage),
+            "higher loop hitcounts should move existing PCs into new AFL buckets"
+        );
     }
 }

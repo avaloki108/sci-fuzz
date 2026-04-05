@@ -176,9 +176,8 @@ impl CoverageFeedback {
         novel
     }
 
-    /// Convenience wrapper: convert a [`CoverageMap`] (which tracks only
-    /// *which* PCs were hit, not how many times) into a hitcount map where
-    /// every hit is counted as 1, then record it.
+    /// Convenience wrapper: flatten a [`CoverageMap`] into raw hitcounts and
+    /// record it.
     ///
     /// Returns `true` when new coverage was discovered.
     pub fn record_from_coverage_map(&mut self, cov: &CoverageMap) -> bool {
@@ -212,13 +211,12 @@ impl Default for CoverageFeedback {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Convert a [`CoverageMap`] into a hitcount map where every recorded PC
-/// has a count of 1.
+/// Convert a [`CoverageMap`] into a flat hitcount map.
 fn coverage_map_to_hitcounts(cov: &CoverageMap) -> HashMap<(Address, usize), u32> {
     let mut hitcounts = HashMap::new();
     for (addr, pcs) in &cov.map {
-        for &pc in pcs {
-            hitcounts.insert((*addr, pc), 1);
+        for (&pc, &count) in pcs {
+            hitcounts.insert((*addr, pc), count);
         }
     }
     hitcounts
@@ -356,7 +354,7 @@ mod tests {
             fb.record_from_coverage_map(&cov),
             "first record_from_coverage_map should be novel"
         );
-        // Each PC treated as 1 hit → bucket 1, so 3 unique triples.
+        // Each PC was hit once → bucket 1, so 3 unique triples.
         assert_eq!(fb.total_coverage(), 3);
 
         // Recording the same CoverageMap again should not be novel.
@@ -439,5 +437,24 @@ mod tests {
         hc2.insert((addr_b, 0), 1u32); // same bucket: 1
         assert!(fb.record(&hc2));
         assert_eq!(fb.total_coverage(), 3, "one new bit from addr_a");
+    }
+
+    #[test]
+    fn record_from_coverage_map_uses_hitcounts() {
+        let mut fb = CoverageFeedback::new();
+        let addr = Address::ZERO;
+        let mut cov = CoverageMap::new();
+
+        cov.record_hit(addr, 7);
+        assert!(fb.record_from_coverage_map(&cov));
+        assert_eq!(fb.global_coverage().get(&(addr, 7)), Some(&1));
+
+        cov.record_hit(addr, 7);
+        cov.record_hit(addr, 7);
+        assert!(
+            fb.record_from_coverage_map(&cov),
+            "1 hit then 3 hits should cross into a new bucket"
+        );
+        assert_eq!(fb.global_coverage().get(&(addr, 7)), Some(&3));
     }
 }

@@ -1,3 +1,6 @@
 /target/
 benchmark-results.json
 benchmark-results.txt
+
+# OpenMemory - IDE/Assistant specific rules
+.cursor/rules/openmemory.mdc

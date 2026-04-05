@@ -13,13 +13,13 @@ use crate::evm::EvmExecutor;
 use crate::feedback::CoverageFeedback;
 use revm::db::{CacheDB, EmptyDB};
 
-use crate::invariant::{EchidnaPropertyCaller, InvariantRegistry};
+use crate::invariant::EchidnaPropertyCaller;
 use crate::mutator::TxMutator;
 use crate::oracle::OracleEngine;
 use crate::snapshot::SnapshotCorpus;
 use crate::types::{
-    Address, Bytes, CampaignConfig, ContractInfo, CoverageMap, ExecutionResult, Finding, Severity,
-    StateSnapshot, Transaction, U256,
+    Address, CampaignConfig, ContractInfo, CoverageMap, Finding, StateSnapshot, Transaction,
+    U256,
 };
 
 /// deposit() selector: keccak256("deposit()")[..4] = 0xd0e30db0
@@ -164,16 +164,7 @@ impl Campaign {
             let tx = mutator.generate(&mut rng);
             if let Ok(result) = executor.execute(&tx) {
                 mutator.feed_execution(&result);
-
-                let mut cov = CoverageMap::new();
-                if result.success {
-                    for (addr, slots) in &result.state_diff.storage_writes {
-                        for slot in slots.keys() {
-                            let pc = slot.as_limbs()[0] as usize & 0xFFFFF;
-                            cov.record_hit(*addr, pc);
-                        }
-                    }
-                }
+                let cov = result.coverage.clone();
 
                 if feedback.record_from_coverage_map(&cov) {
                     let snap = StateSnapshot {
@@ -321,19 +312,7 @@ impl Campaign {
                 }
 
                 // --- Feedback: is the result interesting? ------------------
-                // For now we use a simple heuristic: successful txs with
-                // storage writes are interesting.
-                let mut cov = CoverageMap::new();
-                if result.success {
-                    for (addr, slots) in &result.state_diff.storage_writes {
-                        for (slot, _) in slots {
-                            // Use the low 20 bits of the slot as a pseudo-PC
-                            // so we get *some* diversity signal.
-                            let pc = slot.as_limbs()[0] as usize & 0xFFFFF;
-                            cov.record_hit(*addr, pc);
-                        }
-                    }
-                }
+                let cov = result.coverage.clone();
 
                 // Track successful state-changing transactions.
                 if result.success && !result.state_diff.storage_writes.is_empty() {

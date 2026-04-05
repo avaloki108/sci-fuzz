@@ -13,9 +13,10 @@ The name stands for **S**mart **C**ontract **I**nvariant **Fuzz**er. The thesis 
 ## What Works Today
 
 - **EVM execution** via revm 19.7 with snapshot/restore (CacheDB cloning)
+- **Real EVM instruction coverage** via a revm inspector that records per-contract instruction hitcounts during execution
 - **Dual executor modes**: `Fast` (all safety checks off, best for exploration) and `Realistic` (balance enforcement on, reduces false positives from impossible states)
-- **AFL++ hitcount bucketing** — tracks not just "was this PC hit?" but which hitcount bucket (1, 2, 4, 8, 16, 32, 64, 128+), so loop iteration differences count as new coverage
-- **Power scheduling** — snapshot selection weighted by novelty × new-bits boost × depth bonus ÷ √exploration-count, ported from LibAFL's power schedule
+- **AFL++ hitcount bucketing** — tracks not just "was this PC hit?" but which hitcount bucket (1, 2, 4, 8, 16, 32, 64, 128+), using real instruction hitcounts from the executor so loop iteration differences count as new coverage
+- **Power scheduling** — snapshot selection weighted by novelty × new-bits boost × depth bonus ÷ √exploration-count, ported from LibAFL's power schedule and now driven by real execution coverage instead of storage-write heuristics
 - **Calibration phase** — runs seed transactions before the main loop to establish coverage baselines and populate the value dictionary
 - **ABI-aware mutation** — extracts function selectors from ABI JSON, generates typed arguments (uint256, address, bool, bytes32), mutates with bit-flip, byte-replace, selector-swap, value-change, sender-swap
 - **Value dictionary** — seeded from EVM bytecode (PUSH1–PUSH32 operand extraction) and grown from execution results (return data, log topics, storage writes)
@@ -29,7 +30,7 @@ The name stands for **S**mart **C**ontract **I**nvariant **Fuzz**er. The thesis 
 Honesty matters more than marketing. These are real gaps:
 
 - **No Solidity compiler integration.** You cannot point sci-fuzz at a `.sol` file yet. Contracts must be pre-compiled to bytecode.
-- **No real EVM coverage instrumentation.** The hitcount bucketing infrastructure is built, but the EVM executor does not yet instrument opcodes to populate coverage maps during execution. Coverage feedback is currently derived from storage-write heuristics, not actual branch tracing.
+- **No edge coverage yet.** sci-fuzz now records real per-instruction hitcounts from revm and feeds those into `CoverageFeedback`, but it does not yet record exact edge coverage (`prev_pc -> current_pc`) or perform block/sequence-level path canonicalization.
 - **No sequence shrinking.** When a violation is found, the reproducer is the full transaction sequence. There is no minimization pass to reduce it.
 - **No multi-worker parallelism.** The fuzzing loop is single-threaded. The `workers` config field exists but is not wired.
 - **No Foundry project integration.** The `project.rs` module parses directory structure but does not invoke `forge build` or consume Foundry artifacts.
@@ -41,9 +42,9 @@ Honesty matters more than marketing. These are real gaps:
 
 ```text
 campaign.rs    main loop: calibrate → select snapshot → generate/mutate → execute → check → learn
-evm.rs         revm 19.7 wrapper: execute, deploy, static_call, snapshot/restore, Fast/Realistic modes
-snapshot.rs    state corpus: novelty-weighted selection, power scheduling metadata, auto-pruning
-feedback.rs    AFL++ hitcount bucketing (8 classes), virgin-bits tracking
+evm.rs         revm 19.7 wrapper: execute, deploy, static_call, snapshot/restore, Fast/Realistic modes, instruction coverage inspector
+snapshot.rs    state corpus: novelty-weighted selection, power scheduling metadata, auto-pruning over real coverage
+feedback.rs    AFL++ hitcount bucketing (8 classes), virgin-bits tracking, real-hitcount ingestion
 mutator.rs     ABI-aware generation, 5 mutation strategies, value dictionary, bytecode constant extraction
 invariant.rs   Invariant trait + 5 built-in checkers + EchidnaPropertyCaller
 oracle.rs      routes execution results through invariant registry
@@ -144,7 +145,7 @@ None of these are done yet. Until they are, this is a working prototype, not a p
 | Metric | Value |
 |--------|-------|
 | Rust source | ~5,500 lines across 13 modules |
-| Unit tests | 90 passing |
+| Unit tests | 103 passing |
 | Benchmark contracts | 133 (from EF/CF) |
 | Benchmark matrix entries | 81 with expected bug types |
 | Dependencies | revm 19.7, alloy-primitives 0.8, clap 4, serde, rand, tiny-keccak |

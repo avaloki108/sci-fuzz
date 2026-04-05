@@ -260,7 +260,7 @@ impl SnapshotCorpus {
         let mut pair_counts: HashMap<(Address, usize), usize> = HashMap::new();
         for snap in &self.snapshots {
             for (addr, pcs) in &snap.coverage.map {
-                for &pc in pcs {
+                for &pc in pcs.keys() {
                     *pair_counts.entry((*addr, pc)).or_insert(0) += 1;
                 }
             }
@@ -272,7 +272,7 @@ impl SnapshotCorpus {
             .map(|snap| {
                 let mut score = 1.0_f64; // baseline so empty-coverage snapshots survive
                 for (addr, pcs) in &snap.coverage.map {
-                    for &pc in pcs {
+                    for &pc in pcs.keys() {
                         let count = pair_counts.get(&(*addr, pc)).copied().unwrap_or(1);
                         score += 1.0 / count as f64;
                     }

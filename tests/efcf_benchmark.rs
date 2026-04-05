@@ -30,7 +30,7 @@ use sci_fuzz::oracle::OracleEngine;
 use sci_fuzz::scoreboard::{Scoreboard, ScorecardEntry};
 use sci_fuzz::snapshot::SnapshotCorpus;
 use sci_fuzz::types::{
-    Address, Bytes, CampaignConfig, ContractInfo, CoverageMap, Finding, Severity, StateSnapshot,
+    Address, Bytes, CampaignConfig, ContractInfo, Finding, Severity, StateSnapshot,
     Transaction, U256,
 };
 
@@ -157,16 +157,8 @@ impl BenchmarkLoop {
                         total_execs += 1;
                         self.mutator.feed_execution(&result);
 
-                        // Update coverage feedback.
-                        let mut cov = CoverageMap::new();
-                        if result.success {
-                            for (addr, slots) in &result.state_diff.storage_writes {
-                                for slot in slots.keys() {
-                                    let pc = slot.as_limbs()[0] as usize & 0xFFFFF;
-                                    cov.record_hit(*addr, pc);
-                                }
-                            }
-                        }
+                        // Update coverage feedback using real execution hitcounts.
+                        let cov = result.coverage.clone();
                         let is_novel = self.feedback.record_from_coverage_map(&cov);
                         if is_novel
                             && result.success
@@ -289,9 +281,11 @@ fn efcf_harvey_baz_property() {
             "PropertyViolation",
             "fast",
             seed,
+            0,
             first_hit_ms.unwrap_or(0),
             total_execs,
             f,
+            "echidna_property",
         )
     } else {
         eprintln!("  NOT FOUND within {}s", timeout.as_secs());
@@ -422,9 +416,11 @@ fn efcf_simple_dao_ether_drain() {
             "Reentrancy",
             "fast",
             seed,
+            0,
             first_hit_ms.unwrap_or(0),
             total_execs,
             f,
+            "balance_increase_oracle",
         )
     } else {
         eprintln!("  NOT FOUND within {}s", timeout.as_secs());
@@ -564,9 +560,11 @@ fn efcf_delegatecall_access_control() {
             "AccessControl",
             "fast",
             seed,
+            0,
             first_hit_ms.unwrap_or(0),
             total_execs,
             f,
+            "generic_oracle",
         )
     } else {
         eprintln!(
@@ -634,9 +632,11 @@ fn efcf_scoreboard_summary() {
                     "PropertyViolation",
                     "fast",
                     seed,
+                    0,
                     hit_ms.unwrap_or(0),
                     execs,
                     f,
+                    "echidna_property",
                 )
             } else {
                 ScorecardEntry::not_found(
@@ -676,9 +676,11 @@ fn efcf_scoreboard_summary() {
                     "Reentrancy",
                     "fast",
                     seed,
+                    0,
                     hit_ms.unwrap_or(0),
                     execs,
                     f,
+                    "balance_increase_oracle",
                 )
             } else {
                 ScorecardEntry::not_found(
@@ -714,9 +716,11 @@ fn efcf_scoreboard_summary() {
                     "AccessControl",
                     "fast",
                     seed,
+                    0,
                     hit_ms.unwrap_or(0),
                     execs,
                     &findings[0],
+                    "generic_oracle",
                 )
             } else {
                 ScorecardEntry::not_found(

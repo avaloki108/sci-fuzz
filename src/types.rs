@@ -5,7 +5,7 @@
 //! module speaks the same "language" without conversion boilerplate.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::Duration;
 
 // ── Re-exports ───────────────────────────────────────────────────────────────
@@ -76,6 +76,8 @@ pub struct ExecutionResult {
     pub gas_used: u64,
     /// Event logs emitted during execution.
     pub logs: Vec<Log>,
+    /// Real EVM instruction hitcounts collected during this execution.
+    pub coverage: CoverageMap,
     /// Storage & balance mutations caused by this execution.
     pub state_diff: StateDiff,
 }
@@ -87,6 +89,7 @@ impl Default for ExecutionResult {
             output: Bytes::new(),
             gas_used: 0,
             logs: Vec::new(),
+            coverage: CoverageMap::new(),
             state_diff: StateDiff::default(),
         }
     }
@@ -163,12 +166,11 @@ impl Default for StateSnapshot {
 
 // ── Coverage Map ─────────────────────────────────────────────────────────────
 
-/// Tracks which program-counter offsets (basic-block entries) have been
-/// executed for each contract address.
+/// Tracks real EVM instruction hitcounts for each contract address.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CoverageMap {
-    /// contract address → set of hit program-counter offsets.
-    pub map: HashMap<Address, HashSet<usize>>,
+    /// contract address → program counter → raw hitcount.
+    pub map: HashMap<Address, HashMap<usize, u32>>,
 }
 
 impl CoverageMap {
@@ -179,15 +181,29 @@ impl CoverageMap {
         }
     }
 
-    /// Record a single basic-block hit.
+    /// Record a single instruction hit.
     pub fn record_hit(&mut self, address: Address, pc: usize) {
-        self.map.entry(address).or_default().insert(pc);
+        self.record_hitcount(address, pc, 1);
+    }
+
+    /// Record `count` hits for a single `(address, pc)` pair.
+    pub fn record_hitcount(&mut self, address: Address, pc: usize, count: u32) {
+        if count == 0 {
+            return;
+        }
+
+        let entry = self.map.entry(address).or_default().entry(pc).or_insert(0);
+        *entry = entry.saturating_add(count);
     }
 
     /// Merge all coverage from `other` into `self`.
     pub fn merge(&mut self, other: &CoverageMap) {
         for (addr, pcs) in &other.map {
-            self.map.entry(*addr).or_default().extend(pcs);
+            let dst = self.map.entry(*addr).or_default();
+            for (&pc, &count) in pcs {
+                let entry = dst.entry(pc).or_insert(0);
+                *entry = entry.saturating_add(count);
+            }
         }
     }
 
@@ -201,6 +217,15 @@ impl CoverageMap {
         self.map.values().all(|s| s.is_empty())
     }
 
+    /// Return the raw hitcount for `(address, pc)`, or `0` if unseen.
+    pub fn hitcount(&self, address: Address, pc: usize) -> u32 {
+        self.map
+            .get(&address)
+            .and_then(|pcs| pcs.get(&pc))
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// Returns `true` if `other` contains at least one (address, pc) pair
     /// that is **not** present in `self`.
     pub fn has_new_coverage(&self, other: &CoverageMap) -> bool {
@@ -212,7 +237,7 @@ impl CoverageMap {
                     }
                 }
                 Some(existing) => {
-                    if !pcs.is_subset(existing) {
+                    if pcs.keys().any(|pc| !existing.contains_key(pc)) {
                         return true;
                     }
                 }
@@ -371,9 +396,10 @@ mod tests {
         assert_eq!(a.len(), 2);
         assert!(!a.is_empty());
 
-        // Duplicate hit does not increase count.
+        // Duplicate hit does not increase the number of covered PCs.
         a.record_hit(addr, 42);
         assert_eq!(a.len(), 2);
+        assert_eq!(a.hitcount(addr, 42), 2);
     }
 
     #[test]
@@ -385,9 +411,11 @@ mod tests {
 
         let mut b = CoverageMap::new();
         b.record_hit(addr, 1);
+        b.record_hit(addr, 0);
 
         a.merge(&b);
         assert_eq!(a.len(), 2);
+        assert_eq!(a.hitcount(addr, 0), 2);
     }
 
     #[test]

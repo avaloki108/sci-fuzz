@@ -32,7 +32,7 @@ use sci_fuzz::oracle::OracleEngine;
 use sci_fuzz::scoreboard::{MultiSeedSummary, Scoreboard, ScorecardEntry};
 use sci_fuzz::snapshot::SnapshotCorpus;
 use sci_fuzz::types::{
-    Address, Bytes, ContractInfo, CoverageMap, Finding, Severity, StateSnapshot, Transaction, U256,
+    Address, Bytes, ContractInfo, Finding, Severity, StateSnapshot, Transaction, U256,
 };
 
 // ---------------------------------------------------------------------------
@@ -163,16 +163,8 @@ impl BenchmarkHarness {
                         total_execs += 1;
                         self.mutator.feed_execution(&result);
 
-                        // Lightweight coverage feedback.
-                        let mut cov = CoverageMap::new();
-                        if result.success {
-                            for (addr, slots) in &result.state_diff.storage_writes {
-                                for slot in slots.keys() {
-                                    let pc = slot.as_limbs()[0] as usize & 0xFFFFF;
-                                    cov.record_hit(*addr, pc);
-                                }
-                            }
-                        }
+                        // Lightweight coverage feedback from real execution hitcounts.
+                        let cov = result.coverage.clone();
                         if self.feedback.record_from_coverage_map(&cov)
                             && result.success
                             && !result.state_diff.storage_writes.is_empty()

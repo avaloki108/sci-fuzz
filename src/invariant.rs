@@ -548,7 +548,7 @@ impl Default for InvariantRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Bytes, Log, StateDiff};
+    use crate::types::{Bytes, CoverageMap, Log, StateDiff};
     use serde_json::json;
 
     /// Helper — build a minimal [`ExecutionResult`].
@@ -561,6 +561,7 @@ mod tests {
             output: Bytes::new(),
             gas_used: 21_000,
             logs: Vec::new(),
+            coverage: CoverageMap::new(),
             state_diff: StateDiff {
                 storage_writes: HashMap::new(),
                 balance_changes,
@@ -701,6 +702,7 @@ mod tests {
             output: Bytes::new(),
             gas_used: 21_000,
             logs,
+            coverage: CoverageMap::new(),
             state_diff: StateDiff {
                 storage_writes: HashMap::new(),
                 balance_changes: HashMap::new(),

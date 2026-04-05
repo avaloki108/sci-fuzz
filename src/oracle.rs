@@ -83,7 +83,7 @@ impl OracleEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Bytes, ExecutionResult, Severity, StateDiff};
+    use crate::types::{Bytes, ExecutionResult, Severity};
 
     /// Helper — build a minimal no-op execution result.
     fn empty_result() -> ExecutionResult {
