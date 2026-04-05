@@ -17,6 +17,7 @@ The name stands for **S**mart **C**ontract **I**nvariant **Fuzz**er. The thesis 
 - **Dual executor modes**: `Fast` (all safety checks off, best for exploration) and `Realistic` (balance enforcement on, reduces false positives from impossible states)
 - **AFL++ hitcount bucketing** — tracks not just "was this edge taken?" but which hitcount bucket (1, 2, 4, 8, 16, 32, 64, 128+), using real transition hitcounts from the executor so loop iteration differences count as new coverage
 - **Power scheduling** — snapshot selection weighted by novelty × new-bits boost × depth bonus ÷ √exploration-count, ported from LibAFL's power schedule and now driven by real execution coverage instead of storage-write heuristics
+- **Multi-worker shared-corpus fuzzing (local DB)** — when `workers > 1` and execution uses the in-memory DB (no RPC fork), the campaign spawns parallel threads after calibration. Each worker has its own revm executor; coverage feedback, the snapshot corpus, saved DB snapshots, and finding deduplication are shared under mutexes. Aggregate `CampaignReport` totals are global. **RPC/fork mode** forces `workers = 1`. Scheduling is not reproducible across runs when `workers > 1`; the shared mutator serializes selector/dictionary updates and can limit speedup.
 - **Calibration phase** — runs seed transactions before the main loop to establish coverage baselines and populate the value dictionary
 - **ABI-aware mutation** — extracts function selectors from ABI JSON, generates typed arguments (uint256, address, bool, bytes32), mutates with bit-flip, byte-replace, selector-swap, value-change, sender-swap
 - **Value dictionary** — seeded from EVM bytecode (PUSH1–PUSH32 operand extraction) and grown from execution results (return data, log topics, storage writes)
@@ -36,7 +37,7 @@ Honesty matters more than marketing. These are real gaps:
 
 - **No block- or sequence-level path IDs yet.** Coverage is keyed by `(contract, prev_pc, current_pc)` edges with AFL-style bucketing on each edge’s hitcount. There is no canonical basic-block trace, call-stack-aware edge key, or transaction-sequence fingerprint yet — different dynamic paths that share the same edge multiset can look identical to the engine.
 - **Shrinking is still a first pass.** The shrinker is deterministic and useful today, but it is not yet a full semantic reducer: it does not reason about ABI types, storage dependencies, or minimal base-state snapshots, and it does not guarantee globally minimal sequences.
-- **No multi-worker parallelism.** The fuzzing loop is single-threaded. The `workers` config field exists but is not wired.
+- **No distributed fuzzing** — workers are in-process threads only; there is no multi-machine corpus sync.
 - **Foundry integration gaps after harness setup.** Script-based deploy flows, library-specific bootstrapping, and Forge cheatcodes (`vm.*`) are not implemented. Harness `setUp` must be plain Solidity (deploy, calls, storage); tests that rely on the Forge cheatcode VM may revert or behave incorrectly. There is still no `StdInvariant` / `targetContract` import path or parity with Foundry’s invariant runner.
 - **External comparison execution is still partial.** `sci-fuzz benchmark` has a real measured path for sci-fuzz and a stable comparison schema for Echidna / Forge, but it does not yet orchestrate those tools end-to-end on shared targets. Their rows are reported as `unavailable` or `skipped`, never faked.
 - **No on-chain forking.** The `audit` subcommand exists in the CLI but is not implemented.
@@ -47,7 +48,7 @@ Honesty matters more than marketing. These are real gaps:
 ## Architecture
 
 ```text
-campaign.rs    main loop: calibrate → select snapshot → generate/mutate → execute → check → learn
+campaign.rs    main loop: calibrate → (optional) parallel workers → shared corpus/feedback → execute → check → learn
 harness.rs     Foundry-style setUp() selector + one-shot setup execution on the revm executor
 evm.rs         revm 19.7 wrapper: execute, deploy, static_call, snapshot/restore, Fast/Realistic modes, edge coverage inspector
 snapshot.rs    state corpus: novelty-weighted selection, power scheduling metadata, auto-pruning over real coverage

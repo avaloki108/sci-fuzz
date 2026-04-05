@@ -568,7 +568,11 @@ pub struct CampaignConfig {
     pub max_depth: u32,
     /// Upper bound on the number of retained state snapshots.
     pub max_snapshots: usize,
-    /// Number of parallel fuzzing workers.
+    /// Number of parallel fuzzing workers. Values greater than `1` spawn
+    /// threads that share coverage feedback, the snapshot corpus, saved DB
+    /// snapshots, and deduplicated findings. Ordering is not reproducible across
+    /// runs when `workers > 1`. If `rpc_url` is set, the campaign forces a
+    /// single worker (RPC fork state is not shared across threads).
     pub workers: usize,
     /// Deterministic seed for the PRNG.
     pub seed: u64,
