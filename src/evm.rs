@@ -20,7 +20,9 @@ use revm::{
     Database, DatabaseCommit, DatabaseRef, Evm, EvmContext, Inspector,
 };
 
-use crate::types::{Address, Bytes, CoverageMap, ExecutionResult, Log, StateDiff, Transaction, U256};
+use crate::types::{
+    Address, Bytes, CoverageMap, ExecutionResult, Log, StateDiff, Transaction, U256,
+};
 
 // ---------------------------------------------------------------------------
 // ExecutorMode
@@ -60,8 +62,7 @@ impl<DB: Database> Inspector<DB> for CoverageInspector {
             .contract
             .bytecode_address
             .unwrap_or(interp.contract.target_address);
-        self.coverage
-            .record_hit(address, interp.program_counter());
+        self.coverage.record_hit(address, interp.program_counter());
     }
 }
 

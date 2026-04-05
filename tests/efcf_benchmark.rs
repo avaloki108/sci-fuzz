@@ -30,8 +30,8 @@ use sci_fuzz::oracle::OracleEngine;
 use sci_fuzz::scoreboard::{Scoreboard, ScorecardEntry};
 use sci_fuzz::snapshot::SnapshotCorpus;
 use sci_fuzz::types::{
-    Address, Bytes, CampaignConfig, ContractInfo, Finding, Severity, StateSnapshot,
-    Transaction, U256,
+    Address, Bytes, CampaignConfig, ContractInfo, Finding, Severity, StateSnapshot, Transaction,
+    U256,
 };
 
 // ---------------------------------------------------------------------------

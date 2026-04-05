@@ -214,7 +214,9 @@ impl Project {
             .cloned()
             .collect();
 
-        let has_non_test = candidates.iter().any(|contract| !is_test_artifact(contract));
+        let has_non_test = candidates
+            .iter()
+            .any(|contract| !is_test_artifact(contract));
         if has_non_test {
             candidates.retain(|contract| !is_test_artifact(contract));
         }
@@ -550,7 +552,10 @@ fn parse_artifact_file(artifact_path: &Path, out_dir: &Path) -> Result<ContractI
             ))
         })?;
 
-    let abi = artifact.get("abi").cloned().filter(|value| !value.is_null());
+    let abi = artifact
+        .get("abi")
+        .cloned()
+        .filter(|value| !value.is_null());
     let creation_bytecode = extract_bytecode(
         &artifact,
         &[
@@ -820,7 +825,11 @@ mod tests {
             "compilationTarget": { source_path: contract_name }
         });
 
-        fs::write(&artifact_path, serde_json::to_vec_pretty(&artifact).unwrap()).unwrap();
+        fs::write(
+            &artifact_path,
+            serde_json::to_vec_pretty(&artifact).unwrap(),
+        )
+        .unwrap();
         artifact_path
     }
 
@@ -966,8 +975,9 @@ mod tests {
     #[test]
     fn forge_build_reports_missing_binary_and_failures() {
         let dir = tempdir().unwrap();
-        let missing = run_forge_build_with_program(dir.path(), "definitely-not-a-real-forge-binary")
-            .unwrap_err();
+        let missing =
+            run_forge_build_with_program(dir.path(), "definitely-not-a-real-forge-binary")
+                .unwrap_err();
         assert!(missing.to_string().contains("binary not found"));
 
         let failing_script = dir.path().join("fake-forge-fail");

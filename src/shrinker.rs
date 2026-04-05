@@ -54,7 +54,11 @@ impl SequenceShrinker {
         current
     }
 
-    fn try_remove_prefix<F>(&self, current: &[Transaction], fails: &mut F) -> Option<Vec<Transaction>>
+    fn try_remove_prefix<F>(
+        &self,
+        current: &[Transaction],
+        fails: &mut F,
+    ) -> Option<Vec<Transaction>>
     where
         F: FnMut(&[Transaction]) -> bool,
     {
@@ -67,7 +71,11 @@ impl SequenceShrinker {
         None
     }
 
-    fn try_remove_suffix<F>(&self, current: &[Transaction], fails: &mut F) -> Option<Vec<Transaction>>
+    fn try_remove_suffix<F>(
+        &self,
+        current: &[Transaction],
+        fails: &mut F,
+    ) -> Option<Vec<Transaction>>
     where
         F: FnMut(&[Transaction]) -> bool,
     {
@@ -80,7 +88,11 @@ impl SequenceShrinker {
         None
     }
 
-    fn try_remove_chunks<F>(&self, current: &[Transaction], fails: &mut F) -> Option<Vec<Transaction>>
+    fn try_remove_chunks<F>(
+        &self,
+        current: &[Transaction],
+        fails: &mut F,
+    ) -> Option<Vec<Transaction>>
     where
         F: FnMut(&[Transaction]) -> bool,
     {

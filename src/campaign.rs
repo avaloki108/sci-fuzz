@@ -19,8 +19,7 @@ use crate::oracle::OracleEngine;
 use crate::shrinker::SequenceShrinker;
 use crate::snapshot::SnapshotCorpus;
 use crate::types::{
-    Address, CampaignConfig, ContractInfo, CoverageMap, Finding, StateSnapshot, Transaction,
-    U256,
+    Address, CampaignConfig, ContractInfo, CoverageMap, Finding, StateSnapshot, Transaction, U256,
 };
 
 /// deposit() selector: keccak256("deposit()")[..4] = 0xd0e30db0
