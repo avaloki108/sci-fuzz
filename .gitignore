@@ -1,18 +1,16 @@
-/target/
-/benchmark-results.json
-/benchmark-results.txt
+# Local secrets and personal notes
+.env
+openmemory.md
+ci-run.log
 
-# OpenMemory - IDE/Assistant specific rules
-/.cursor/rules/openmemory.mdc
-/.cursor/
-/.cursor/hooks/state/*
-/.cursor/hooks/state/continual-learning.json
-/.cursor/hooks/state/continual-learning-index.json
-/.env
-/openmemory.md
-/ci-run.log
-/.kilocode/
-/.serena/
-/.cursor
-/.serena
-/Cargo.lock
+# Benchmark / CI artifacts
+benchmark-results.json
+benchmark-results.txt
+
+# IDE / assistant tooling
+.cursor/
+.kilocode/
+.serena/
+
+# Rust build output
+target/
