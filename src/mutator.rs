@@ -356,6 +356,47 @@ fn generate_typed_arg(typ: &str, dict: &ValueDictionary, rng: &mut impl Rng) -> 
 }
 
 // ---------------------------------------------------------------------------
+// Protocol classification
+// ---------------------------------------------------------------------------
+
+/// Coarse protocol class inferred from ABI selector overlap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProtocolClass {
+    Vault,
+    Amm,
+    Lending,
+    Generic,
+}
+
+/// Generate a token amount that is biased toward realistic DeFi amounts:
+/// 40% from the value dictionary (if non-empty), 40% from common ETH
+/// boundaries, and 20% purely random.
+fn biased_token_amount(dict: &ValueDictionary, rng: &mut impl Rng) -> U256 {
+    const COMMON_AMOUNTS: &[u128] = &[
+        1,                           // 1 wei (first-depositor attack amount)
+        1_000,                       // dust
+        1_000_000,                   // micro
+        1_000_000_000,               // gwei
+        1_000_000_000_000_000,       // 0.001 ether
+        10_000_000_000_000_000,      // 0.01 ether
+        100_000_000_000_000_000,     // 0.1 ether
+        1_000_000_000_000_000_000,   // 1 ether / 1 token (18 decimals)
+        10_000_000_000_000_000_000,  // 10 ether / 10 tokens
+        100_000_000_000_000_000_000, // 100 ether / 100 tokens
+        u128::MAX,                   // max uint128 (common overflow target)
+    ];
+
+    let r: f64 = rng.gen();
+    if r < 0.40 && !dict.uint_values.is_empty() {
+        dict.uint_values[rng.gen_range(0..dict.uint_values.len())]
+    } else if r < 0.80 {
+        U256::from(COMMON_AMOUNTS[rng.gen_range(0..COMMON_AMOUNTS.len())])
+    } else {
+        U256::from_be_bytes(rng.gen::<[u8; 32]>())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TxMutator
 // ---------------------------------------------------------------------------
 
@@ -471,7 +512,7 @@ impl TxMutator {
     ) -> Transaction {
         let to = self.random_target(rng);
         let sender = self.pick_sender(prev_sender, rng);
-        let data = self.random_calldata(rng);
+        let data = self.random_calldata_biased(to, rng);
 
         let value = self.random_value(&data, rng);
 
@@ -687,6 +728,155 @@ impl TxMutator {
     /// mutations can reuse observed constants.
     pub fn feed_execution(&mut self, result: &ExecutionResult) {
         self.dict.seed_from_execution(result);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Protocol-guided calldata generation
+    // ---------------------------------------------------------------------------
+
+    /// Keccak first 4 bytes for a signature string.
+    fn sel(sig: &str) -> [u8; 4] {
+        keccak_selector(sig.as_bytes())
+    }
+
+    /// Known ERC-4626 vault selectors (deposit, mint, withdraw, redeem) and
+    /// common DeFi patterns that benefit from semantic sequencing.
+    fn vault_selectors() -> &'static [[u8; 4]] {
+        static VAULT: &[[u8; 4]] = &[
+            [0xd0, 0xe3, 0x0d, 0xb0], // deposit()
+            [0x6e, 0x55, 0x3f, 0x65], // deposit(uint256,address)
+            [0x94, 0xbf, 0x80, 0x4d], // mint(uint256,address)
+            [0xb4, 0x60, 0xaf, 0x94], // withdraw(uint256,address,address)
+            [0xba, 0x08, 0x76, 0x52], // redeem(uint256,address,address)
+            [0x3c, 0xcf, 0xd6, 0x0b], // withdraw()
+        ];
+        VAULT
+    }
+
+    /// Known AMM selectors (swap, addLiquidity, removeLiquidity, sync).
+    fn amm_selectors() -> &'static [[u8; 4]] {
+        static AMM: &[[u8; 4]] = &[
+            [0x02, 0x2c, 0x0d, 0x9f], // swap(uint256,uint256,address,bytes)
+            [0xe8, 0xe3, 0x37, 0x00], // addLiquidity(...)
+            [0xba, 0xa2, 0xab, 0xde], // removeLiquidity(...)
+            [0xfb, 0x3b, 0xdb, 0x41], // swapETHForExactTokens(...)
+            [0x18, 0xcb, 0xaf, 0xe5], // swapExactTokensForETH(...)
+            [0xff, 0xf6, 0xca, 0xe9], // sync()
+            [0x89, 0xaf, 0xcb, 0x44], // burn(address)
+        ];
+        AMM
+    }
+
+    /// Known lending protocol selectors (borrow, repay, liquidate, supply).
+    fn lending_selectors() -> &'static [[u8; 4]] {
+        static LENDING: &[[u8; 4]] = &[
+            [0xa0, 0x71, 0x2d, 0x68], // mint(uint256)
+            [0x1e, 0x9a, 0x69, 0x50], // redeem(uint256)
+            [0xc5, 0xeb, 0xea, 0xec], // borrow(uint256)
+            [0x0e, 0x75, 0x27, 0x02], // repayBorrow(uint256)
+            [0xf5, 0xe3, 0xc4, 0x62], // liquidateBorrow(address,uint256,address)
+            [0x86, 0x7a, 0x0b, 0x09], // supply(address,uint256,address,uint16)
+        ];
+        LENDING
+    }
+
+    /// Determine whether this target looks like a vault, AMM, or lending pool
+    /// by checking how many of our known selectors overlap with the registered ABIs.
+    fn classify_target(&self, target: Address) -> ProtocolClass {
+        let target_info = self.targets.iter().find(|t| t.address == target);
+        let target_selectors: Vec<[u8; 4]> = target_info
+            .and_then(|t| {
+                t.abi.as_ref().and_then(|abi| abi.as_array()).map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(selector_from_abi_entry)
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
+
+        if target_selectors.is_empty() {
+            return ProtocolClass::Generic;
+        }
+
+        let vault_hits = Self::vault_selectors()
+            .iter()
+            .filter(|s| target_selectors.contains(s))
+            .count();
+        let amm_hits = Self::amm_selectors()
+            .iter()
+            .filter(|s| target_selectors.contains(s))
+            .count();
+        let lending_hits = Self::lending_selectors()
+            .iter()
+            .filter(|s| target_selectors.contains(s))
+            .count();
+
+        if vault_hits >= 2 {
+            ProtocolClass::Vault
+        } else if amm_hits >= 2 {
+            ProtocolClass::Amm
+        } else if lending_hits >= 2 {
+            ProtocolClass::Lending
+        } else {
+            ProtocolClass::Generic
+        }
+    }
+
+    /// Biased calldata generation — uses protocol class of the target to pick
+    /// selectors that are semantically meaningful for that contract type.
+    ///
+    /// For vaults: heavy bias toward deposit/withdraw/redeem.
+    /// For AMMs: heavy bias toward swap/addLiquidity/sync.
+    /// For lending: heavy bias toward mint/borrow/repay/liquidate.
+    /// For generics: falls back to `random_calldata`.
+    fn random_calldata_biased(&self, target: Address, rng: &mut impl Rng) -> Bytes {
+        let class = self.classify_target(target);
+
+        // 70% of the time use protocol-guided selectors, 30% use fully random.
+        if rng.gen_bool(0.7) {
+            let protocol_sels: &[[u8; 4]] = match class {
+                ProtocolClass::Vault => Self::vault_selectors(),
+                ProtocolClass::Amm => Self::amm_selectors(),
+                ProtocolClass::Lending => Self::lending_selectors(),
+                ProtocolClass::Generic => return self.random_calldata(rng),
+            };
+
+            // Pick from known protocol selectors, but only those that are
+            // actually registered in the ABI (avoids calls to non-existent funcs).
+            let usable: Vec<[u8; 4]> = protocol_sels
+                .iter()
+                .filter(|s| self.selectors.contains(*s) || !self.selectors.is_empty())
+                .copied()
+                .collect();
+
+            if !usable.is_empty() {
+                let sel = usable[rng.gen_range(0..usable.len())];
+                let mut buf = sel.to_vec();
+
+                // Generate args: for vault/lending use realistic token amounts.
+                if let Some(params) = self.selector_params.get(&sel) {
+                    for param_type in params {
+                        if param_type.starts_with("uint") {
+                            // Bias toward token-like amounts (not just random U256).
+                            buf.extend_from_slice(&biased_token_amount(&self.dict, rng).to_be_bytes::<32>());
+                        } else {
+                            buf.extend_from_slice(&generate_typed_arg(param_type, &self.dict, rng));
+                        }
+                    }
+                } else {
+                    // No ABI params — append 1-2 token amounts as guesses.
+                    let n: usize = rng.gen_range(0..=2);
+                    for _ in 0..n {
+                        buf.extend_from_slice(&biased_token_amount(&self.dict, rng).to_be_bytes::<32>());
+                    }
+                }
+
+                return Bytes::from(buf);
+            }
+        }
+
+        self.random_calldata(rng)
     }
 
     /// Number of known function selectors extracted from ABIs.

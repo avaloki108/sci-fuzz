@@ -9,7 +9,9 @@ use tiny_keccak::{Hasher, Keccak};
 
 use crate::conservation_oracles::{
     AmmSyncExplainedOracle, Erc4626DepositVsUnderlyingTransferOracle,
+    Erc4626FirstDepositorInflationOracle,
 };
+
 use crate::economic::{
     Erc20BalanceStorageWithoutTransferOracle, Erc20BurnWithoutSupplyWriteOracle,
     Erc20MintWithoutSupplyWriteOracle, Erc4626EventAnomalyOracle, Erc4626ExchangeRateJumpOracle,
@@ -742,6 +744,9 @@ impl InvariantRegistry {
             profiles: pmap.clone(),
         }));
         reg.add(Box::new(Erc4626DepositVsUnderlyingTransferOracle {
+            profiles: pmap.clone(),
+        }));
+        reg.add(Box::new(Erc4626FirstDepositorInflationOracle {
             profiles: pmap,
         }));
         reg
@@ -950,7 +955,7 @@ mod tests {
         // Erc20BurnWithoutSupplyWrite, Erc4626WithdrawRateJump, Erc4626SameTransactionDepositRateSpread,
         // UniswapV2StyleSwapReserve, AmmSyncExplained, Erc4626PreviewVsDepositEvent,
         // UniswapV2StyleSyncVsGetReserves, Erc4626RateJumpWithoutTokenFlow,
-        // Erc4626DepositVsUnderlyingTransfer (18 total)
+        // Erc4626DepositVsUnderlyingTransfer, Erc4626FirstDepositorInflation (19 total)
         assert_eq!(reg.len(), 18);
         assert!(!reg.is_empty());
     }
@@ -1137,8 +1142,8 @@ mod tests {
         let attacker = Address::repeat_byte(0x99);
         let tokens = vec![Address::repeat_byte(0xA1), Address::repeat_byte(0xA2)];
         let reg = InvariantRegistry::with_erc20(attacker, &tokens);
-        // 18 defaults + 2 ERC20Supply invariants
-        assert_eq!(reg.len(), 20);
+        // 19 defaults + 2 ERC20Supply invariants
+        assert_eq!(reg.len(), 21);
     }
 
     // -- EchidnaPropertyCaller tests ------------------------------------------

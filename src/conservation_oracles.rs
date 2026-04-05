@@ -92,6 +92,149 @@ impl Invariant for AmmSyncExplainedOracle {
 }
 
 // ---------------------------------------------------------------------------
+// ERC-4626: First-Depositor Inflation Attack Detection
+// ---------------------------------------------------------------------------
+
+/// Detects first-depositor inflation attack patterns in ERC-4626 vaults.
+///
+/// Attack pattern (checked within a single transaction sequence):
+/// 1. Attacker deposits 1 wei → gets 1 share (vault empty, assets < 1000 wei).
+/// 2. Attacker donates large amount to vault directly (Transfer to vault, no Deposit event).
+/// 3. Next depositor gets 0 shares because `totalAssets` >> `totalSupply`.
+///
+/// This oracle fires on step 1 (tiny deposit with 1 share) OR when it sees
+/// a deposit returning 0 shares in the same sequence as a prior donation.
+/// Uses only data available within a single execution result — fully `Send + Sync`.
+pub struct Erc4626FirstDepositorInflationOracle {
+    pub profiles: Option<ProtocolProfileMap>,
+}
+
+impl Default for Erc4626FirstDepositorInflationOracle {
+    fn default() -> Self {
+        Self { profiles: None }
+    }
+}
+
+impl Invariant for Erc4626FirstDepositorInflationOracle {
+    fn name(&self) -> &str {
+        "economic-erc4626-first-depositor-inflation"
+    }
+
+    fn check(
+        &self,
+        _pre_balances: &HashMap<Address, U256>,
+        result: &ExecutionResult,
+        sequence: &[Transaction],
+    ) -> Option<Finding> {
+        if !result.success {
+            return None;
+        }
+
+        let dep_t = topic_erc4626_deposit();
+        let xfer_t = transfer_topic();
+        let logs = effective_logs(result);
+
+        // --- Step 1 detection: tiny first deposit (assets < 1000, shares <= 1) ----
+        // Also captures step 3: zero-share deposit from a subsequent depositor.
+        let mut tiny_deposit_vault: Option<Address> = None;
+        let mut zero_share_vault: Option<(Address, U256)> = None;
+
+        for log in logs {
+            if log.topics.get(0).copied() != Some(dep_t) || log.data.len() < 64 {
+                continue;
+            }
+            let vault = log.address;
+            if suppress_erc4626_rate_gated(lookup_profile(&self.profiles, vault)) {
+                continue;
+            }
+            let assets = U256::from_be_slice(&log.data[..32]);
+            let shares = U256::from_be_slice(&log.data[32..64]);
+
+            // Step 1: attacker seeds vault with 1 wei to get 1 share.
+            if assets > U256::ZERO && assets < U256::from(1_000u64) && shares <= U256::from(1u64) {
+                tiny_deposit_vault = Some(vault);
+            }
+            // Step 3: victim gets 0 shares for a non-trivial deposit — confirmed inflation.
+            if shares.is_zero() && assets > U256::from(1_000u64) {
+                zero_share_vault = Some((vault, assets));
+            }
+        }
+
+        // Confirmed inflation: step 3 fires — victim deposited real assets and got 0 shares.
+        if let Some((vault, victim_assets)) = zero_share_vault {
+            // Measure donation: any large Transfer to vault in cumulative logs
+            // that has no matching Deposit event on the same vault in the same tx.
+            let vault_b256 = address_to_b256(vault);
+            let donation: U256 = result
+                .sequence_cumulative_logs
+                .iter()
+                .filter(|l| {
+                    l.topics.get(0).copied() == Some(xfer_t)
+                        && l.topics.len() >= 3
+                        && l.topics[2] == vault_b256
+                })
+                .map(|l| {
+                    if l.data.len() >= 32 {
+                        U256::from_be_slice(&l.data[..32])
+                    } else {
+                        U256::ZERO
+                    }
+                })
+                .fold(U256::ZERO, |a, b| a.saturating_add(b));
+
+            let desc = append_triage_simple(
+                format!(
+                    "Vault {vault}: victim deposited {victim_assets} assets and received 0 shares \
+                     (sequence includes {donation} wei in inbound Transfers). \
+                     Confirmed first-depositor share-inflation attack — attacker seeded vault, \
+                     inflated totalAssets via donation, and rounded victim to zero shares.",
+                ),
+                vault,
+                lookup_profile(&self.profiles, vault),
+                "ERC-4626 inflation: totalAssets >> totalSupply allows attacker to steal victim deposits via rounding to zero shares.",
+                "sequence_cumulative_logs: Deposit shares=0 + inbound Transfer without Deposit on vault; indicates inflation attack.",
+                "Fee-on-transfer assets or very low precision vaults may produce shares=0 benignly — verify with source code.",
+            );
+            return Some(Finding {
+                severity: Severity::Critical,
+                title: format!("Economic: ERC4626 first-depositor inflation — victim gets 0 shares ({vault})"),
+                description: desc,
+                contract: vault,
+                reproducer: sequence.to_vec(),
+                exploit_profit: Some(victim_assets),
+            });
+        }
+
+        // Step 1 only (setup detected, full attack not yet confirmed in this sequence).
+        if let Some(vault) = tiny_deposit_vault {
+            let desc = append_triage_simple(
+                format!(
+                    "Vault {vault}: tiny first deposit (assets < 1000 wei, shares ≤ 1) — \
+                     step 1 of a first-depositor inflation attack. \
+                     If the attacker donates to inflate totalAssets before the next depositor, \
+                     that depositor will receive 0 shares.",
+                ),
+                vault,
+                lookup_profile(&self.profiles, vault),
+                "ERC-4626 first-depositor: vault with no virtual-share offset allows share-inflation via donation after first seed deposit.",
+                "result.logs: Deposit(assets < 1000, shares ≤ 1) heuristic.",
+                "Vaults with virtual shares (e.g. OpenZeppelin 5.x ERC4626) are not vulnerable; confirm absence of `_offset()` override.",
+            );
+            return Some(Finding {
+                severity: Severity::High,
+                title: format!("Economic: ERC4626 first-depositor inflation setup detected ({vault})"),
+                description: desc,
+                contract: vault,
+                reproducer: sequence.to_vec(),
+                exploit_profit: None,
+            });
+        }
+
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ERC-4626: Deposit assets vs ERC-20 Transfer to vault (same tx)
 // ---------------------------------------------------------------------------
 

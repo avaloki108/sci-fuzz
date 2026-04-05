@@ -174,6 +174,12 @@ pub struct ForgeArgs {
     /// Fail on critical findings
     #[arg(long)]
     pub fail_on_critical: bool,
+
+    /// Foundry build profile to use (sets FOUNDRY_PROFILE env var during build
+    /// and reads the profile's `out` directory for artifacts). Useful when the
+    /// echidna harness lives outside `src/` and needs a custom profile to compile.
+    #[arg(long)]
+    pub forge_profile: Option<String>,
 }
 
 /// Arguments for the `benchmark` subcommand
