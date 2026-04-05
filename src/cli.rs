@@ -11,14 +11,12 @@ use std::path::PathBuf;
 #[command(
     name = "sci-fuzz",
     version,
-    about = "State-first, automated smart contract fuzzer that beats Echidna and Forge",
+    about = "State-first smart contract fuzzer for EVM targets",
     long_about = r#"
-Sci-Fuzz is a research-backed smart contract fuzzer designed from the ground up
-to address the fundamental limitations of existing tools like Echidna and Forge.
+Sci-Fuzz is a stateful smart contract fuzzer for EVM targets.
 
-By combining snapshot-based state exploration, hybrid guidance mechanisms,
-and automated oracle generation, Sci-Fuzz discovers deep-state vulnerabilities
-faster and with less manual specification effort.
+It combines snapshot-based state exploration, coverage-guided feedback,
+ABI-aware mutation, and automated invariant checking in one workflow.
 "#
 )]
 pub struct Cli {

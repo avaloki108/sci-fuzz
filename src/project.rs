@@ -5,25 +5,32 @@
 //! build system and configuration.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tiny_keccak::{Hasher, Keccak};
 
 use crate::error::{Error, Result};
-use crate::types::{Address, ContractInfo};
+use crate::types::{Address, Bytes, ContractInfo};
 
 /// Foundry project configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FoundryConfig {
     /// Profile-specific configurations
+    #[serde(default)]
     pub profile: HashMap<String, FoundryProfile>,
     /// Dependencies
+    #[serde(default)]
     pub dependencies: HashMap<String, FoundryDependency>,
     /// Fuzz configuration
     pub fuzz: Option<FoundryFuzzConfig>,
     /// Invariant configuration
     pub invariant: Option<FoundryInvariantConfig>,
     /// Etherscan configuration
+    #[serde(default)]
     pub etherscan: HashMap<String, FoundryEtherscanConfig>,
 }
 
@@ -158,8 +165,89 @@ impl Project {
         project.discover_contracts()?;
         project.discover_tests()?;
         project.discover_scripts()?;
+        project.out_dir = Some(project.get_out_dir());
 
         Ok(project)
+    }
+
+    /// Run `forge build` for this project.
+    pub fn build(&self) -> Result<()> {
+        self.build_with_program("forge")
+    }
+
+    fn build_with_program(&self, program: impl AsRef<OsStr>) -> Result<()> {
+        run_forge_build_with_program(&self.root, program)
+    }
+
+    /// Parse contract artifacts from the project's `out/` directory and
+    /// populate [`Project::contracts`] with the results.
+    pub fn load_artifacts_from_out(&mut self) -> Result<Vec<ContractInfo>> {
+        let out_dir = self.get_out_dir();
+        self.out_dir = Some(out_dir.clone());
+
+        let artifact_paths = discover_artifact_paths(&out_dir)?;
+        let mut contracts = Vec::with_capacity(artifact_paths.len());
+        self.contracts.clear();
+
+        for artifact_path in artifact_paths {
+            let contract = parse_artifact_file(&artifact_path, &out_dir)?;
+            self.contracts.insert(contract.address, contract.clone());
+            contracts.push(contract);
+        }
+
+        Ok(contracts)
+    }
+
+    /// Select the first-pass set of fuzzable targets from compiled artifacts.
+    ///
+    /// Current policy:
+    /// - require non-empty deployed/runtime bytecode
+    /// - always exclude obvious script artifacts
+    /// - prefer non-test contracts
+    /// - within the remaining set, prefer contracts under `src/`
+    pub fn select_fuzz_targets(&self) -> Vec<ContractInfo> {
+        let mut candidates: Vec<ContractInfo> = self
+            .contracts
+            .values()
+            .filter(|contract| !contract.deployed_bytecode.is_empty())
+            .filter(|contract| !is_script_artifact(contract))
+            .cloned()
+            .collect();
+
+        let has_non_test = candidates.iter().any(|contract| !is_test_artifact(contract));
+        if has_non_test {
+            candidates.retain(|contract| !is_test_artifact(contract));
+        }
+
+        candidates.sort_by_key(target_sort_key);
+        candidates
+    }
+
+    /// End-to-end Foundry project loading for fuzzing:
+    /// load config, run `forge build`, ingest artifacts, and select targets.
+    pub fn build_and_select_targets(
+        root: impl AsRef<Path>,
+    ) -> Result<(Self, Vec<ContractInfo>, usize)> {
+        Self::build_and_select_targets_with_program(root, "forge")
+    }
+
+    fn build_and_select_targets_with_program(
+        root: impl AsRef<Path>,
+        program: impl AsRef<OsStr>,
+    ) -> Result<(Self, Vec<ContractInfo>, usize)> {
+        let mut project = Self::load(root)?;
+        project.build_with_program(program)?;
+        let artifact_count = project.load_artifacts_from_out()?.len();
+        let targets = project.select_fuzz_targets();
+
+        if targets.is_empty() {
+            return Err(Error::Project(format!(
+                "No fuzzable contracts found in {} after artifact ingestion",
+                project.get_out_dir().display()
+            )));
+        }
+
+        Ok((project, targets, artifact_count))
     }
 
     /// Discover contracts in the project
@@ -174,6 +262,7 @@ impl Project {
                     .and_then(|p| p.src.as_ref())
                     .cloned()
             })
+            .map(|path| self.resolve_project_path(path))
             .unwrap_or_else(|| self.root.join("src"));
 
         if !src_dir.exists() {
@@ -214,6 +303,7 @@ impl Project {
                     .and_then(|p| p.test.as_ref())
                     .cloned()
             })
+            .map(|path| self.resolve_project_path(path))
             .unwrap_or_else(|| self.root.join("test"));
 
         if !test_dir.exists() {
@@ -260,6 +350,7 @@ impl Project {
                     .and_then(|p| p.script.as_ref())
                     .cloned()
             })
+            .map(|path| self.resolve_project_path(path))
             .unwrap_or_else(|| self.root.join("script"));
 
         if script_dir.exists() {
@@ -279,6 +370,7 @@ impl Project {
                     .and_then(|p| p.out.as_ref())
                     .cloned()
             })
+            .map(|path| self.resolve_project_path(path))
             .unwrap_or_else(|| self.root.join("out"))
     }
 
@@ -325,6 +417,309 @@ impl Project {
             .and_then(|c| c.etherscan.get(chain))
             .map(|config| config.key.as_str())
     }
+
+    fn resolve_project_path(&self, path: PathBuf) -> PathBuf {
+        if path.is_absolute() {
+            path
+        } else {
+            self.root.join(path)
+        }
+    }
+}
+
+fn run_forge_build_with_program(root: &Path, program: impl AsRef<OsStr>) -> Result<()> {
+    let program = program.as_ref();
+    let output = Command::new(program)
+        .arg("build")
+        .current_dir(root)
+        .output()
+        .map_err(|err| match err.kind() {
+            std::io::ErrorKind::NotFound => Error::Project(format!(
+                "Failed to run `{} build`: binary not found. Install Foundry and ensure `forge` is on PATH.",
+                program.to_string_lossy()
+            )),
+            _ => Error::Project(format!(
+                "Failed to run `{} build`: {}",
+                program.to_string_lossy(),
+                err
+            )),
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            format!("exit status {}", output.status)
+        };
+
+        return Err(Error::Project(format!(
+            "`{} build` failed in {}: {}",
+            program.to_string_lossy(),
+            root.display(),
+            detail
+        )));
+    }
+
+    Ok(())
+}
+
+fn discover_artifact_paths(out_dir: &Path) -> Result<Vec<PathBuf>> {
+    if !out_dir.exists() {
+        return Err(Error::Project(format!(
+            "Foundry output directory does not exist: {}",
+            out_dir.display()
+        )));
+    }
+
+    let mut artifacts = Vec::new();
+    for entry in walkdir::WalkDir::new(out_dir)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_file())
+    {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if file_name.ends_with(".dbg.json") || file_name.ends_with(".metadata.json") {
+            continue;
+        }
+
+        let rel = path.strip_prefix(out_dir).unwrap_or(path);
+        if rel
+            .components()
+            .any(|component| component.as_os_str() == OsStr::new("build-info"))
+        {
+            continue;
+        }
+
+        artifacts.push(path.to_path_buf());
+    }
+
+    artifacts.sort();
+    Ok(artifacts)
+}
+
+fn parse_artifact_file(artifact_path: &Path, out_dir: &Path) -> Result<ContractInfo> {
+    let artifact_str = std::fs::read_to_string(artifact_path).map_err(|err| {
+        Error::Project(format!(
+            "Failed to read Foundry artifact {}: {}",
+            artifact_path.display(),
+            err
+        ))
+    })?;
+    let artifact: Value = serde_json::from_str(&artifact_str).map_err(|err| {
+        Error::Project(format!(
+            "Failed to parse Foundry artifact {}: {}",
+            artifact_path.display(),
+            err
+        ))
+    })?;
+
+    let source_path = extract_source_path(&artifact, artifact_path, out_dir);
+    let contract_name = artifact
+        .get("contractName")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            artifact
+                .get("compilationTarget")
+                .and_then(Value::as_object)
+                .and_then(|target| target.values().next())
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            artifact_path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_owned)
+        })
+        .ok_or_else(|| {
+            Error::Project(format!(
+                "Could not determine contract name for artifact {}",
+                artifact_path.display()
+            ))
+        })?;
+
+    let abi = artifact.get("abi").cloned().filter(|value| !value.is_null());
+    let creation_bytecode = extract_bytecode(
+        &artifact,
+        &[
+            &["bytecode"],
+            &["bytecode", "object"],
+            &["evm", "bytecode", "object"],
+        ],
+        artifact_path,
+    )?;
+    let deployed_bytecode = extract_bytecode(
+        &artifact,
+        &[
+            &["deployedBytecode"],
+            &["deployedBytecode", "object"],
+            &["evm", "deployedBytecode", "object"],
+        ],
+        artifact_path,
+    )?
+    .unwrap_or_default();
+
+    Ok(ContractInfo {
+        address: synthetic_contract_address(&source_path, &contract_name),
+        deployed_bytecode,
+        creation_bytecode,
+        name: Some(contract_name),
+        source_path: Some(source_path),
+        abi,
+    })
+}
+
+fn extract_source_path(artifact: &Value, artifact_path: &Path, out_dir: &Path) -> String {
+    if let Some(source_path) = artifact
+        .get("compilationTarget")
+        .and_then(Value::as_object)
+        .and_then(|target| target.keys().next())
+    {
+        return source_path.to_string();
+    }
+
+    let rel = artifact_path.strip_prefix(out_dir).unwrap_or(artifact_path);
+    rel.parent()
+        .map(|parent| parent.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default()
+}
+
+fn extract_bytecode(
+    artifact: &Value,
+    candidate_paths: &[&[&str]],
+    artifact_path: &Path,
+) -> Result<Option<Bytes>> {
+    for path in candidate_paths {
+        if let Some(value) = get_nested(artifact, path) {
+            if let Some(bytes) = decode_bytecode_value(value, artifact_path)? {
+                return Ok(Some(bytes));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn decode_bytecode_value(value: &Value, artifact_path: &Path) -> Result<Option<Bytes>> {
+    match value {
+        Value::Null => Ok(None),
+        Value::String(raw) => decode_hex_bytes(raw, artifact_path),
+        Value::Object(object) => {
+            if let Some(raw) = object.get("object").and_then(Value::as_str) {
+                decode_hex_bytes(raw, artifact_path)
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+fn decode_hex_bytes(raw: &str, artifact_path: &Path) -> Result<Option<Bytes>> {
+    let trimmed = raw.trim();
+    let trimmed = trimmed.strip_prefix("0x").unwrap_or(trimmed);
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let bytes = hex::decode(trimmed).map_err(|err| {
+        Error::Project(format!(
+            "Invalid hex bytecode in artifact {}: {}",
+            artifact_path.display(),
+            err
+        ))
+    })?;
+    Ok(Some(Bytes::from(bytes)))
+}
+
+fn get_nested<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    let mut current = value;
+    for segment in path {
+        current = current.get(*segment)?;
+    }
+    Some(current)
+}
+
+fn synthetic_contract_address(source_path: &str, contract_name: &str) -> Address {
+    let mut keccak = Keccak::v256();
+    keccak.update(source_path.as_bytes());
+    keccak.update(&[0xff]);
+    keccak.update(contract_name.as_bytes());
+
+    let mut hash = [0u8; 32];
+    keccak.finalize(&mut hash);
+    Address::from_slice(&hash[12..])
+}
+
+fn is_script_artifact(contract: &ContractInfo) -> bool {
+    let source_path = contract
+        .source_path
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let name = contract
+        .name
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    source_path.starts_with("script/")
+        || source_path.contains("/script/")
+        || source_path.ends_with(".s.sol")
+        || name.ends_with("script")
+}
+
+fn is_test_artifact(contract: &ContractInfo) -> bool {
+    let source_path = contract
+        .source_path
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let name = contract
+        .name
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    source_path.starts_with("test/")
+        || source_path.contains("/test/")
+        || source_path.ends_with(".t.sol")
+        || name.ends_with("test")
+}
+
+fn target_sort_key(contract: &ContractInfo) -> (u8, String, String) {
+    let source_path = contract
+        .source_path
+        .as_deref()
+        .unwrap_or_default()
+        .replace('\\', "/");
+    let rank = if source_path.starts_with("src/") || source_path == "src" {
+        0
+    } else {
+        1
+    };
+
+    (
+        rank,
+        source_path.to_ascii_lowercase(),
+        contract
+            .name
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase(),
+    )
 }
 
 /// Try to detect the contract type from source code or bytecode
@@ -390,7 +785,62 @@ pub fn detect_contract_type(bytecode: &[u8], source: Option<&str>) -> Option<Con
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use std::fs;
+    use std::path::Path;
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    fn write_artifact(
+        out_dir: &Path,
+        source_path: &str,
+        contract_name: &str,
+        creation_bytecode: Option<&str>,
+        deployed_bytecode: &str,
+    ) -> PathBuf {
+        let artifact_dir = out_dir.join(source_path);
+        fs::create_dir_all(&artifact_dir).unwrap();
+
+        let artifact_path = artifact_dir.join(format!("{contract_name}.json"));
+        let artifact = json!({
+            "contractName": contract_name,
+            "abi": [
+                {
+                    "type": "function",
+                    "name": "echidna_ok",
+                    "inputs": [],
+                    "outputs": [{"type": "bool"}],
+                    "stateMutability": "view"
+                }
+            ],
+            "bytecode": { "object": creation_bytecode.unwrap_or("0x") },
+            "deployedBytecode": { "object": deployed_bytecode },
+            "compilationTarget": { source_path: contract_name }
+        });
+
+        fs::write(&artifact_path, serde_json::to_vec_pretty(&artifact).unwrap()).unwrap();
+        artifact_path
+    }
+
+    fn write_foundry_toml(root: &Path) {
+        fs::write(
+            root.join("foundry.toml"),
+            "[profile.default]\nsrc = 'src'\nout = 'out'\n",
+        )
+        .unwrap();
+    }
+
+    fn write_executable_script(path: &Path, body: &str) {
+        fs::write(path, body).unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(path, perms).unwrap();
+        }
+    }
 
     #[test]
     fn test_project_load_nonexistent() {
@@ -418,5 +868,156 @@ mod tests {
             detect_contract_type(&erc20_bytecode, None),
             Some(ContractKind::Erc20)
         );
+    }
+
+    #[test]
+    fn parse_foundry_artifact_into_contract_info() {
+        let dir = tempdir().unwrap();
+        let out_dir = dir.path().join("out");
+        let artifact_path = write_artifact(
+            &out_dir,
+            "src/Vault.sol",
+            "Vault",
+            Some("0x600a600c600039600a6000f3602a60005260206000f3"),
+            "0x602a60005260206000f3",
+        );
+
+        let contract = parse_artifact_file(&artifact_path, &out_dir).unwrap();
+        assert_eq!(contract.name.as_deref(), Some("Vault"));
+        assert_eq!(contract.source_path.as_deref(), Some("src/Vault.sol"));
+        assert_eq!(
+            contract.creation_bytecode,
+            Some(Bytes::from(
+                hex::decode("600a600c600039600a6000f3602a60005260206000f3").unwrap()
+            ))
+        );
+        assert_eq!(
+            contract.deployed_bytecode,
+            Bytes::from(hex::decode("602a60005260206000f3").unwrap())
+        );
+        assert!(contract.abi.is_some());
+    }
+
+    #[test]
+    fn select_fuzzable_contracts_from_mock_out_tree() {
+        let dir = tempdir().unwrap();
+        write_foundry_toml(dir.path());
+        let out_dir = dir.path().join("out");
+
+        write_artifact(
+            &out_dir,
+            "src/Vault.sol",
+            "Vault",
+            Some("0x60006000f3"),
+            "0x60006000f3",
+        );
+        write_artifact(
+            &out_dir,
+            "test/Vault.t.sol",
+            "VaultTest",
+            Some("0x60006000f3"),
+            "0x60006000f3",
+        );
+        write_artifact(
+            &out_dir,
+            "script/Deploy.s.sol",
+            "DeployScript",
+            Some("0x60006000f3"),
+            "0x60006000f3",
+        );
+        write_artifact(&out_dir, "src/IVault.sol", "IVault", Some("0x"), "0x");
+
+        let mut project = Project::load(dir.path()).unwrap();
+        let parsed = project.load_artifacts_from_out().unwrap();
+        assert_eq!(parsed.len(), 4);
+
+        let targets = project.select_fuzz_targets();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].name.as_deref(), Some("Vault"));
+        assert_eq!(targets[0].source_path.as_deref(), Some("src/Vault.sol"));
+    }
+
+    #[test]
+    fn load_minimal_foundry_project_with_out_artifacts() {
+        let dir = tempdir().unwrap();
+        write_foundry_toml(dir.path());
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/Vault.sol"), "contract Vault {}").unwrap();
+        let out_dir = dir.path().join("out");
+        write_artifact(
+            &out_dir,
+            "src/Vault.sol",
+            "Vault",
+            Some("0x60006000f3"),
+            "0x60006000f3",
+        );
+
+        let mut project = Project::load(dir.path()).unwrap();
+        let parsed = project.load_artifacts_from_out().unwrap();
+
+        assert_eq!(parsed.len(), 1);
+        assert!(project.is_valid());
+        assert_eq!(project.get_out_dir(), out_dir);
+
+        let contract = project.contracts.values().next().unwrap();
+        assert_eq!(contract.name.as_deref(), Some("Vault"));
+    }
+
+    #[test]
+    fn forge_build_reports_missing_binary_and_failures() {
+        let dir = tempdir().unwrap();
+        let missing = run_forge_build_with_program(dir.path(), "definitely-not-a-real-forge-binary")
+            .unwrap_err();
+        assert!(missing.to_string().contains("binary not found"));
+
+        let failing_script = dir.path().join("fake-forge-fail");
+        write_executable_script(
+            &failing_script,
+            "#!/bin/sh\nprintf 'boom from fake forge\\n' >&2\nexit 1\n",
+        );
+
+        let failed = run_forge_build_with_program(dir.path(), &failing_script).unwrap_err();
+        assert!(failed.to_string().contains("boom from fake forge"));
+    }
+
+    #[test]
+    fn build_and_select_targets_produces_campaign_targets() {
+        let dir = tempdir().unwrap();
+        write_foundry_toml(dir.path());
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/Vault.sol"), "contract Vault {}").unwrap();
+
+        let forge_script = dir.path().join("fake-forge");
+        let out_dir = dir.path().join("out");
+        let artifact_dir = out_dir.join("src/Vault.sol");
+        let artifact_path = artifact_dir.join("Vault.json");
+        write_executable_script(
+            &forge_script,
+            &format!(
+                "#!/bin/sh\nmkdir -p '{}'\ncat > '{}' <<'JSON'\n{}\nJSON\n",
+                artifact_dir.display(),
+                artifact_path.display(),
+                json!({
+                    "contractName": "Vault",
+                    "abi": [],
+                    "bytecode": { "object": "0x60006000f3" },
+                    "deployedBytecode": { "object": "0x60006000f3" },
+                    "compilationTarget": { "src/Vault.sol": "Vault" }
+                })
+            ),
+        );
+
+        let (_project, targets, artifact_count) =
+            Project::build_and_select_targets_with_program(dir.path(), &forge_script).unwrap();
+
+        assert_eq!(artifact_count, 1);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].name.as_deref(), Some("Vault"));
+
+        let config = crate::types::CampaignConfig {
+            targets,
+            ..crate::types::CampaignConfig::default()
+        };
+        assert_eq!(config.targets.len(), 1);
     }
 }

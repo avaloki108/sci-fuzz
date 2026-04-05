@@ -23,6 +23,7 @@ The name stands for **S**mart **C**ontract **I**nvariant **Fuzz**er. The thesis 
 - **5 invariant checkers**: BalanceIncrease, UnexpectedRevert, SelfDestruct, EchidnaProperty (log-based assertion detection), ERC20Supply (mint/burn monitoring)
 - **Real Echidna property calling** — `EchidnaPropertyCaller` discovers `echidna_*` functions from ABI, calls them via `static_call` after each sequence, checks bool returns. This is the actual Echidna workflow, not just log watching.
 - **Deterministic sequence shrinking** — findings are replayed from the same pre-sequence snapshot and reduced by prefix/suffix elimination, whole-tx removal, calldata-word reduction, `msg.value` reduction, and sender simplification
+- **Foundry artifact ingestion** — `sci-fuzz forge --project /path/to/project` runs `forge build`, parses standard `out/` artifacts, extracts ABI plus creation/runtime bytecode, and hands selected contracts to the existing campaign
 - **Benchmark matrix** — 81 entries mapping EF/CF contracts to expected vulnerability types, with file-existence and category-coverage validation tests
 - **133 benchmark contracts** from EF/CF covering reentrancy, selfdestruct, overflow, cross-function attacks, property tests, and assertion tests
 
@@ -30,13 +31,13 @@ The name stands for **S**mart **C**ontract **I**nvariant **Fuzz**er. The thesis 
 
 Honesty matters more than marketing. These are real gaps:
 
-- **No Solidity compiler integration.** You cannot point sci-fuzz at a `.sol` file yet. Contracts must be pre-compiled to bytecode.
 - **No edge coverage yet.** sci-fuzz now records real per-instruction hitcounts from revm and feeds those into `CoverageFeedback`, but it does not yet record exact edge coverage (`prev_pc -> current_pc`) or perform block/sequence-level path canonicalization.
 - **Shrinking is still a first pass.** The shrinker is deterministic and useful today, but it is not yet a full semantic reducer: it does not reason about ABI types, storage dependencies, or minimal base-state snapshots, and it does not guarantee globally minimal sequences.
 - **No multi-worker parallelism.** The fuzzing loop is single-threaded. The `workers` config field exists but is not wired.
-- **No Foundry project integration.** The `project.rs` module parses directory structure but does not invoke `forge build` or consume Foundry artifacts.
+- **Foundry integration is still partial.** Project mode now invokes `forge build` and ingests standard artifacts from `out/`, but it does not execute setup scripts, deploy script flows, imported invariant harnesses, or library-specific bootstrapping.
 - **No on-chain forking.** The `audit` subcommand exists in the CLI but is not implemented.
 - **Partial Echidna compatibility.** `EchidnaPropertyCaller` implements the core workflow (discover echidna_* functions, call them, check bool return). `EchidnaProperty` detects assertion events in logs. Neither handles revert/assert distinction with full Echidna fidelity, and the property-harness workflow (targetContract, configurable test limits, shrinking) is not implemented.
+- **No Foundry fork/invariant parity.** There is no Foundry fork-mode execution, no `StdInvariant` harness import path, and no parity claim with Foundry's invariant runner.
 - **The 207k execs/sec number is a smoke test.** It measures empty-target throughput. Real contracts with storage and complex logic will run at 1–5k execs/sec. The number demonstrates low framework overhead, not security-testing strength.
 
 ## Architecture
@@ -65,11 +66,14 @@ cargo build --release
 ## Usage
 
 ```bash
-# Run with default settings (2 minute timeout)
+# Fuzz the current Foundry project
 sci-fuzz forge --timeout 120
 
+# Fuzz a specific Foundry project in one command
+sci-fuzz forge --project /path/to/foundry-project --timeout 120
+
 # Deeper exploration with more snapshots
-sci-fuzz forge --depth 32 --max-snapshots 8192 --timeout 600
+sci-fuzz forge --project /path/to/foundry-project --depth 32 --max-snapshots 8192 --timeout 600
 
 # Reproducible run
 sci-fuzz forge --seed 42 --timeout 60
@@ -135,7 +139,7 @@ Notably, LibAFL (v0.16.0) was analyzed but **not** used as a dependency. The typ
 The minimum proof standard before sci-fuzz earns the label "credible tool":
 
 1. **One real benchmark run** — the 81-entry matrix populated with actual pass/fail/time data
-2. **One real Foundry target** — a nontrivial project fuzzing end-to-end
+2. **One real Foundry target** — a nontrivial project fuzzing end-to-end with measured findings
 3. **One minimized reproducer** — a finding with a shrunk transaction sequence
 4. **One side-by-side comparison** — sci-fuzz vs Echidna on a shared target with shared properties
 

@@ -107,7 +107,9 @@ fn real_target_prop_false_found() {
     let target = ContractInfo {
         address: contract_addr,
         deployed_bytecode: Bytes::from(bytecode),
+        creation_bytecode: None,
         name: Some("PropFalse".into()),
+        source_path: None,
         abi: Some(abi),
     };
 
@@ -286,7 +288,9 @@ fn real_target_prop_stateful_found_via_fuzzing() {
     let target = ContractInfo {
         address: contract_addr,
         deployed_bytecode: Bytes::from(bytecode),
+        creation_bytecode: None,
         name: Some("PropStateful".into()),
+        source_path: None,
         abi: Some(abi),
     };
 
@@ -410,7 +414,9 @@ fn campaign_with_real_target() {
     let target = ContractInfo {
         address: contract_addr,
         deployed_bytecode: Bytes::from(bytecode),
+        creation_bytecode: None,
         name: Some("PropFalse".into()),
+        source_path: None,
         abi: Some(abi),
     };
 
@@ -466,7 +472,9 @@ fn scorecard_prop_false() {
     let mutator = TxMutator::new(vec![ContractInfo {
         address: contract_addr,
         deployed_bytecode: Bytes::from(bytecode),
+        creation_bytecode: None,
         name: Some("PropFalse".into()),
+        source_path: None,
         abi: Some(abi),
     }]);
 
@@ -555,7 +563,9 @@ fn campaign_solves_prop_stateful() {
     let target = ContractInfo {
         address: contract_addr,
         deployed_bytecode: Bytes::from(bytecode),
+        creation_bytecode: None,
         name: Some("PropStateful".into()),
+        source_path: None,
         abi: Some(abi),
     };
 

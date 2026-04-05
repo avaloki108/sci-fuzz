@@ -64,12 +64,20 @@ impl Campaign {
         // property callers need to target the real on-chain addresses.
         let mut deployed_targets: Vec<ContractInfo> = Vec::new();
         for target in &self.config.targets {
-            if !target.deployed_bytecode.is_empty() {
-                let deployed_addr = executor.deploy(attacker, target.deployed_bytecode.clone())?;
+            let deployment_bytecode = target
+                .creation_bytecode
+                .clone()
+                .filter(|code| !code.is_empty())
+                .unwrap_or_else(|| target.deployed_bytecode.clone());
+
+            if !deployment_bytecode.is_empty() {
+                let deployed_addr = executor.deploy(attacker, deployment_bytecode)?;
                 deployed_targets.push(ContractInfo {
                     address: deployed_addr,
                     deployed_bytecode: target.deployed_bytecode.clone(),
+                    creation_bytecode: target.creation_bytecode.clone(),
                     name: target.name.clone(),
+                    source_path: target.source_path.clone(),
                     abi: target.abi.clone(),
                 });
             } else {

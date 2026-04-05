@@ -28,8 +28,14 @@ pub struct ContractInfo {
     pub address: Address,
     /// Deployed (runtime) bytecode.
     pub deployed_bytecode: Bytes,
+    /// Creation/init bytecode, when available from a compiler artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation_bytecode: Option<Bytes>,
     /// Human-readable name, e.g. `"Vault"`.
     pub name: Option<String>,
+    /// Source path reported by the build system, relative to project root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
     /// Full JSON ABI (as produced by `solc --abi`).
     pub abi: Option<serde_json::Value>,
 }

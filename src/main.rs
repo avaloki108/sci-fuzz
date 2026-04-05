@@ -38,8 +38,6 @@ fn main() {
 
 #[cfg(feature = "cli")]
 fn run(cli: Cli) -> Result<()> {
-    use sci_fuzz::cli;
-
     match cli.command {
         Commands::Forge(args) => handle_forge(args),
         Commands::Audit(args) => handle_audit(args),
@@ -56,11 +54,7 @@ fn run(cli: Cli) -> Result<()> {
 
 #[cfg(feature = "cli")]
 fn handle_forge(args: sci_fuzz::cli::ForgeArgs) -> Result<()> {
-    use sci_fuzz::{
-        campaign::Campaign,
-        evm::EvmExecutor,
-        types::{CampaignConfig, ContractInfo},
-    };
+    use sci_fuzz::{campaign::Campaign, project::Project, types::CampaignConfig};
 
     println!("⚡ sci-fuzz — Smart Contract Invariant Fuzzer");
     println!();
@@ -71,6 +65,17 @@ fn handle_forge(args: sci_fuzz::cli::ForgeArgs) -> Result<()> {
     println!("  seed    : {}", args.seed.unwrap_or(0));
     println!();
 
+    let project_root = args.project.canonicalize().unwrap_or(args.project.clone());
+    println!("found project: {}", project_root.display());
+    println!("running forge build...");
+
+    let (_project, targets, artifact_count) = Project::build_and_select_targets(&project_root)?;
+
+    println!("discovered {} artifact(s)", artifact_count);
+    println!("selected {} fuzz target(s)", targets.len());
+    println!("starting campaign...");
+    println!();
+
     // Build a default campaign config from CLI args.
     let config = CampaignConfig {
         timeout: std::time::Duration::from_secs(args.timeout),
@@ -78,7 +83,7 @@ fn handle_forge(args: sci_fuzz::cli::ForgeArgs) -> Result<()> {
         max_snapshots: args.max_snapshots,
         workers: args.workers,
         seed: args.seed.unwrap_or_else(|| rand::random()),
-        targets: Vec::new(), // will be populated from project discovery
+        targets,
     };
 
     let mut campaign = Campaign::new(config);

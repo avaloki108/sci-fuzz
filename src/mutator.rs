@@ -725,7 +725,9 @@ mod tests {
         let targets = vec![ContractInfo {
             address: Address::ZERO,
             deployed_bytecode: Bytes::new(),
+            creation_bytecode: None,
             name: Some("Vault".into()),
+            source_path: None,
             abi: Some(abi),
         }];
 
@@ -803,7 +805,9 @@ mod tests {
         let targets = vec![ContractInfo {
             address: Address::ZERO,
             deployed_bytecode: Bytes::new(),
+            creation_bytecode: None,
             name: Some("Token".into()),
+            source_path: None,
             abi: Some(abi),
         }];
 

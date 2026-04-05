@@ -94,7 +94,9 @@ impl BenchmarkHarness {
         let target = ContractInfo {
             address: contract_addr,
             deployed_bytecode: Bytes::from(bytecode),
+            creation_bytecode: None,
             name: None,
+            source_path: None,
             abi: abi.clone(),
         };
 
