@@ -562,6 +562,7 @@ mod tests {
             gas_used: 21_000,
             logs: Vec::new(),
             coverage: CoverageMap::new(),
+            dataflow: Default::default(),
             state_diff: StateDiff {
                 storage_writes: HashMap::new(),
                 balance_changes,
@@ -703,6 +704,7 @@ mod tests {
             gas_used: 21_000,
             logs,
             coverage: CoverageMap::new(),
+            dataflow: Default::default(),
             state_diff: StateDiff {
                 storage_writes: HashMap::new(),
                 balance_changes: HashMap::new(),

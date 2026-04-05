@@ -199,6 +199,7 @@ impl Campaign {
             block_number: 1,
             timestamp: 1,
             coverage: CoverageMap::new(),
+            dataflow: Default::default(),
         };
         snapshots.add(initial_snapshot);
 
@@ -222,8 +223,12 @@ impl Campaign {
             if let Ok(result) = executor.execute(&tx) {
                 mutator.feed_execution(&result);
                 let cov = result.coverage.clone();
+                let df = result.dataflow.clone();
 
-                if feedback.record_from_coverage_map(&cov) {
+                let novel_cov = feedback.record_from_coverage_map(&cov);
+                let novel_df = feedback.record_dataflow(&df);
+
+                if novel_cov || novel_df {
                     let snap = StateSnapshot {
                         id: 0,
                         parent_id: None,
@@ -232,6 +237,7 @@ impl Campaign {
                         block_number: 1,
                         timestamp: 1,
                         coverage: cov.clone(),
+                        dataflow: df.clone(),
                     };
                     let snap_id = snapshots.add(snap);
                     snapshots.update_metadata(snap_id, |m| {
@@ -309,33 +315,41 @@ impl Campaign {
 
             // Generate a transaction sequence.
             let seq_len: u32 = rng.gen_range(1..=self.config.max_depth);
-            let mut sequence: Vec<Transaction> = Vec::with_capacity(seq_len as usize);
+            let mut raw_sequence: Vec<Transaction> = Vec::with_capacity(seq_len as usize);
+
+            for _ in 0..seq_len {
+                let tx = if raw_sequence.is_empty() || rng.gen_bool(0.3) {
+                    let prev_sender = raw_sequence.last().map(|t: &Transaction| t.sender);
+                    mutator.generate_in_sequence(prev_sender, &mut rng)
+                } else {
+                    mutator.mutate(raw_sequence.last().unwrap(), &mut rng)
+                };
+                raw_sequence.push(tx);
+            }
+
+            // Wrap a small percentage (e.g. 5%) of sequences in a flashloan to enable
+            // the Global Economic Oracle to catch logic flaws.
+            let wrap_flashloan = rng.gen_bool(0.05);
+            let final_sequence = if wrap_flashloan {
+                let flashloan_mutator = crate::flashloan::FlashloanMutator::new(&mutator, &mutator.dict);
+                flashloan_mutator.wrap_sequence(raw_sequence, &mut rng)
+            } else {
+                raw_sequence
+            };
 
             // Save the executor state so we can roll back after the sequence.
             let db_snapshot = executor.snapshot();
             let mut reached_exec_budget = false;
+            let mut sequence: Vec<Transaction> = Vec::with_capacity(final_sequence.len());
 
-            for _ in 0..seq_len {
-                let tx = if sequence.is_empty() || rng.gen_bool(0.3) {
-                    // 30 % chance of a brand-new random tx, or always for the
-                    // first tx in the sequence.  Reuse the previous sender so
-                    // stateful interactions (deposit → withdraw) use one actor.
-                    let prev_sender = sequence.last().map(|t| t.sender);
-                    mutator.generate_in_sequence(prev_sender, &mut rng)
-                } else {
-                    // 70 % chance: mutate the last tx.
-                    mutator.mutate(sequence.last().unwrap(), &mut rng)
-                };
-
+            for tx in final_sequence {
                 let result = match executor.execute(&tx) {
                     Ok(r) => r,
-                    Err(_) => {
-                        // EVM-level error (not a revert) — skip this tx.
-                        continue;
-                    }
+                    Err(_) => continue,
                 };
 
                 total_execs += 1;
+                sequence.push(tx.clone());
 
                 // Diagnostic: track deposit/withdraw patterns.
                 if result.success && tx.data.len() >= 4 {
@@ -399,13 +413,16 @@ impl Campaign {
 
                 // --- Feedback: is the result interesting? ------------------
                 let cov = result.coverage.clone();
+                let df = result.dataflow.clone();
 
                 // Track successful state-changing transactions.
                 if result.success && !result.state_diff.storage_writes.is_empty() {
                     successful_state_changes += 1;
                 }
 
-                let is_novel = feedback.record_from_coverage_map(&cov);
+                let novel_cov = feedback.record_from_coverage_map(&cov);
+                let novel_df = feedback.record_dataflow(&df);
+                let is_novel = novel_cov || novel_df;
                 if is_novel {
                     // Store a snapshot of this state for future exploration.
                     let snap = StateSnapshot {
@@ -416,6 +433,7 @@ impl Campaign {
                         block_number: 1,
                         timestamp: 1,
                         coverage: cov,
+                        dataflow: df,
                     };
                     let snap_id = snapshots.add(snap);
 
@@ -430,8 +448,6 @@ impl Campaign {
                         snapshots_saved += 1;
                     }
                 }
-
-                sequence.push(tx);
 
                 if let Some(max_execs) = self.config.max_execs {
                     if total_execs >= max_execs {

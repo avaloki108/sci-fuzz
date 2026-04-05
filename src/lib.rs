@@ -40,6 +40,7 @@ pub mod snapshot;
 // ── Feedback & guidance ─────────────────────────────────────────────────
 
 pub mod feedback;
+pub mod flashloan;
 pub mod mutator;
 pub mod shrinker;
 

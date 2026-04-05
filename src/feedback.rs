@@ -94,12 +94,15 @@ pub struct CoverageFeedback {
     /// Every `(address, pc)` → set of buckets that **have** been seen.
     /// A new bucket value for a known key, or a brand-new key, both
     /// constitute novel coverage.
-    seen_bits: HashMap<(Address, usize), HashSet<u8>>,
+    seen_bits: HashMap<(Address, (usize, usize)), HashSet<u8>>,
 
     /// Accumulated raw hitcounts across the entire campaign (for stats /
     /// reporting).  Values are the *maximum* hitcount observed for each
-    /// `(address, pc)` pair.
-    global_hitcounts: HashMap<(Address, usize), u32>,
+    /// `(address, edge)` pair.
+    global_hitcounts: HashMap<(Address, (usize, usize)), u32>,
+
+    /// Dataflow waypoints observed globally.
+    seen_dataflow: HashMap<Address, HashSet<crate::types::U256>>,
 
     /// Total unique `(address, pc, bucket)` triples discovered so far.
     total_bits: usize,
@@ -116,17 +119,18 @@ impl CoverageFeedback {
         Self {
             seen_bits: HashMap::new(),
             global_hitcounts: HashMap::new(),
+            seen_dataflow: HashMap::new(),
             total_bits: 0,
             last_was_novel: false,
         }
     }
 
     /// Read-only check: would `hitcounts` produce at least one novel
-    /// `(address, pc, bucket)` triple?
+    /// `(address, edge, bucket)` triple?
     ///
     /// This does **not** mutate the feedback state — call
     /// [`record`](Self::record) afterwards to actually merge.
-    pub fn is_interesting(&self, hitcounts: &HashMap<(Address, usize), u32>) -> bool {
+    pub fn is_interesting(&self, hitcounts: &HashMap<(Address, (usize, usize)), u32>) -> bool {
         for (&key, &count) in hitcounts {
             let b = bucket(count);
             if b == 0 {
@@ -148,7 +152,7 @@ impl CoverageFeedback {
     ///
     /// Returns `true` when at least one previously-unseen
     /// `(address, pc, bucket)` triple was discovered.
-    pub fn record(&mut self, hitcounts: &HashMap<(Address, usize), u32>) -> bool {
+    pub fn record(&mut self, hitcounts: &HashMap<(Address, (usize, usize)), u32>) -> bool {
         let mut novel = false;
 
         for (&key, &count) in hitcounts {
@@ -160,7 +164,7 @@ impl CoverageFeedback {
             // Update seen_bits / virgin tracking.
             let buckets = self.seen_bits.entry(key).or_default();
             if buckets.insert(b) {
-                // This bucket was never seen for this (address, pc).
+                // This bucket was never seen for this (address, edge).
                 self.total_bits += 1;
                 novel = true;
             }
@@ -172,7 +176,9 @@ impl CoverageFeedback {
             }
         }
 
-        self.last_was_novel = novel;
+        if novel {
+            self.last_was_novel = true;
+        }
         novel
     }
 
@@ -182,7 +188,27 @@ impl CoverageFeedback {
     /// Returns `true` when new coverage was discovered.
     pub fn record_from_coverage_map(&mut self, cov: &CoverageMap) -> bool {
         let hitcounts = coverage_map_to_hitcounts(cov);
-        self.record(&hitcounts)
+        let novel = self.record(&hitcounts);
+        self.last_was_novel = novel;
+        novel
+    }
+
+    /// Record dataflow waypoints and return true if any are novel.
+    pub fn record_dataflow(&mut self, dataflow: &crate::types::DataflowWaypoints) -> bool {
+        let mut novel = false;
+        for (addr, slots) in &dataflow.map {
+            let seen = self.seen_dataflow.entry(*addr).or_default();
+            for slot in slots {
+                if seen.insert(*slot) {
+                    self.total_bits += 1; // Count dataflow accesses towards total bits
+                    novel = true;
+                }
+            }
+        }
+        if novel {
+            self.last_was_novel = true;
+        }
+        novel
     }
 
     /// Total number of unique `(address, pc, bucket)` triples discovered.
@@ -196,7 +222,7 @@ impl CoverageFeedback {
     }
 
     /// Borrow the accumulated raw hitcounts (high-water marks).
-    pub fn global_coverage(&self) -> &HashMap<(Address, usize), u32> {
+    pub fn global_coverage(&self) -> &HashMap<(Address, (usize, usize)), u32> {
         &self.global_hitcounts
     }
 }
@@ -212,11 +238,11 @@ impl Default for CoverageFeedback {
 // ---------------------------------------------------------------------------
 
 /// Convert a [`CoverageMap`] into a flat hitcount map.
-fn coverage_map_to_hitcounts(cov: &CoverageMap) -> HashMap<(Address, usize), u32> {
+fn coverage_map_to_hitcounts(cov: &CoverageMap) -> HashMap<(Address, (usize, usize)), u32> {
     let mut hitcounts = HashMap::new();
-    for (addr, pcs) in &cov.map {
-        for (&pc, &count) in pcs {
-            hitcounts.insert((*addr, pc), count);
+    for (addr, edges) in &cov.map {
+        for (&edge, &count) in edges {
+            hitcounts.insert((*addr, edge), count);
         }
     }
     hitcounts
@@ -272,7 +298,7 @@ mod tests {
         assert!(fb.is_empty());
 
         let mut hc = HashMap::new();
-        hc.insert((Address::ZERO, 42usize), 1u32);
+        hc.insert((Address::ZERO, (42usize, 43usize)), 1u32);
 
         assert!(fb.is_interesting(&hc), "first hit should be interesting");
         assert!(fb.record(&hc), "first record should report novel coverage");
@@ -285,11 +311,11 @@ mod tests {
         let mut fb = CoverageFeedback::new();
 
         let mut hc = HashMap::new();
-        hc.insert((Address::ZERO, 10), 1u32);
-        hc.insert((Address::ZERO, 20), 5u32);
+        hc.insert((Address::ZERO, (10, 11)), 1u32);
+        hc.insert((Address::ZERO, (20, 21)), 5u32);
 
         assert!(fb.record(&hc), "first time → novel");
-        assert_eq!(fb.total_coverage(), 2); // (ZERO,10,bucket(1)=1) and (ZERO,20,bucket(5)=8)
+        assert_eq!(fb.total_coverage(), 2); // (ZERO,10->11,bucket(1)=1) and (ZERO,20->21,bucket(5)=8)
 
         // Exact same hitcounts → same buckets → not novel.
         assert!(
@@ -307,19 +333,19 @@ mod tests {
     fn new_bucket_for_existing_pc_is_novel() {
         let mut fb = CoverageFeedback::new();
 
-        // First execution: PC 0x10 hit once → bucket 1.
+        // First execution: edge 10->11 hit once → bucket 1.
         let mut hc1 = HashMap::new();
-        hc1.insert((Address::ZERO, 0x10), 1u32);
+        hc1.insert((Address::ZERO, (0x10, 0x11)), 1u32);
         assert!(fb.record(&hc1));
         assert_eq!(fb.total_coverage(), 1);
 
         // Same hitcount → same bucket → not novel.
         assert!(!fb.record(&hc1));
 
-        // Second execution: PC 0x10 hit 5 times → bucket 8.
+        // Second execution: edge 10->11 hit 5 times → bucket 8.
         // Different bucket for the same PC → novel!
         let mut hc2 = HashMap::new();
-        hc2.insert((Address::ZERO, 0x10), 5u32);
+        hc2.insert((Address::ZERO, (0x10, 0x11)), 5u32);
         assert!(
             fb.is_interesting(&hc2),
             "different bucket for same PC should be interesting"
@@ -331,9 +357,9 @@ mod tests {
             "should now have 2 bits: bucket 1 and bucket 8"
         );
 
-        // Third execution: PC 0x10 hit 100 times → bucket 64.
+        // Third execution: edge 10->11 hit 100 times → bucket 64.
         let mut hc3 = HashMap::new();
-        hc3.insert((Address::ZERO, 0x10), 100u32);
+        hc3.insert((Address::ZERO, (0x10, 0x11)), 100u32);
         assert!(fb.record(&hc3));
         assert_eq!(fb.total_coverage(), 3);
     }
@@ -346,9 +372,9 @@ mod tests {
         let addr_b = Address::repeat_byte(0xBB);
 
         let mut cov = CoverageMap::new();
-        cov.record_hit(addr_a, 0);
-        cov.record_hit(addr_a, 42);
-        cov.record_hit(addr_b, 7);
+        cov.record_hit(addr_a, 0, 1);
+        cov.record_hit(addr_a, 42, 43);
+        cov.record_hit(addr_b, 7, 8);
 
         assert!(
             fb.record_from_coverage_map(&cov),
@@ -370,7 +396,7 @@ mod tests {
         let mut fb = CoverageFeedback::new();
 
         let mut hc = HashMap::new();
-        hc.insert((Address::ZERO, 99), 0u32);
+        hc.insert((Address::ZERO, (99, 100)), 0u32);
 
         assert!(
             !fb.is_interesting(&hc),
@@ -383,7 +409,7 @@ mod tests {
     #[test]
     fn global_coverage_tracks_high_water_mark() {
         let mut fb = CoverageFeedback::new();
-        let key = (Address::ZERO, 5usize);
+        let key = (Address::ZERO, (5usize, 6usize));
 
         let mut hc1 = HashMap::new();
         hc1.insert(key, 3u32);
@@ -425,16 +451,16 @@ mod tests {
 
         // Same PC on different addresses → distinct entries.
         let mut hc = HashMap::new();
-        hc.insert((addr_a, 0), 1u32);
-        hc.insert((addr_b, 0), 1u32);
+        hc.insert((addr_a, (0, 1)), 1u32);
+        hc.insert((addr_b, (0, 1)), 1u32);
 
         assert!(fb.record(&hc));
         assert_eq!(fb.total_coverage(), 2);
 
         // A new bucket on only one address is still novel.
         let mut hc2 = HashMap::new();
-        hc2.insert((addr_a, 0), 10u32); // bucket changes: 1 → 16
-        hc2.insert((addr_b, 0), 1u32); // same bucket: 1
+        hc2.insert((addr_a, (0, 1)), 10u32); // bucket changes: 1 → 16
+        hc2.insert((addr_b, (0, 1)), 1u32); // same bucket: 1
         assert!(fb.record(&hc2));
         assert_eq!(fb.total_coverage(), 3, "one new bit from addr_a");
     }
@@ -445,16 +471,16 @@ mod tests {
         let addr = Address::ZERO;
         let mut cov = CoverageMap::new();
 
-        cov.record_hit(addr, 7);
+        cov.record_hit(addr, 7, 8);
         assert!(fb.record_from_coverage_map(&cov));
-        assert_eq!(fb.global_coverage().get(&(addr, 7)), Some(&1));
+        assert_eq!(fb.global_coverage().get(&(addr, (7, 8))), Some(&1));
 
-        cov.record_hit(addr, 7);
-        cov.record_hit(addr, 7);
+        cov.record_hit(addr, 7, 8);
+        cov.record_hit(addr, 7, 8);
         assert!(
             fb.record_from_coverage_map(&cov),
             "1 hit then 3 hits should cross into a new bucket"
         );
-        assert_eq!(fb.global_coverage().get(&(addr, 7)), Some(&3));
+        assert_eq!(fb.global_coverage().get(&(addr, (7, 8))), Some(&3));
     }
 }

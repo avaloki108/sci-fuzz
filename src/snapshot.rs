@@ -256,8 +256,8 @@ impl SnapshotCorpus {
     /// many snapshots include it.  A snapshot's score is the sum of
     /// `1.0 / count` over all its pairs, plus a baseline of `1.0`.
     fn novelty_scores(&self) -> Vec<f64> {
-        // Step 1 — count how many snapshots cover each (address, pc) pair.
-        let mut pair_counts: HashMap<(Address, usize), usize> = HashMap::new();
+        // Step 1 — count how many snapshots cover each (address, edge) pair.
+        let mut pair_counts: HashMap<(Address, (usize, usize)), usize> = HashMap::new();
         for snap in &self.snapshots {
             for (addr, pcs) in &snap.coverage.map {
                 for &pc in pcs.keys() {
@@ -294,11 +294,11 @@ mod tests {
 
     /// Helper — build a minimal snapshot whose coverage hits the given PCs
     /// at [`Address::ZERO`].
-    fn snapshot_with_pcs(pcs: &[usize]) -> StateSnapshot {
+    fn snapshot_with_pcs(pcs: &[(usize, usize)]) -> StateSnapshot {
         let mut snap = StateSnapshot::default();
         let addr = Address::ZERO;
-        for &pc in pcs {
-            snap.coverage.record_hit(addr, pc);
+        for &(prev, current) in pcs {
+            snap.coverage.record_hit(addr, prev, current);
         }
         snap
     }
@@ -309,11 +309,11 @@ mod tests {
         assert!(corpus.is_empty());
         assert_eq!(corpus.len(), 0);
 
-        let id0 = corpus.add(snapshot_with_pcs(&[0, 1]));
+        let id0 = corpus.add(snapshot_with_pcs(&[(0, 1), (1, 2)]));
         assert_eq!(corpus.len(), 1);
         assert!(!corpus.is_empty());
 
-        let id1 = corpus.add(snapshot_with_pcs(&[2, 3]));
+        let id1 = corpus.add(snapshot_with_pcs(&[(2, 3), (3, 4)]));
         assert_eq!(corpus.len(), 2);
         assert_ne!(id0, id1);
 
@@ -332,13 +332,13 @@ mod tests {
         let mut corpus = SnapshotCorpus::new(2);
 
         // Snap A: covers PCs 0, 1 (shared with B).
-        let _id_a = corpus.add(snapshot_with_pcs(&[0, 1]));
+        let _id_a = corpus.add(snapshot_with_pcs(&[(0, 1), (1, 2)]));
         // Snap B: covers PCs 0, 1 (identical to A — redundant).
-        let _id_b = corpus.add(snapshot_with_pcs(&[0, 1]));
+        let _id_b = corpus.add(snapshot_with_pcs(&[(0, 1), (1, 2)]));
         assert_eq!(corpus.len(), 2);
 
         // Snap C: covers PCs 10, 20 — completely novel.
-        let id_c = corpus.add(snapshot_with_pcs(&[10, 20]));
+        let id_c = corpus.add(snapshot_with_pcs(&[(10, 11), (20, 21)]));
 
         // After auto-prune the corpus should be back to 2 entries, and the
         // novel snapshot C must have survived.
@@ -353,13 +353,13 @@ mod tests {
     fn prune_keeps_metadata_in_sync() {
         let mut corpus = SnapshotCorpus::new(2);
 
-        let id_a = corpus.add(snapshot_with_pcs(&[0, 1]));
+        let id_a = corpus.add(snapshot_with_pcs(&[(0, 1), (1, 2)]));
         corpus.update_metadata(id_a, |m| m.calibrated = true);
 
-        let _id_b = corpus.add(snapshot_with_pcs(&[0, 1]));
+        let _id_b = corpus.add(snapshot_with_pcs(&[(0, 1), (1, 2)]));
 
         // Novel snapshot forces a prune.
-        let id_c = corpus.add(snapshot_with_pcs(&[10, 20]));
+        let id_c = corpus.add(snapshot_with_pcs(&[(10, 11), (20, 21)]));
         assert_eq!(corpus.len(), 2);
 
         // Metadata vec must stay in sync with snapshots vec.
@@ -378,9 +378,9 @@ mod tests {
     #[test]
     fn select_weighted_returns_valid_snapshot() {
         let mut corpus = SnapshotCorpus::new(8);
-        corpus.add(snapshot_with_pcs(&[0, 1, 2]));
-        corpus.add(snapshot_with_pcs(&[3, 4, 5]));
-        corpus.add(snapshot_with_pcs(&[6]));
+        corpus.add(snapshot_with_pcs(&[(0, 1), (1, 2), (2, 3)]));
+        corpus.add(snapshot_with_pcs(&[(3, 4), (4, 5), (5, 6)]));
+        corpus.add(snapshot_with_pcs(&[(6, 7)]));
 
         let mut rng = rand::thread_rng();
         for _ in 0..50 {
@@ -398,8 +398,8 @@ mod tests {
     #[test]
     fn update_metadata_modifies_correct_entry() {
         let mut corpus = SnapshotCorpus::new(8);
-        let id0 = corpus.add(snapshot_with_pcs(&[0]));
-        let id1 = corpus.add(snapshot_with_pcs(&[1]));
+        let id0 = corpus.add(snapshot_with_pcs(&[(0, 1)]));
+        let id1 = corpus.add(snapshot_with_pcs(&[(1, 2)]));
 
         corpus.update_metadata(id0, |m| {
             m.n_fuzz = 10;
@@ -428,7 +428,7 @@ mod tests {
     #[test]
     fn update_metadata_nonexistent_id_is_noop() {
         let mut corpus = SnapshotCorpus::new(8);
-        corpus.add(snapshot_with_pcs(&[0]));
+        corpus.add(snapshot_with_pcs(&[(0, 1)]));
 
         // Should not panic.
         corpus.update_metadata(9999, |m| {
@@ -439,7 +439,7 @@ mod tests {
     #[test]
     fn compute_energy_baseline() {
         let mut corpus = SnapshotCorpus::new(8);
-        corpus.add(snapshot_with_pcs(&[0, 1, 2]));
+        corpus.add(snapshot_with_pcs(&[(0, 1), (1, 2), (2, 3)]));
 
         // Default metadata: no n_fuzz, no new_bits, no depth, not
         // calibrated, no handicap.  Energy should equal pure novelty.
@@ -456,7 +456,7 @@ mod tests {
     #[test]
     fn compute_energy_calibration_bonus() {
         let mut corpus = SnapshotCorpus::new(8);
-        let id = corpus.add(snapshot_with_pcs(&[0, 1]));
+        let id = corpus.add(snapshot_with_pcs(&[(0, 1), (1, 2)]));
 
         let energy_before = corpus.compute_energy(0);
 
@@ -472,7 +472,7 @@ mod tests {
     #[test]
     fn compute_energy_n_fuzz_penalty() {
         let mut corpus = SnapshotCorpus::new(8);
-        let id = corpus.add(snapshot_with_pcs(&[0, 1]));
+        let id = corpus.add(snapshot_with_pcs(&[(0, 1), (1, 2)]));
 
         let energy_fresh = corpus.compute_energy(0);
 
@@ -494,7 +494,7 @@ mod tests {
     #[test]
     fn compute_energy_depth_bonus() {
         let mut corpus = SnapshotCorpus::new(8);
-        let id = corpus.add(snapshot_with_pcs(&[0]));
+        let id = corpus.add(snapshot_with_pcs(&[(0, 1)]));
 
         let energy_shallow = corpus.compute_energy(0);
 
@@ -511,7 +511,7 @@ mod tests {
     #[test]
     fn compute_energy_handicap_penalty() {
         let mut corpus = SnapshotCorpus::new(8);
-        let id = corpus.add(snapshot_with_pcs(&[0]));
+        let id = corpus.add(snapshot_with_pcs(&[(0, 1)]));
 
         let energy_base = corpus.compute_energy(0);
 
@@ -529,7 +529,7 @@ mod tests {
     #[test]
     fn compute_energy_new_bits_boost() {
         let mut corpus = SnapshotCorpus::new(8);
-        let id = corpus.add(snapshot_with_pcs(&[0]));
+        let id = corpus.add(snapshot_with_pcs(&[(0, 1)]));
 
         let energy_base = corpus.compute_energy(0);
 
@@ -576,9 +576,9 @@ mod tests {
     #[test]
     fn add_always_pushes_default_metadata() {
         let mut corpus = SnapshotCorpus::new(16);
-        corpus.add(snapshot_with_pcs(&[0]));
-        corpus.add(snapshot_with_pcs(&[1]));
-        corpus.add(snapshot_with_pcs(&[2]));
+        corpus.add(snapshot_with_pcs(&[(0, 1)]));
+        corpus.add(snapshot_with_pcs(&[(1, 2)]));
+        corpus.add(snapshot_with_pcs(&[(2, 3)]));
 
         assert_eq!(corpus.metadata.len(), 3);
         for meta in &corpus.metadata {
@@ -592,8 +592,8 @@ mod tests {
         let mut corpus = SnapshotCorpus::new(8);
 
         // Two snapshots with identical coverage.
-        let id_a = corpus.add(snapshot_with_pcs(&[0, 1]));
-        let id_b = corpus.add(snapshot_with_pcs(&[2, 3]));
+        let id_a = corpus.add(snapshot_with_pcs(&[(0, 1), (1, 2)]));
+        let id_b = corpus.add(snapshot_with_pcs(&[(2, 3), (3, 4)]));
 
         // Mark only B as calibrated (2× energy boost).
         corpus.update_metadata(id_b, |m| m.calibrated = true);

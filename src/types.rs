@@ -84,6 +84,8 @@ pub struct ExecutionResult {
     pub logs: Vec<Log>,
     /// Real EVM instruction hitcounts collected during this execution.
     pub coverage: CoverageMap,
+    /// Dataflow waypoints reached during execution.
+    pub dataflow: DataflowWaypoints,
     /// Storage & balance mutations caused by this execution.
     pub state_diff: StateDiff,
 }
@@ -96,6 +98,7 @@ impl Default for ExecutionResult {
             gas_used: 0,
             logs: Vec::new(),
             coverage: CoverageMap::new(),
+            dataflow: DataflowWaypoints::new(),
             state_diff: StateDiff::default(),
         }
     }
@@ -154,6 +157,8 @@ pub struct StateSnapshot {
     pub timestamp: u64,
     /// Cumulative code coverage at this point.
     pub coverage: CoverageMap,
+    /// Dataflow waypoints reached across this snapshot's history.
+    pub dataflow: DataflowWaypoints,
 }
 
 impl Default for StateSnapshot {
@@ -166,6 +171,7 @@ impl Default for StateSnapshot {
             block_number: 0,
             timestamp: 0,
             coverage: CoverageMap::new(),
+            dataflow: DataflowWaypoints::new(),
         }
     }
 }
@@ -173,10 +179,46 @@ impl Default for StateSnapshot {
 // ── Coverage Map ─────────────────────────────────────────────────────────────
 
 /// Tracks real EVM instruction hitcounts for each contract address.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub struct CoverageMap {
-    /// contract address → program counter → raw hitcount.
-    pub map: HashMap<Address, HashMap<usize, u32>>,
+    /// contract address → (prev_pc, current_pc) edge → raw hitcount.
+    pub map: HashMap<Address, HashMap<(usize, usize), u32>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CoverageMapShadow {
+    map: HashMap<Address, Vec<((usize, usize), u32)>>,
+}
+
+impl Serialize for CoverageMap {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut shadow = CoverageMapShadow {
+            map: HashMap::new(),
+        };
+        for (addr, edges) in &self.map {
+            let vec: Vec<_> = edges.iter().map(|(&k, &v)| (k, v)).collect();
+            shadow.map.insert(*addr, vec);
+        }
+        shadow.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for CoverageMap {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let shadow = CoverageMapShadow::deserialize(deserializer)?;
+        let mut map = HashMap::new();
+        for (addr, vec) in shadow.map {
+            let inner_map: HashMap<_, _> = vec.into_iter().collect();
+            map.insert(addr, inner_map);
+        }
+        Ok(CoverageMap { map })
+    }
 }
 
 impl CoverageMap {
@@ -187,33 +229,33 @@ impl CoverageMap {
         }
     }
 
-    /// Record a single instruction hit.
-    pub fn record_hit(&mut self, address: Address, pc: usize) {
-        self.record_hitcount(address, pc, 1);
+    /// Record a single instruction edge hit.
+    pub fn record_hit(&mut self, address: Address, prev_pc: usize, current_pc: usize) {
+        self.record_hitcount(address, prev_pc, current_pc, 1);
     }
 
-    /// Record `count` hits for a single `(address, pc)` pair.
-    pub fn record_hitcount(&mut self, address: Address, pc: usize, count: u32) {
+    /// Record `count` hits for a single `(prev_pc, current_pc)` pair.
+    pub fn record_hitcount(&mut self, address: Address, prev_pc: usize, current_pc: usize, count: u32) {
         if count == 0 {
             return;
         }
 
-        let entry = self.map.entry(address).or_default().entry(pc).or_insert(0);
+        let entry = self.map.entry(address).or_default().entry((prev_pc, current_pc)).or_insert(0);
         *entry = entry.saturating_add(count);
     }
 
     /// Merge all coverage from `other` into `self`.
     pub fn merge(&mut self, other: &CoverageMap) {
-        for (addr, pcs) in &other.map {
+        for (addr, edges) in &other.map {
             let dst = self.map.entry(*addr).or_default();
-            for (&pc, &count) in pcs {
-                let entry = dst.entry(pc).or_insert(0);
+            for (&edge, &count) in edges {
+                let entry = dst.entry(edge).or_insert(0);
                 *entry = entry.saturating_add(count);
             }
         }
     }
 
-    /// Total number of unique (address, pc) pairs covered.
+    /// Total number of unique (address, edge) pairs covered.
     pub fn len(&self) -> usize {
         self.map.values().map(|s| s.len()).sum()
     }
@@ -223,27 +265,87 @@ impl CoverageMap {
         self.map.values().all(|s| s.is_empty())
     }
 
-    /// Return the raw hitcount for `(address, pc)`, or `0` if unseen.
-    pub fn hitcount(&self, address: Address, pc: usize) -> u32 {
+    /// Return the raw hitcount for `(address, prev_pc, current_pc)`, or `0` if unseen.
+    pub fn hitcount(&self, address: Address, prev_pc: usize, current_pc: usize) -> u32 {
         self.map
             .get(&address)
-            .and_then(|pcs| pcs.get(&pc))
+            .and_then(|edges| edges.get(&(prev_pc, current_pc)))
             .copied()
             .unwrap_or(0)
     }
 
-    /// Returns `true` if `other` contains at least one (address, pc) pair
+    /// Returns `true` if `other` contains at least one (address, edge) pair
     /// that is **not** present in `self`.
     pub fn has_new_coverage(&self, other: &CoverageMap) -> bool {
-        for (addr, pcs) in &other.map {
+        for (addr, edges) in &other.map {
             match self.map.get(addr) {
                 None => {
-                    if !pcs.is_empty() {
+                    if !edges.is_empty() {
                         return true;
                     }
                 }
                 Some(existing) => {
-                    if pcs.keys().any(|pc| !existing.contains_key(pc)) {
+                    if edges.keys().any(|edge| !existing.contains_key(edge)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+
+// ── Dataflow Waypoints ───────────────────────────────────────────────────────
+
+/// Tracks which storage slots have been accessed (dataflow waypoints).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DataflowWaypoints {
+    /// contract address -> set of accessed slot keys
+    pub map: HashMap<Address, std::collections::HashSet<U256>>,
+}
+
+impl DataflowWaypoints {
+    /// Create an empty dataflow waypoints tracker.
+    pub fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+        }
+    }
+
+    /// Record a storage slot access.
+    pub fn record_access(&mut self, address: Address, slot: U256) {
+        self.map.entry(address).or_default().insert(slot);
+    }
+
+    /// Merge all waypoints from `other` into `self`.
+    pub fn merge(&mut self, other: &DataflowWaypoints) {
+        for (addr, slots) in &other.map {
+            self.map.entry(*addr).or_default().extend(slots);
+        }
+    }
+
+    /// Total number of unique (address, slot) pairs accessed.
+    pub fn len(&self) -> usize {
+        self.map.values().map(|s| s.len()).sum()
+    }
+
+    /// Returns `true` when no waypoints have been recorded.
+    pub fn is_empty(&self) -> bool {
+        self.map.values().all(|s| s.is_empty())
+    }
+
+    /// Returns `true` if `other` contains at least one (address, slot)
+    /// that is **not** present in `self`.
+    pub fn has_new_waypoints(&self, other: &DataflowWaypoints) -> bool {
+        for (addr, slots) in &other.map {
+            match self.map.get(addr) {
+                None => {
+                    if !slots.is_empty() {
+                        return true;
+                    }
+                }
+                Some(existing) => {
+                    if slots.iter().any(|slot| !existing.contains(slot)) {
                         return true;
                     }
                 }
@@ -451,15 +553,15 @@ mod tests {
         assert_eq!(a.len(), 0);
 
         let addr = Address::ZERO;
-        a.record_hit(addr, 0);
-        a.record_hit(addr, 42);
+        a.record_hit(addr, 0, 1);
+        a.record_hit(addr, 42, 43);
         assert_eq!(a.len(), 2);
         assert!(!a.is_empty());
 
-        // Duplicate hit does not increase the number of covered PCs.
-        a.record_hit(addr, 42);
+        // Duplicate hit does not increase the number of covered edges.
+        a.record_hit(addr, 42, 43);
         assert_eq!(a.len(), 2);
-        assert_eq!(a.hitcount(addr, 42), 2);
+        assert_eq!(a.hitcount(addr, 42, 43), 2);
     }
 
     #[test]
@@ -467,15 +569,15 @@ mod tests {
         let addr = Address::ZERO;
 
         let mut a = CoverageMap::new();
-        a.record_hit(addr, 0);
+        a.record_hit(addr, 0, 1);
 
         let mut b = CoverageMap::new();
-        b.record_hit(addr, 1);
-        b.record_hit(addr, 0);
+        b.record_hit(addr, 1, 2);
+        b.record_hit(addr, 0, 1);
 
         a.merge(&b);
         assert_eq!(a.len(), 2);
-        assert_eq!(a.hitcount(addr, 0), 2);
+        assert_eq!(a.hitcount(addr, 0, 1), 2);
     }
 
     #[test]
@@ -483,18 +585,18 @@ mod tests {
         let addr = Address::ZERO;
 
         let mut base = CoverageMap::new();
-        base.record_hit(addr, 0);
-        base.record_hit(addr, 1);
+        base.record_hit(addr, 0, 1);
+        base.record_hit(addr, 1, 2);
 
         // Subset — no new coverage.
         let mut subset = CoverageMap::new();
-        subset.record_hit(addr, 0);
+        subset.record_hit(addr, 0, 1);
         assert!(!base.has_new_coverage(&subset));
 
         // Superset — has new coverage.
         let mut superset = CoverageMap::new();
-        superset.record_hit(addr, 0);
-        superset.record_hit(addr, 99);
+        superset.record_hit(addr, 0, 1);
+        superset.record_hit(addr, 99, 100);
         assert!(base.has_new_coverage(&superset));
     }
 
@@ -533,8 +635,8 @@ mod tests {
     fn coverage_map_serde_roundtrip() {
         let addr = Address::ZERO;
         let mut cm = CoverageMap::new();
-        cm.record_hit(addr, 10);
-        cm.record_hit(addr, 20);
+        cm.record_hit(addr, 10, 11);
+        cm.record_hit(addr, 20, 21);
 
         let json = serde_json::to_string(&cm).expect("serialize");
         let restored: CoverageMap = serde_json::from_str(&json).expect("deserialize");

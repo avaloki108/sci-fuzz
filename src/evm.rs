@@ -54,6 +54,8 @@ pub enum ExecutorMode {
 #[derive(Debug, Clone, Default)]
 struct CoverageInspector {
     coverage: CoverageMap,
+    prev_pc: Option<usize>,
+    dataflow: crate::types::DataflowWaypoints,
 }
 
 impl<DB: Database> Inspector<DB> for CoverageInspector {
@@ -62,7 +64,20 @@ impl<DB: Database> Inspector<DB> for CoverageInspector {
             .contract
             .bytecode_address
             .unwrap_or(interp.contract.target_address);
-        self.coverage.record_hit(address, interp.program_counter());
+        
+        let current_pc = interp.program_counter();
+        let prev = self.prev_pc.unwrap_or(current_pc);
+        
+        self.coverage.record_hit(address, prev, current_pc);
+        self.prev_pc = Some(current_pc);
+
+        let op = interp.current_opcode();
+        if op == revm::interpreter::opcode::SLOAD || op == revm::interpreter::opcode::SSTORE {
+            let target_address = interp.contract.target_address;
+            if let Ok(top) = interp.stack().peek(0) {
+                self.dataflow.record_access(target_address, top);
+            }
+        }
     }
 }
 
@@ -109,6 +124,13 @@ impl EvmExecutor {
     /// State changes are committed to the inner database on success *and*
     /// revert (the revert data is still captured in the result).
     pub fn execute(&mut self, tx: &Transaction) -> Result<ExecutionResult> {
+        // Intercept flashloan mock calls
+        if let Some(to) = tx.to {
+            if to == crate::flashloan::MOCK_FLASHLOAN_POOL {
+                return self.execute_mock_flashloan(tx);
+            }
+        }
+
         // Snapshot balances *before* execution so we can compute diffs later.
         let pre_balances = self.snapshot_balances();
 
@@ -152,14 +174,56 @@ impl EvmExecutor {
             .transact()
             .map_err(|e| anyhow!("EVM transact error: {e:?}"))?;
         let coverage = evm.context.external.coverage.clone();
+        let dataflow = evm.context.external.dataflow.clone();
 
         // Commit state changes into the CacheDB.
         drop(evm); // release mutable borrow on self.db
         self.db.commit(state.clone());
 
         // Convert the revm result into our own type.
-        let exec_result = self.convert_result(&result, &state, &pre_balances, coverage)?;
+        let exec_result = self.convert_result(&result, &state, &pre_balances, coverage, dataflow)?;
         Ok(exec_result)
+    }
+
+    /// Simulate a mock flashloan `borrow` or `repay` interaction natively.
+    fn execute_mock_flashloan(&mut self, tx: &Transaction) -> Result<ExecutionResult> {
+        if tx.data.len() < 36 {
+            return Ok(ExecutionResult::default());
+        }
+
+        let sel = &tx.data[..4];
+        let amount = U256::from_be_slice(&tx.data[4..36]);
+        let pre_balances = self.snapshot_balances();
+        let mut balance_changes = HashMap::new();
+
+        if sel == crate::flashloan::BORROW_SELECTOR {
+            let old = self.get_balance(tx.sender);
+            let new = old.saturating_add(amount);
+            self.set_balance(tx.sender, new);
+            balance_changes.insert(tx.sender, (old, new));
+        } else if sel == crate::flashloan::REPAY_SELECTOR {
+            let old = self.get_balance(tx.sender);
+            if old < amount {
+                return Ok(ExecutionResult {
+                    success: false,
+                    ..Default::default()
+                });
+            }
+            let new = old - amount;
+            self.set_balance(tx.sender, new);
+            balance_changes.insert(tx.sender, (old, new));
+        } else {
+            return Ok(ExecutionResult::default());
+        }
+
+        Ok(ExecutionResult {
+            success: true,
+            state_diff: crate::types::StateDiff {
+                storage_writes: HashMap::new(),
+                balance_changes,
+            },
+            ..Default::default()
+        })
     }
 
     // -- Contract deployment ------------------------------------------------
@@ -348,6 +412,7 @@ impl EvmExecutor {
         state: &revm::primitives::EvmState,
         pre_balances: &HashMap<Address, U256>,
         coverage: CoverageMap,
+        dataflow: crate::types::DataflowWaypoints,
     ) -> Result<ExecutionResult> {
         let (success, gas_used, output, logs) = match result {
             RevmResult::Success {
@@ -387,6 +452,7 @@ impl EvmExecutor {
             gas_used,
             logs: our_logs,
             coverage,
+            dataflow,
             state_diff,
         })
     }
@@ -842,11 +908,11 @@ mod tests {
             })
             .expect("non-zero-value call should execute");
 
-        assert_eq!(zero_value.coverage.hitcount(target, 7), 0);
-        assert!(zero_value.coverage.hitcount(target, 14) > 0);
+        assert_eq!(zero_value.coverage.hitcount(target, 6, 7), 0);
+        assert!(zero_value.coverage.hitcount(target, 6, 14) > 0);
 
-        assert!(nonzero_value.coverage.hitcount(target, 7) > 0);
-        assert!(nonzero_value.coverage.hitcount(target, 9) > 0);
+        assert!(nonzero_value.coverage.hitcount(target, 6, 7) > 0);
+        assert!(nonzero_value.coverage.hitcount(target, 7, 9) > 0);
     }
 
     #[test]
@@ -901,8 +967,8 @@ mod tests {
             })
             .expect("4-iteration loop should execute");
 
-        assert_eq!(one_iteration.coverage.hitcount(target, 1), 2);
-        assert_eq!(four_iterations.coverage.hitcount(target, 1), 5);
+        assert_eq!(one_iteration.coverage.hitcount(target, 13, 1), 1);
+        assert_eq!(four_iterations.coverage.hitcount(target, 13, 1), 4);
 
         let mut feedback = CoverageFeedback::new();
         assert!(feedback.record_from_coverage_map(&one_iteration.coverage));
