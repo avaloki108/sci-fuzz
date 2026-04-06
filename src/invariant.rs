@@ -1161,6 +1161,15 @@ impl InvariantRegistry {
         Self::with_defaults_and_profiles(attacker, None)
     }
 
+    /// Assertion-mode registry: only registers EchidnaProperty and UnexpectedRevert.
+    /// Used when `TestMode::Assertion` is active to suppress economic oracle noise.
+    pub fn with_assertion_mode(attacker: Address) -> Self {
+        let mut reg = Self::new();
+        reg.add(Box::new(UnexpectedRevert::default()));
+        reg.add(Box::new(EchidnaProperty));
+        reg
+    }
+
     /// Like [`Self::with_defaults`] but attaches optional ABI-derived protocol profiles for economic triage and gating.
     pub fn with_defaults_and_profiles(
         attacker: Address,
@@ -1452,8 +1461,8 @@ mod tests {
         // UniswapV2StyleSwapReserve, AmmSyncExplained, Erc4626PreviewVsDepositEvent,
         // UniswapV2StyleSyncVsGetReserves, Erc4626RateJumpWithoutTokenFlow,
         // Erc4626DepositVsUnderlyingTransfer, Erc4626FirstDepositorInflation,
-        // ReentrancyOracle, LendingHealthOracle (21 total)
-        assert_eq!(reg.len(), 21);
+        // ReentrancyOracle, LendingHealthOracle (22 total)
+        assert_eq!(reg.len(), 22);
         assert!(!reg.is_empty());
     }
 
@@ -1642,8 +1651,8 @@ mod tests {
         let attacker = Address::repeat_byte(0x99);
         let tokens = vec![Address::repeat_byte(0xA1), Address::repeat_byte(0xA2)];
         let reg = InvariantRegistry::with_erc20(attacker, &tokens);
-        // 21 defaults + 2 ERC20Supply invariants
-        assert_eq!(reg.len(), 23);
+        // 22 defaults + 2 ERC20Supply invariants
+        assert_eq!(reg.len(), 24);
     }
 
     // -- EchidnaPropertyCaller tests ------------------------------------------

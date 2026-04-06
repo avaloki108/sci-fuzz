@@ -1,8 +1,8 @@
 //! Output formatters for sci-fuzz findings.
 //!
-//! Provides SARIF 2.1, JUnit XML, and Forge reproducer output for CI
-//! integration.  All formatters are pure functions that take a slice of
-//! [`Finding`]s and return a `String`.
+//! Provides SARIF 2.1, JUnit XML, Forge reproducer, and rich text output
+//! for terminal display and CI integration.  All formatters are pure
+//! functions that take a slice of [`Finding`]s and return a `String`.
 
 use crate::types::{Finding, Severity, U256};
 

@@ -559,8 +559,12 @@ fn biased_token_amount(dict: &ValueDictionary, rng: &mut impl Rng) -> U256 {
 pub struct TxMutator {
     /// Known contract targets.
     targets: Vec<ContractInfo>,
+    /// Per-target call weight (aligned with `targets`; default 1).
+    target_weights: Vec<u32>,
     /// Known four-byte function selectors extracted from ABIs.
     selectors: Vec<[u8; 4]>,
+    /// Per-selector call weight (aligned with `selectors`; default 1).
+    selector_weights: Vec<u32>,
     /// Parameter types for each known selector (from ABI) — plain type strings.
     selector_params: HashMap<[u8; 4], Vec<String>>,
     /// Full ABI input objects for each selector (preserves `name`, `components`
@@ -639,15 +643,43 @@ impl TxMutator {
             address_pool.push(Address::ZERO);
         }
 
+        let targets_len = targets.len();
+        let sel_len = selectors.len();
+
         Self {
             targets,
+            target_weights: vec![1u32; targets_len],
             selectors,
+            selector_weights: vec![1u32; sel_len],
             selector_params,
             selector_full_params,
             payable_selectors,
             address_pool,
             dict,
         }
+    }
+
+    /// Like [`Self::new`] but applies per-address target weights and per-selector
+    /// weights from the campaign config.  Used for system-mode campaigns.
+    pub fn new_with_weights(
+        targets: Vec<ContractInfo>,
+        target_weight_map: &std::collections::HashMap<crate::types::Address, u32>,
+        selector_weight_map: &std::collections::HashMap<[u8; 4], u32>,
+    ) -> Self {
+        let mut m = Self::new(targets);
+        // Apply target weights.
+        for (i, t) in m.targets.iter().enumerate() {
+            if let Some(&w) = target_weight_map.get(&t.address) {
+                m.target_weights[i] = w.max(1);
+            }
+        }
+        // Apply selector weights.
+        for (i, sel) in m.selectors.iter().enumerate() {
+            if let Some(&w) = selector_weight_map.get(sel) {
+                m.selector_weights[i] = w.max(1);
+            }
+        }
+        m
     }
 
     /// Generate a completely random transaction targeting one of the known
@@ -816,7 +848,19 @@ impl TxMutator {
         if self.targets.is_empty() {
             return Address::ZERO;
         }
-        self.targets[rng.gen_range(0..self.targets.len())].address
+        // Weighted selection: sum weights, pick a random bucket.
+        let total: u32 = self.target_weights.iter().sum();
+        if total == 0 {
+            return self.targets[rng.gen_range(0..self.targets.len())].address;
+        }
+        let mut pick = rng.gen_range(0..total);
+        for (i, &w) in self.target_weights.iter().enumerate() {
+            if pick < w {
+                return self.targets[i].address;
+            }
+            pick -= w;
+        }
+        self.targets.last().unwrap().address
     }
 
     /// Pick a random sender — biased toward the address pool but
@@ -867,7 +911,22 @@ impl TxMutator {
                 let payable: Vec<[u8; 4]> = self.payable_selectors.iter().copied().collect();
                 payable[rng.gen_range(0..payable.len())]
             } else {
-                self.selectors[rng.gen_range(0..self.selectors.len())]
+                // Weighted selector pick.
+                let total: u32 = self.selector_weights.iter().sum();
+                if total == 0 {
+                    self.selectors[rng.gen_range(0..self.selectors.len())]
+                } else {
+                    let mut pick = rng.gen_range(0..total);
+                    let mut chosen = *self.selectors.last().unwrap();
+                    for (i, &w) in self.selector_weights.iter().enumerate() {
+                        if pick < w {
+                            chosen = self.selectors[i];
+                            break;
+                        }
+                        pick -= w;
+                    }
+                    chosen
+                }
             };
             let mut buf = sel.to_vec();
 
@@ -1168,6 +1227,8 @@ mod tests {
             creation_bytecode: None,
             name: Some("Vault".into()),
             source_path: None,
+            deployed_source_map: None,
+            source_file_list: vec![],
             abi: Some(abi),
         }];
 
@@ -1248,6 +1309,8 @@ mod tests {
             creation_bytecode: None,
             name: Some("Token".into()),
             source_path: None,
+            deployed_source_map: None,
+            source_file_list: vec![],
             abi: Some(abi),
         }];
 

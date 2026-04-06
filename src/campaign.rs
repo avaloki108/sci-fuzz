@@ -27,7 +27,7 @@ use crate::shrinker::SequenceShrinker;
 use crate::snapshot::SnapshotCorpus;
 use crate::types::{
     contract_info_for_mutator, Address, Bytes, CampaignConfig, ContractInfo, CoverageMap, Finding,
-    StateSnapshot, Transaction, B256, U256,
+    StateSnapshot, TestMode, Transaction, B256, U256,
 };
 
 /// ABI function names excluded from fuzzing (harness lifecycle; setup runs once at bootstrap).
@@ -102,10 +102,15 @@ pub struct CampaignFindingRecord {
 /// Structured outcome of one campaign run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CampaignReport {
+    /// Testing mode used for this campaign.
+    pub test_mode: TestMode,
     /// Unique stored findings and their benchmark metadata.
     pub findings: Vec<CampaignFindingRecord>,
     /// Total EVM executions completed during the run.
     pub total_execs: u64,
+    /// Aggregated coverage map from the entire campaign.
+    #[serde(default, skip_serializing_if = "crate::types::CoverageMap::is_empty")]
+    pub aggregate_coverage: crate::types::CoverageMap,
     /// Total wall-clock runtime in milliseconds.
     pub elapsed_ms: u64,
     /// Execution count for the first observed finding, if any.
@@ -140,8 +145,120 @@ impl Campaign {
         Ok(self.run_with_report()?.into_findings())
     }
 
+    /// Replay a fixed transaction sequence and return any findings.
+    ///
+    /// Sets up the EVM executor and deploys target contracts (same as the
+    /// normal campaign path) then executes each transaction in `sequence`
+    /// in order, running the oracle after every step.  Returns any
+    /// invariant violations detected.
+    ///
+    /// This is used by the `replay` CLI subcommand to confirm that a
+    /// previously serialized finding still triggers.
+    pub fn replay_sequence(&mut self, sequence: &[Transaction]) -> anyhow::Result<Vec<Finding>> {
+        // --- Executor setup (mirrors run_with_report) ----------------------
+        let mut executor = if let Some(ref url) = self.config.rpc_url {
+            let url = url.trim();
+            let rpc_db = crate::rpc::RpcCacheDB::new(url, self.config.rpc_block_number)?;
+            EvmExecutor::new_with_db(FuzzerDatabase::Rpc(rpc_db))
+        } else {
+            EvmExecutor::new()
+        };
+        executor.set_mode(self.config.mode);
+
+        let attacker = self.config.resolved_attacker();
+        if self.config.rpc_url.is_some() {
+            executor.set_balance(attacker, self.config.fork_attacker_balance_wei);
+        } else {
+            executor.set_balance(attacker, U256::from(100_000_000_000_000_000_000_u128));
+        }
+
+        // --- Deploy targets -----------------------------------------------
+        let mut deployed_targets: Vec<ContractInfo> = Vec::new();
+        for target in &self.config.targets {
+            let deployment_bytecode = target
+                .creation_bytecode
+                .clone()
+                .filter(|c| !c.is_empty())
+                .unwrap_or_else(|| target.deployed_bytecode.clone());
+
+            if !deployment_bytecode.is_empty() {
+                match executor.deploy(attacker, deployment_bytecode) {
+                    Ok(addr) => deployed_targets.push(ContractInfo {
+                        address: addr,
+                        deployed_bytecode: target.deployed_bytecode.clone(),
+                        creation_bytecode: target.creation_bytecode.clone(),
+                        name: target.name.clone(),
+                        source_path: target.source_path.clone(),
+                        deployed_source_map: target.deployed_source_map.clone(),
+                        source_file_list: target.source_file_list.clone(),
+                        abi: target.abi.clone(),
+                    }),
+                    Err(e) => eprintln!("[replay] skipping target — deploy failed: {e}"),
+                }
+            } else {
+                deployed_targets.push(target.clone());
+            }
+        }
+
+        // --- Oracle setup -------------------------------------------------
+        let protocol_profiles =
+            crate::protocol_semantics::build_protocol_profiles(&deployed_targets);
+        let oracle = match self.config.test_mode {
+            TestMode::Exploration => OracleEngine::empty(attacker),
+            TestMode::Assertion => OracleEngine::new_assertion_mode(attacker),
+            _ => OracleEngine::new_with_protocol_profiles(
+                attacker,
+                Some(Arc::clone(&protocol_profiles)),
+            ),
+        };
+
+        // --- Execute sequence and collect violations ----------------------
+        let mut findings: Vec<Finding> = Vec::new();
+        let target_abis: HashMap<Address, JsonAbi> = deployed_targets
+            .iter()
+            .filter_map(|t| {
+                t.abi
+                    .clone()
+                    .and_then(|v| serde_json::from_value(v).ok())
+                    .map(|abi| (t.address, abi))
+            })
+            .collect();
+        let pre_probes = crate::protocol_probes::capture_pre_sequence_probes(
+            &executor,
+            attacker,
+            &protocol_profiles,
+            &target_abis,
+            sequence,
+        );
+        let pre_balances = capture_eth_baseline(&executor, attacker);
+        let mut cumulative_sequence: Vec<Transaction> = Vec::new();
+
+        for tx in sequence {
+            let mut result = match executor.execute(tx) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("[replay] tx execution error: {e}");
+                    continue;
+                }
+            };
+            cumulative_sequence.push(tx.clone());
+            result.sequence_cumulative_logs = result.logs.clone();
+
+            let new_findings = oracle.check(
+                &pre_balances,
+                &pre_probes,
+                &result,
+                &cumulative_sequence,
+            );
+            findings.extend(new_findings);
+        }
+
+        Ok(findings)
+    }
+
     /// Run the fuzzing loop and return both findings and execution metrics.
     pub fn run_with_report(&mut self) -> anyhow::Result<CampaignReport> {
+        // NOTE: replay_sequence() is defined above if you need a no-fuzz reproducer path.
         let effective_workers = effective_worker_count(self.config.workers, &self.config.rpc_url);
         if self.config.rpc_url.is_some() && self.config.workers > 1 {
             eprintln!(
@@ -304,6 +421,8 @@ impl Campaign {
                             creation_bytecode: target.creation_bytecode.clone(),
                             name: target.name.clone(),
                             source_path: target.source_path.clone(),
+                            deployed_source_map: target.deployed_source_map.clone(),
+                            source_file_list: target.source_file_list.clone(),
                             abi: target.abi.clone(),
                         });
                     }
@@ -340,6 +459,8 @@ impl Campaign {
                 creation_bytecode: harness.creation_bytecode.clone(),
                 name: harness.name.clone(),
                 source_path: harness.source_path.clone(),
+                deployed_source_map: harness.deployed_source_map.clone(),
+                source_file_list: harness.source_file_list.clone(),
                 abi: harness.abi.clone(),
             });
 
@@ -396,14 +517,65 @@ impl Campaign {
             .iter()
             .map(|c| contract_info_for_mutator(c, STRIP_HARNESS_LIFECYCLE))
             .collect();
-        let mut mutator = TxMutator::new(mutator_targets);
+        let mut mutator = if self.config.system_mode
+            || !self.config.target_weights.is_empty()
+            || !self.config.selector_weights.is_empty()
+        {
+            TxMutator::new_with_weights(
+                mutator_targets,
+                &self.config.target_weights,
+                &self.config.selector_weights,
+            )
+        } else {
+            TxMutator::new(mutator_targets)
+        };
         mutator.add_to_address_pool(attacker);
+
+        // Fund and register extra senders (multi-actor system-level fuzzing).
+        for &extra in &self.config.extra_senders {
+            executor.set_balance(extra, self.config.sender_balance_wei);
+            mutator.add_to_address_pool(extra);
+            eprintln!(
+                "[campaign] extra sender {extra:#x} funded with {} wei",
+                self.config.sender_balance_wei
+            );
+        }
         let protocol_profiles =
             crate::protocol_semantics::build_protocol_profiles(&deployed_targets);
-        let oracle = OracleEngine::new_with_protocol_profiles(
-            attacker,
-            Some(Arc::clone(&protocol_profiles)),
-        );
+        let mut oracle = match self.config.test_mode {
+            TestMode::Exploration => OracleEngine::empty(attacker),
+            TestMode::Assertion => OracleEngine::new_assertion_mode(attacker),
+            TestMode::Property | TestMode::FoundryInvariant | TestMode::Optimization => {
+                OracleEngine::new_with_protocol_profiles(
+                    attacker,
+                    Some(Arc::clone(&protocol_profiles)),
+                )
+            }
+        };
+
+        // --- ABI-inferred invariants (Phase 6) ------------------------------
+        if self.config.infer_invariants {
+            let deployer = self
+                .config
+                .attacker_address
+                .unwrap_or_else(|| attacker);
+            let synth = crate::inferred_invariants::SynthesizedInvariants::synthesize(
+                &deployed_targets,
+                attacker,
+                deployer,
+            );
+            let count = synth.invariants.len();
+            if count > 0 {
+                oracle.extend_invariants(synth.invariants);
+                eprintln!(
+                    "[campaign] synthesized {} ABI-inferred invariant(s):",
+                    count
+                );
+                for desc in &synth.descriptions {
+                    eprintln!("  ↳ {desc}");
+                }
+            }
+        }
 
         // --- Build Echidna property callers at deployed addresses -----------
         let mut property_callers: Vec<EchidnaPropertyCaller> = Vec::new();
@@ -561,6 +733,7 @@ impl Campaign {
                 protocol_profiles,
                 attacker,
                 effective_workers,
+                deployed_targets,
             );
         }
 
@@ -986,20 +1159,33 @@ impl Campaign {
             "campaign finished",
         );
 
-        // Persist the sequence corpus for the next run.
+        let aggregate_coverage = coverage_map_from_global(feedback.global_coverage());
+
+        // Persist the sequence corpus and findings for the next run.
         if let Some(ref dir) = self.config.corpus_dir {
             save_corpus_to_dir(&seq_corpus, dir);
+            save_findings_to_dir(&findings, dir);
         }
 
-        Ok(CampaignReport {
+        let report = CampaignReport {
+            test_mode: self.config.test_mode,
             deduped_finding_count: findings.len(),
             elapsed_ms: elapsed.as_millis() as u64,
             finding_count,
-            findings,
+            findings: findings.clone(),
             first_hit_execs,
             first_hit_time_ms,
             total_execs,
-        })
+            aggregate_coverage: aggregate_coverage.clone(),
+        };
+
+        // Persist campaign report and source coverage.
+        if let Some(ref dir) = self.config.corpus_dir {
+            save_campaign_report_to_dir(&report, dir);
+            save_source_coverage_to_dir(&aggregate_coverage, &deployed_targets, dir);
+        }
+
+        Ok(report)
     }
 }
 
@@ -1013,6 +1199,7 @@ fn run_parallel_campaign(
     protocol_profiles: ProtocolProfileMap,
     attacker: Address,
     worker_count: usize,
+    deployed_targets: Vec<ContractInfo>,
 ) -> anyhow::Result<CampaignReport> {
     let shared = Arc::new(Mutex::new(inner));
     let total_execs = Arc::new(AtomicU64::new(0));
@@ -1071,17 +1258,29 @@ fn run_parallel_campaign(
 
     if let Some(ref dir) = config.corpus_dir {
         save_corpus_to_dir(&inner.seq_corpus, dir);
+        save_findings_to_dir(&inner.findings, dir);
     }
 
-    Ok(CampaignReport {
+    let aggregate_coverage = coverage_map_from_global(inner.feedback.global_coverage());
+
+    let report = CampaignReport {
+        test_mode: config.test_mode,
         deduped_finding_count: inner.findings.len(),
         elapsed_ms: elapsed.as_millis() as u64,
         finding_count: inner.finding_count,
-        findings: inner.findings,
+        findings: inner.findings.clone(),
         first_hit_execs: inner.first_hit_execs,
         first_hit_time_ms: inner.first_hit_time_ms,
         total_execs: total_execs_u64,
-    })
+        aggregate_coverage: aggregate_coverage.clone(),
+    };
+
+    if let Some(ref dir) = config.corpus_dir {
+        save_campaign_report_to_dir(&report, dir);
+        save_source_coverage_to_dir(&aggregate_coverage, &deployed_targets, dir);
+    }
+
+    Ok(report)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1546,6 +1745,114 @@ fn load_corpus_from_dir(dir: &std::path::Path) -> Vec<CorpusEntry> {
     }
 }
 
+/// Build a `CoverageMap` from the feedback's flat global hitcount table.
+fn coverage_map_from_global(
+    global: &std::collections::HashMap<(Address, (usize, usize)), u32>,
+) -> crate::types::CoverageMap {
+    let mut map = crate::types::CoverageMap::new();
+    for (&(addr, (prev, cur)), &count) in global {
+        map.record_hitcount(addr, prev, cur, count);
+    }
+    map
+}
+
+/// Save source-level coverage to `{dir}/source_coverage.json` if any
+/// deployed targets carry a source map.
+fn save_source_coverage_to_dir(
+    coverage: &crate::types::CoverageMap,
+    deployed_targets: &[ContractInfo],
+    dir: &std::path::Path,
+) {
+    use crate::source_map::{BytecodeSourceMap, SourceCoverageReport};
+    use std::collections::HashMap;
+
+    // Build per-contract source-map metadata.
+    // (bytecode, source_map_str, file_list, name)
+    let mut contract_source_maps: HashMap<
+        Address,
+        (Vec<u8>, String, Vec<String>, Option<String>),
+    > = HashMap::new();
+
+    for target in deployed_targets {
+        if let Some(ref sm) = target.deployed_source_map {
+            if !sm.is_empty() && !target.deployed_bytecode.is_empty() {
+                contract_source_maps.insert(
+                    target.address,
+                    (
+                        target.deployed_bytecode.to_vec(),
+                        sm.clone(),
+                        target.source_file_list.clone(),
+                        target.name.clone(),
+                    ),
+                );
+            }
+        }
+    }
+
+    if contract_source_maps.is_empty() {
+        tracing::debug!("[coverage] no source maps available — skipping source coverage report");
+        return;
+    }
+
+    // Load source file contents for offset→line mapping.
+    let mut source_file_contents: HashMap<String, String> = HashMap::new();
+    for (_, _, file_list, _) in contract_source_maps.values() {
+        for path in file_list {
+            if !source_file_contents.contains_key(path) {
+                if let Ok(content) = std::fs::read_to_string(path) {
+                    source_file_contents.insert(path.clone(), content);
+                }
+            }
+        }
+    }
+
+    let report =
+        SourceCoverageReport::build(coverage, &contract_source_maps, &source_file_contents);
+
+    if let Err(e) = report.save_to_dir(dir) {
+        tracing::warn!("[coverage] failed to save source coverage: {e}");
+    } else {
+        report.print_summary();
+    }
+}
+
+/// Persist individual finding JSON files to `{dir}/findings/`.
+fn save_findings_to_dir(findings: &[CampaignFindingRecord], dir: &std::path::Path) {
+    let findings_dir = dir.join("findings");
+    if let Err(e) = std::fs::create_dir_all(&findings_dir) {
+        tracing::warn!("[corpus] could not create findings dir: {e}");
+        return;
+    }
+    for (i, record) in findings.iter().enumerate() {
+        let filename = format!("finding_{:04}_{}.json", i, record.finding.severity);
+        let path = findings_dir.join(&filename);
+        match serde_json::to_string_pretty(record) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&path, json) {
+                    tracing::warn!("[corpus] failed to write {}: {e}", path.display());
+                }
+            }
+            Err(e) => tracing::warn!("[corpus] failed to serialize finding {i}: {e}"),
+        }
+    }
+    tracing::info!("[corpus] saved {} finding(s) to {}", findings.len(), findings_dir.display());
+}
+
+/// Persist a `CampaignReport` to `{dir}/campaign_report.json`.
+fn save_campaign_report_to_dir(report: &CampaignReport, dir: &std::path::Path) {
+    let path = dir.join("campaign_report.json");
+    match serde_json::to_string_pretty(report) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&path, json) {
+                tracing::warn!("[corpus] failed to write report: {e}");
+            } else {
+                tracing::info!("[corpus] saved campaign report to {}", path.display());
+            }
+        }
+        Err(e) => tracing::warn!("[corpus] failed to serialize report: {e}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Corpus entry for splice crossover
 // ---------------------------------------------------------------------------
@@ -1704,6 +2011,8 @@ mod tests {
                 creation_bytecode: None,
                 name: Some("x".into()),
                 source_path: None,
+                deployed_source_map: None,
+                source_file_list: vec![],
                 abi: None,
             }],
             harness: None,
@@ -1743,6 +2052,8 @@ mod tests {
             creation_bytecode: Some(Bytes::from(bytecode.clone())),
             name: Some(label.into()),
             source_path: None,
+            deployed_source_map: None,
+            source_file_list: vec![],
             abi: Some(abi.clone()),
         };
         let config = CampaignConfig {

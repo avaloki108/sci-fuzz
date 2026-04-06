@@ -15,3 +15,7 @@ CLAUDE.md
 
 # Rust build output
 target/
+
+# OpenMemory - IDE/Assistant specific rules
+.cursor/rules/openmemory.mdc
+AGENTS.md

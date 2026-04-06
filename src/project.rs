@@ -702,12 +702,17 @@ fn parse_artifact_file(artifact_path: &Path, out_dir: &Path) -> Result<ContractI
     )?
     .unwrap_or_default();
 
+    let deployed_source_map = crate::source_map::extract_deployed_source_map(&artifact);
+    let source_file_list = crate::source_map::extract_source_file_list(&artifact);
+
     Ok(ContractInfo {
         address: synthetic_contract_address(&source_path, &contract_name),
         deployed_bytecode,
         creation_bytecode,
         name: Some(contract_name),
         source_path: Some(source_path),
+        deployed_source_map,
+        source_file_list,
         abi,
     })
 }

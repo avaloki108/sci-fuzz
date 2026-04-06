@@ -75,6 +75,7 @@ pub use protocol_semantics::{
     ProtocolKind,
 };
 pub mod invariant;
+pub mod inferred_invariants;
 pub mod oracle;
 
 // ── Fuzzing campaign ────────────────────────────────────────────────────
@@ -101,9 +102,14 @@ pub mod harness;
 
 pub mod output;
 
+// ── Source map & source-linked coverage ────────────────────────────────
+
+pub mod source_map;
+
 // ── Differential execution ──────────────────────────────────────────────
 
 pub mod diff;
+pub mod config;
 
 // ── CLI (feature-gated) ─────────────────────────────────────────────────
 

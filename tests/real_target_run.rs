@@ -109,7 +109,9 @@ fn real_target_prop_false_found() {
         creation_bytecode: None,
         name: Some("PropFalse".into()),
         source_path: None,
-        abi: Some(abi),
+        deployed_source_map: None,
+            source_file_list: vec![],
+                abi: Some(abi),
     };
 
     // Wire up sub-systems.
@@ -293,7 +295,9 @@ fn real_target_prop_stateful_found_via_fuzzing() {
         creation_bytecode: None,
         name: Some("PropStateful".into()),
         source_path: None,
-        abi: Some(abi),
+        deployed_source_map: None,
+            source_file_list: vec![],
+                abi: Some(abi),
     };
 
     let mut mutator = TxMutator::new(vec![target]);
@@ -419,7 +423,9 @@ fn campaign_with_real_target() {
         creation_bytecode: None,
         name: Some("PropFalse".into()),
         source_path: None,
-        abi: Some(abi),
+        deployed_source_map: None,
+            source_file_list: vec![],
+                abi: Some(abi),
     };
 
     let config = CampaignConfig {
@@ -484,7 +490,9 @@ fn scorecard_prop_false() {
         creation_bytecode: None,
         name: Some("PropFalse".into()),
         source_path: None,
-        abi: Some(abi),
+        deployed_source_map: None,
+            source_file_list: vec![],
+                abi: Some(abi),
     }]);
 
     let mut rng = StdRng::seed_from_u64(42);
@@ -575,7 +583,9 @@ fn campaign_solves_prop_stateful() {
         creation_bytecode: None,
         name: Some("PropStateful".into()),
         source_path: None,
-        abi: Some(abi),
+        deployed_source_map: None,
+            source_file_list: vec![],
+                abi: Some(abi),
     };
 
     let config = CampaignConfig {

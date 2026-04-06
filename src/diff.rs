@@ -562,6 +562,8 @@ fn build_diff_mutator(
         creation_bytecode: contract.creation_bytecode.clone(),
         name: contract.name.clone(),
         source_path: contract.source_path.clone(),
+        deployed_source_map: contract.deployed_source_map.clone(),
+        source_file_list: contract.source_file_list.clone(),
         abi: filtered_abi,
     };
 
@@ -757,6 +759,8 @@ mod tests {
             creation_bytecode: None,
             name: None,
             source_path: None,
+            deployed_source_map: None,
+            source_file_list: vec![],
             abi: None,
         };
         let b = a.clone();

@@ -98,7 +98,9 @@ impl BenchmarkHarness {
             creation_bytecode: None,
             name: None,
             source_path: None,
-            abi: abi.clone(),
+            deployed_source_map: None,
+            source_file_list: vec![],
+                abi: abi.clone(),
         };
 
         let mut mutator = TxMutator::new(vec![target]);

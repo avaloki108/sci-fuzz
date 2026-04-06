@@ -396,6 +396,8 @@ fn load_compiled_fixture_case(
             creation_bytecode: Some(alloy_primitives::Bytes::from(creation_bytecode)),
             name: Some(name.into()),
             source_path: None,
+            deployed_source_map: None,
+            source_file_list: vec![],
             abi,
         }],
     )

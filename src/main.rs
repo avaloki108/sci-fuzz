@@ -47,6 +47,7 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Test(args) => handle_test(args),
         Commands::Ci(args) => handle_ci(args),
         Commands::Diff(args) => handle_diff(args),
+        Commands::Replay(args) => handle_replay(args),
         Commands::Version => handle_version(),
     }
 }
@@ -178,6 +179,12 @@ fn handle_forge(args: sci_fuzz::cli::ForgeArgs) -> Result<()> {
             String::new()
         }
     );
+    if args.system_mode {
+        println!("  🔗 system-mode: all {} contracts fuzzed as equal targets", bootstrap.runtime_targets.len());
+    }
+    if !args.extra_senders.is_empty() {
+        println!("  👥 extra senders: {}", args.extra_senders.join(", "));
+    }
     println!("starting campaign...");
     println!();
 
@@ -189,6 +196,32 @@ fn handle_forge(args: sci_fuzz::cli::ForgeArgs) -> Result<()> {
         .context("invalid --attacker address")?;
 
     // Build a default campaign config from CLI args.
+    let extra_senders: Vec<Address> = args
+        .extra_senders
+        .iter()
+        .filter_map(|s| s.parse::<Address>().ok())
+        .collect();
+    let target_weights: std::collections::HashMap<Address, u32> = args
+        .target_weight
+        .iter()
+        .filter_map(|s| {
+            let (addr, w) = s.rsplit_once(':')?;
+            Some((addr.parse::<Address>().ok()?, w.parse::<u32>().ok()?))
+        })
+        .collect();
+    let selector_weights: std::collections::HashMap<[u8; 4], u32> = args
+        .selector_weight
+        .iter()
+        .filter_map(|s| {
+            let (sel, w) = s.rsplit_once(':')?;
+            let sel = sel.trim_start_matches("0x");
+            let bytes = hex::decode(sel).ok()?;
+            if bytes.len() != 4 { return None; }
+            let arr: [u8; 4] = bytes.try_into().ok()?;
+            Some((arr, w.parse::<u32>().ok()?))
+        })
+        .collect();
+
     let config = CampaignConfig {
         timeout: std::time::Duration::from_secs(args.timeout),
         max_execs: None,
@@ -203,6 +236,12 @@ fn handle_forge(args: sci_fuzz::cli::ForgeArgs) -> Result<()> {
         rpc_block_number: args.fork_block,
         attacker_address,
         corpus_dir: args.corpus_dir.clone(),
+        test_mode: args.mode,
+        system_mode: args.system_mode,
+        infer_invariants: args.infer_invariants,
+        extra_senders,
+        target_weights,
+        selector_weights,
         ..Default::default()
     };
 
@@ -318,6 +357,8 @@ fn handle_audit(args: sci_fuzz::cli::AuditArgs) -> Result<()> {
             creation_bytecode: None,
             name: Some(format!("AuditTarget_{short}")),
             source_path: None,
+            deployed_source_map: None,
+            source_file_list: vec![],
             abi: abi_val,
         });
     }
@@ -480,6 +521,7 @@ fn handle_test(args: sci_fuzz::cli::TestArgs) -> Result<()> {
         mode: sci_fuzz::types::ExecutorMode::Fast,
         rpc_url: args.fork_url.clone(),
         rpc_block_number: args.fork_block,
+        test_mode: args.mode,
         ..Default::default()
     };
 
@@ -536,6 +578,7 @@ fn handle_ci(args: sci_fuzz::cli::CiArgs) -> Result<()> {
         harness: bootstrap.harness,
         mode: sci_fuzz::types::ExecutorMode::Fast,
         corpus_dir: args.corpus_dir.clone(),
+        test_mode: args.mode,
         ..Default::default()
     };
 
@@ -657,6 +700,95 @@ fn handle_diff(args: sci_fuzz::cli::DiffArgs) -> Result<()> {
             serde_json::to_string_pretty(&result).context("Failed to serialize diff result")?;
         std::fs::write(&report_path, result_json)?;
         println!("  💾 wrote {}", report_path.display());
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "cli")]
+fn handle_replay(args: sci_fuzz::cli::ReplayArgs) -> Result<()> {
+    use sci_fuzz::campaign::{Campaign, CampaignFindingRecord};
+    use sci_fuzz::types::{Address, CampaignConfig, ExecutorMode};
+
+    println!("⚡ sci-fuzz replay");
+    println!("  finding  : {}", args.finding.display());
+    println!();
+
+    // Load the serialized finding.
+    let json = std::fs::read_to_string(&args.finding)
+        .with_context(|| format!("failed to read {}", args.finding.display()))?;
+    let record: CampaignFindingRecord = serde_json::from_str(&json)
+        .with_context(|| "failed to parse finding JSON (expected CampaignFindingRecord)")?;
+
+    println!("  title    : {}", record.finding.title);
+    println!("  severity : {}", record.finding.severity);
+    println!("  contract : {:#x}", record.finding.contract);
+    println!("  repro    : {} tx(s)", record.finding.reproducer.len());
+    println!();
+
+    if record.finding.reproducer.is_empty() {
+        println!("⚠️  No reproducer sequence in this finding. Nothing to replay.");
+        return Ok(());
+    }
+
+    // Build project from the --project root.
+    let project_root = args.project.canonicalize().unwrap_or(args.project.clone());
+    println!("found project: {}", project_root.display());
+    println!("running forge build...");
+    let (project, bootstrap, artifact_count) =
+        sci_fuzz::project::Project::build_and_select_targets(&project_root)?;
+    println!("discovered {} artifact(s)", artifact_count);
+    println!(
+        "selected {} runtime fuzz target(s)",
+        bootstrap.runtime_targets.len()
+    );
+    println!();
+
+    let fork_url = args
+        .rpc_url
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("ETH_RPC_URL").ok())
+        .or_else(|| project.eth_rpc_url());
+
+    let attacker_address = args
+        .attacker
+        .as_ref()
+        .map(|s| s.parse::<Address>())
+        .transpose()
+        .context("invalid --attacker address")?;
+
+    let config = CampaignConfig {
+        timeout: std::time::Duration::from_secs(30), // short — replay is deterministic
+        max_execs: Some(0), // no fuzzing, just replay
+        max_depth: (record.finding.reproducer.len() + 1) as u32,
+        max_snapshots: 64,
+        workers: 1,
+        seed: 0,
+        targets: bootstrap.runtime_targets,
+        harness: bootstrap.harness,
+        mode: ExecutorMode::Fast,
+        rpc_url: fork_url,
+        rpc_block_number: args.fork_block,
+        attacker_address,
+        test_mode: sci_fuzz::types::TestMode::default(),
+        ..Default::default()
+    };
+
+    println!("🔁 Replaying {} tx(s)...", record.finding.reproducer.len());
+    let mut campaign = Campaign::new(config);
+    let findings = campaign.replay_sequence(&record.finding.reproducer)?;
+
+    println!();
+    if findings.is_empty() {
+        println!("✅ No violations detected on replay.");
+        println!("   (The bug may require specific fork state — try passing --rpc-url)");
+    } else {
+        println!("🐛 CONFIRMED: {} violation(s) still trigger:", findings.len());
+        for (i, f) in findings.iter().enumerate() {
+            println!("  [{i}] [{}] {}", f.severity, f.title);
+            println!("       {}", f.description);
+        }
     }
 
     Ok(())

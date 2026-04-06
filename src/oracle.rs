@@ -66,6 +66,31 @@ impl OracleEngine {
         Self { registry, attacker }
     }
 
+    /// Assertion-mode engine: only registers `EchidnaProperty` + `UnexpectedRevert`.
+    /// Used when `TestMode::Assertion` is active to suppress economic oracle noise.
+    pub fn new_assertion_mode(attacker: Address) -> Self {
+        Self {
+            registry: InvariantRegistry::with_assertion_mode(attacker),
+            attacker,
+        }
+    }
+
+    /// Empty engine with no registered invariants.
+    /// Used for `TestMode::Exploration` where coverage is the only objective.
+    pub fn empty(attacker: Address) -> Self {
+        Self {
+            registry: InvariantRegistry::new(),
+            attacker,
+        }
+    }
+
+    /// Extend the registry with additional invariants (e.g. ABI-inferred ones).
+    pub fn extend_invariants(&mut self, invariants: Vec<Box<dyn crate::invariant::Invariant>>) {
+        for inv in invariants {
+            self.registry.add(inv);
+        }
+    }
+
     /// Run every registered invariant against an execution result.
     ///
     /// `pre_sequence_balances` must reflect balances **before** the first

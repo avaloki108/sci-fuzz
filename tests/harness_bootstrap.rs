@@ -141,7 +141,9 @@ fn mutator_does_not_include_set_up_selector() {
         creation_bytecode: h.creation_bytecode.clone(),
         name: h.name.clone(),
         source_path: h.source_path.clone(),
-        abi: h.abi.clone(),
+        deployed_source_map: None,
+            source_file_list: vec![],
+                abi: h.abi.clone(),
     };
     let stripped = contract_info_for_mutator(&c, &["setUp", "beforeTest", "afterTest"]);
     let m = TxMutator::new(vec![stripped]);

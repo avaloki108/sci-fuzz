@@ -6,6 +6,8 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
+use crate::types::TestMode;
+
 /// Sci-Fuzz: Next-generation smart contract fuzzer
 #[derive(Parser, Debug)]
 #[command(
@@ -108,6 +110,20 @@ findings meet the configured thresholds (distinct from build error exit 1).
     )]
     Ci(CiArgs),
 
+    /// Replay a previously saved finding to confirm it still triggers
+    #[command(
+        name = "replay",
+        about = "Replay a saved finding to confirm the bug still triggers",
+        long_about = r#"
+Load a serialized CampaignFindingRecord from a JSON file and re-execute
+its reproducer sequence against the target contracts. Reports whether
+the finding still triggers.
+
+Usage: sci-fuzz replay --project ./my-proj finding_0001_critical.json
+"#
+    )]
+    Replay(ReplayArgs),
+
     /// Differential fuzzing between implementations
     #[command(
         name = "diff",
@@ -131,6 +147,10 @@ pub struct ForgeArgs {
     /// Path to Foundry project
     #[arg(short, long, default_value = ".")]
     pub project: PathBuf,
+
+    /// Path to sci-fuzz.toml config file (default: auto-discover)
+    #[arg(long)]
+    pub config: Option<String>,
 
     /// Maximum transaction sequence depth
     #[arg(long, default_value = "50")]
@@ -193,6 +213,48 @@ pub struct ForgeArgs {
     /// echidna harness lives outside `src/` and needs a custom profile to compile.
     #[arg(long)]
     pub forge_profile: Option<String>,
+
+    /// Testing mode: controls which oracles and property checks are active.
+    #[arg(short = 'm', long, default_value = "property")]
+    pub mode: TestMode,
+
+    // -- Phase 5: system-level / all-contract fuzzing ----------------------
+    /// Fuzz ALL deployed contracts as equal targets (system mode).
+    #[arg(long)]
+    pub system_mode: bool,
+
+    /// Enable ABI-inferred invariants (access control, pause, supply, getters).
+    /// Enabled by default; use --no-infer-invariants to disable.
+    #[arg(long, default_value = "true")]
+    pub infer_invariants: bool,
+
+    /// Additional funded senders (comma-separated hex addresses).
+    #[arg(long, value_delimiter = ',')]
+    pub extra_senders: Vec<String>,
+
+    /// Per-target call weight: "<addr>:<weight>" (repeatable or comma-separated).
+    #[arg(long, value_delimiter = ',')]
+    pub target_weight: Vec<String>,
+
+    /// Per-selector call weight: "<0xSEL>:<weight>" (repeatable or comma-separated).
+    #[arg(long, value_delimiter = ',')]
+    pub selector_weight: Vec<String>,
+
+    /// Output format: text, json, sarif, junit.
+    #[arg(long, value_enum, default_value = "text")]
+    pub output_format: String,
+
+    /// Save campaign report as JSON to output dir.
+    #[arg(long)]
+    pub save_report: bool,
+
+    /// Skip Forge reproducer generation.
+    #[arg(long)]
+    pub no_replay: bool,
+
+    /// Only run invariants matching these name prefixes (comma-separated).
+    #[arg(long, value_delimiter = ',')]
+    pub invariant_prefix: Vec<String>,
 }
 
 /// Arguments for the `benchmark` subcommand
@@ -293,6 +355,10 @@ pub struct AuditArgs {
     /// Enable liquidation simulation
     #[arg(long)]
     pub liquidation: bool,
+
+    /// Testing mode: controls which oracles and property checks are active.
+    #[arg(short = 'm', long, default_value = "property")]
+    pub mode: TestMode,
 }
 
 /// Arguments for the `test` subcommand
@@ -333,6 +399,10 @@ pub struct TestArgs {
     /// Gas reporting
     #[arg(long)]
     pub gas_report: bool,
+
+    /// Testing mode: controls which oracles and property checks are active.
+    #[arg(short = 'm', long, default_value = "property")]
+    pub mode: TestMode,
 }
 
 /// Arguments for the `ci` subcommand
@@ -369,6 +439,10 @@ pub struct CiArgs {
     /// Directory for corpus persistence across runs
     #[arg(long)]
     pub corpus_dir: Option<PathBuf>,
+
+    /// Testing mode: controls which oracles and property checks are active.
+    #[arg(short = 'm', long, default_value = "property")]
+    pub mode: TestMode,
 }
 
 /// Arguments for the `diff` subcommand
@@ -498,6 +572,29 @@ pub enum CiOutputFormat {
     GitHub,
     /// GitLab SAST format
     GitLab,
+}
+
+/// Arguments for the `replay` subcommand
+#[derive(Parser, Debug)]
+pub struct ReplayArgs {
+    /// Path to Foundry project
+    #[arg(short, long, default_value = ".")]
+    pub project: PathBuf,
+
+    /// Path to a saved finding JSON file (CampaignFindingRecord)
+    pub finding: PathBuf,
+
+    /// Fork RPC URL (must match the original campaign if it was fork-based)
+    #[arg(long)]
+    pub rpc_url: Option<String>,
+
+    /// Fork block number
+    #[arg(long)]
+    pub fork_block: Option<u64>,
+
+    /// Attacker address
+    #[arg(long)]
+    pub attacker: Option<String>,
 }
 
 /// Parse CLI arguments and return configuration

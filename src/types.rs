@@ -8,6 +8,32 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
 
+/// Testing mode controlling which oracles are registered and how the campaign
+/// interprets results.
+///
+/// The default is `Property`, which preserves all pre-existing behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+pub enum TestMode {
+    /// Check `echidna_*` / `invariant_*` bool properties + all economic oracles.
+    /// This is the default and matches legacy sci-fuzz behavior.
+    #[default]
+    Property,
+    /// Check assertion/panic failures only (`EchidnaProperty` events + property
+    /// callers). Economic and balance oracles are not registered.
+    Assertion,
+    /// Like `Property` but also discovers `invariant_*` functions (Foundry
+    /// convention). All oracles are registered; both `echidna_*` and
+    /// `invariant_*` prefixes are matched by the property caller.
+    FoundryInvariant,
+    /// Track a numeric optimization objective (scaffold — Phase 2 adds full
+    /// objective tracking). Oracle registration matches `Property` for now.
+    Optimization,
+    /// Pure coverage-guided exploration. No oracles or property callers are
+    /// registered. Useful for building a corpus before switching modes.
+    Exploration,
+}
+
 /// Executor mode controlling how strictly EVM rules are enforced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ExecutorMode {
@@ -35,7 +61,7 @@ pub type Storage = HashMap<Address, HashMap<U256, U256>>;
 // ── Contract Info ────────────────────────────────────────────────────────────
 
 /// Metadata about a deployed smart contract.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ContractInfo {
     /// On-chain address of the contract.
     pub address: Address,
@@ -49,6 +75,14 @@ pub struct ContractInfo {
     /// Source path reported by the build system, relative to project root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_path: Option<String>,
+    /// Solidity source map for the deployed bytecode (semicolon-separated
+    /// instruction entries).  Used for PC → source-line mapping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployed_source_map: Option<String>,
+    /// Ordered list of source file paths corresponding to file indices in
+    /// `deployed_source_map`.  Index 0 matches file_index=0 in the source map.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_file_list: Vec<String>,
     /// Full JSON ABI (as produced by `solc --abi`).
     pub abi: Option<serde_json::Value>,
 }
@@ -67,6 +101,8 @@ pub fn contract_info_for_mutator(contract: &ContractInfo, strip_names: &[&str]) 
         creation_bytecode: contract.creation_bytecode.clone(),
         name: contract.name.clone(),
         source_path: contract.source_path.clone(),
+        deployed_source_map: contract.deployed_source_map.clone(),
+        source_file_list: contract.source_file_list.clone(),
         abi,
     }
 }
@@ -798,6 +834,37 @@ pub struct CampaignConfig {
     /// Directory is created if it does not exist.
     #[serde(default)]
     pub corpus_dir: Option<std::path::PathBuf>,
+    /// Testing mode: controls which oracles are registered and how invariant
+    /// checks are gated in the fuzzing loop.
+    #[serde(default)]
+    pub test_mode: TestMode,
+    /// System-level fuzzing: fuzz ALL deployed contracts uniformly, not just the
+    /// primary targets.  When `true`, every contract in `targets` is treated as
+    /// an equal fuzzing target regardless of harness selection heuristics.
+    #[serde(default)]
+    pub system_mode: bool,
+    /// Automatically synthesize invariants from ABI patterns (access control,
+    /// pause state, supply integrity, getter stability).  Enabled by default
+    /// when not in exploration/assertion mode.
+    #[serde(default = "default_true")]
+    pub infer_invariants: bool,
+    /// Per-target call weight overrides.  Maps deployed contract address to a
+    /// relative weight (1 = default, 2 = twice as likely to be called).  Addresses
+    /// not in this map use weight 1.
+    #[serde(default)]
+    pub target_weights: std::collections::HashMap<Address, u32>,
+    /// Per-selector call weight overrides.  Maps 4-byte selector to a relative
+    /// weight.  Selectors not in this map use weight 1.
+    #[serde(default)]
+    pub selector_weights: std::collections::HashMap<[u8; 4], u32>,
+    /// Additional funded senders beyond the attacker.  Each address is funded
+    /// with `sender_balance_wei` at campaign start.  Allows multi-actor
+    /// simulations (e.g. attacker + victim + liquidator).
+    #[serde(default)]
+    pub extra_senders: Vec<Address>,
+    /// Balance to fund each address in `extra_senders` (default 10 ETH).
+    #[serde(default = "default_sender_balance_wei")]
+    pub sender_balance_wei: U256,
 }
 
 fn default_true() -> bool {
@@ -806,6 +873,10 @@ fn default_true() -> bool {
 
 fn default_fork_attacker_balance_wei() -> U256 {
     U256::from(100_000_000_000_000_000_000_u128)
+}
+
+fn default_sender_balance_wei() -> U256 {
+    U256::from(10_000_000_000_000_000_000_u128) // 10 ETH
 }
 
 impl CampaignConfig {
@@ -839,6 +910,13 @@ impl Default for CampaignConfig {
             fork_expected_chain_id: None,
             attacker_address: None,
             corpus_dir: None,
+            test_mode: TestMode::default(),
+            system_mode: false,
+            infer_invariants: true,
+            target_weights: std::collections::HashMap::new(),
+            selector_weights: std::collections::HashMap::new(),
+            extra_senders: Vec::new(),
+            sender_balance_wei: default_sender_balance_wei(),
         }
     }
 }
