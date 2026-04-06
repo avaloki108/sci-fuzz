@@ -418,13 +418,85 @@ fn dotenvy_load() -> anyhow::Result<()> {
 
 #[cfg(feature = "cli")]
 fn handle_test(args: sci_fuzz::cli::TestArgs) -> Result<()> {
+    use sci_fuzz::{project::Project, types::CampaignConfig};
+
     println!("⚡ sci-fuzz test");
     if let Some(ref pat) = args.match_test {
         println!("  match-test : {pat}");
     }
+    if let Some(ref pat) = args.match_contract {
+        println!("  match-contract : {pat}");
+    }
     println!("  runs       : {}", args.runs);
+    println!("  timeout    : 300s");
     println!();
-    println!("  (enhanced test runner not yet implemented — coming soon)");
+
+    let project_root = std::path::PathBuf::from(".")
+        .canonicalize()
+        .unwrap_or(std::path::PathBuf::from("."));
+    println!("  project    : {}", project_root.display());
+    println!("running forge build...");
+    let (_project, bootstrap, artifact_count) = Project::build_and_select_targets(&project_root)?;
+    println!("discovered {} artifact(s)", artifact_count);
+
+    let mut targets = bootstrap.runtime_targets;
+    if let Some(ref contract_pat) = args.match_contract {
+        targets.retain(|target| {
+            target
+                .name
+                .as_deref()
+                .map(|name| name.contains(contract_pat))
+                .unwrap_or(false)
+        });
+    }
+
+    if let Some(ref test_pat) = args.match_test {
+        targets.retain(|target| {
+            target.abi.as_ref().is_some_and(|abi| {
+                abi.as_array().into_iter().flatten().any(|entry| {
+                    entry.get("type").and_then(|t| t.as_str()) == Some("function")
+                        && entry
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .is_some_and(|n| n.contains(test_pat))
+                })
+            })
+        });
+    }
+
+    if targets.is_empty() {
+        anyhow::bail!("no targets matched filters for `sci-fuzz test`");
+    }
+
+    let config = CampaignConfig {
+        timeout: std::time::Duration::from_secs(300),
+        max_execs: Some(args.runs as u64),
+        max_depth: 16,
+        max_snapshots: if args.snapshots { 512 } else { 128 },
+        workers: 1,
+        seed: 0x51f5_7e57,
+        targets,
+        harness: bootstrap.harness,
+        mode: sci_fuzz::types::ExecutorMode::Fast,
+        rpc_url: args.fork_url.clone(),
+        rpc_block_number: args.fork_block,
+        ..Default::default()
+    };
+
+    let mut campaign = Campaign::new(config);
+    let findings = campaign.run()?;
+    if findings.is_empty() {
+        println!("✅ No invariant violations found.");
+        return Ok(());
+    }
+
+    println!("🐛 Found {} invariant violation(s):", findings.len());
+    for (i, finding) in findings.iter().enumerate() {
+        println!("  [{i}] [{}] {}", finding.severity, finding.title);
+    }
+    if args.fail_fast {
+        anyhow::bail!("campaign reported findings and --fail-fast is set");
+    }
     Ok(())
 }
 
@@ -550,7 +622,8 @@ fn handle_ci(args: sci_fuzz::cli::CiArgs) -> Result<()> {
             high,
         );
 
-        let should_fail = (args.fail_on_critical && critical > 0) || (args.fail_on_high && high > 0);
+        let should_fail =
+            (args.fail_on_critical && critical > 0) || (args.fail_on_high && high > 0);
         if should_fail {
             process::exit(2);
         }

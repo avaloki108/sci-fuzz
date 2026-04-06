@@ -49,6 +49,7 @@ pub struct BenchmarkCase {
     pub targets: Vec<ContractInfo>,
     pub matcher: FindingMatcher,
     pub detection_mechanism: Option<String>,
+    pub project_root: Option<PathBuf>,
 }
 
 impl BenchmarkCase {
@@ -69,6 +70,7 @@ impl BenchmarkCase {
             targets,
             matcher: FindingMatcher::AnyFinding,
             detection_mechanism: None,
+            project_root: None,
         }
     }
 
@@ -99,6 +101,11 @@ impl BenchmarkCase {
 
     pub fn with_detection_mechanism(mut self, mechanism: impl Into<String>) -> Self {
         self.detection_mechanism = Some(mechanism.into());
+        self
+    }
+
+    pub fn with_project_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.project_root = Some(root.into());
         self
     }
 }
@@ -207,7 +214,8 @@ pub fn plan_for_foundry_project(
     max_depth: u32,
     max_execs: Option<u64>,
 ) -> crate::Result<Vec<BenchmarkPlanEntry>> {
-    let (_project, bootstrap, _artifact_count) = Project::build_and_select_targets(root)?;
+    let root = root.as_ref().to_path_buf();
+    let (_project, bootstrap, _artifact_count) = Project::build_and_select_targets(&root)?;
     let mut cases = Vec::new();
 
     for target in bootstrap.runtime_targets {
@@ -228,7 +236,8 @@ pub fn plan_for_foundry_project(
                 .with_depth(max_depth)
                 .with_max_execs(max_execs)
                 .with_matcher(FindingMatcher::AnyFinding)
-                .with_detection_mechanism("campaign"),
+                .with_detection_mechanism("campaign")
+                .with_project_root(root.clone()),
         ));
     }
 
@@ -432,24 +441,227 @@ impl ExternalComparisonAdapter {
             );
         }
 
-        ScorecardEntry::with_status(
-            &case.target,
-            &case.property,
-            &case.category,
-            &case.mode,
-            seed,
-            self.engine,
-            BenchmarkStatus::Skipped,
-            format!(
-                "{} comparison adapter not implemented yet for this benchmark target",
-                self.binary
+        match self.engine {
+            BenchmarkEngine::Forge => run_forge_comparison_case(self.binary, case, seed),
+            BenchmarkEngine::Echidna => ScorecardEntry::with_status(
+                &case.target,
+                &case.property,
+                &case.category,
+                &case.mode,
+                seed,
+                self.engine,
+                BenchmarkStatus::Skipped,
+                "echidna adapter currently supports no benchmark case format in this pipeline",
             ),
-        )
+            BenchmarkEngine::SciFuzz => ScorecardEntry::with_status(
+                &case.target,
+                &case.property,
+                &case.category,
+                &case.mode,
+                seed,
+                self.engine,
+                BenchmarkStatus::Skipped,
+                "invalid external adapter engine",
+            ),
+        }
     }
 }
 
 fn binary_available(binary: impl AsRef<OsStr>) -> bool {
     Command::new(binary).arg("--version").output().is_ok()
+}
+
+fn run_forge_comparison_case(binary: &str, case: &BenchmarkCase, seed: u64) -> ScorecardEntry {
+    let Some(project_root) = &case.project_root else {
+        return ScorecardEntry::with_status(
+            &case.target,
+            &case.property,
+            &case.category,
+            &case.mode,
+            seed,
+            BenchmarkEngine::Forge,
+            BenchmarkStatus::Skipped,
+            "forge adapter requires a Foundry project case with project_root",
+        );
+    };
+
+    let run_ctx = match prepare_forge_run_context(case, project_root) {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            return ScorecardEntry::with_status(
+                &case.target,
+                &case.property,
+                &case.category,
+                &case.mode,
+                seed,
+                BenchmarkEngine::Forge,
+                BenchmarkStatus::Failed,
+                err,
+            );
+        }
+    };
+
+    let started = std::time::Instant::now();
+    let output = run_forge_command(binary, &run_ctx, seed);
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    match output {
+        Ok(output) => {
+            if let Err(err) = std::fs::write(&run_ctx.stdout_path, &output.stdout) {
+                tracing::warn!(
+                    "[benchmark] failed to write forge stdout {}: {err}",
+                    run_ctx.stdout_path.display()
+                );
+            }
+            if let Err(err) = std::fs::write(&run_ctx.stderr_path, &output.stderr) {
+                tracing::warn!(
+                    "[benchmark] failed to write forge stderr {}: {err}",
+                    run_ctx.stderr_path.display()
+                );
+            }
+
+            let summary =
+                parse_forge_result_summary(&output.stdout, &output.stderr, output.success);
+            ScorecardEntry::measured(
+                &case.target,
+                &case.property,
+                &case.category,
+                &case.mode,
+                seed,
+                summary.found,
+                None,
+                None,
+                0,
+                elapsed_ms,
+                None,
+                None,
+                summary.failed_count.unwrap_or(0),
+                summary.failed_count.unwrap_or(0),
+                BenchmarkEngine::Forge,
+                Some("forge-test-failure-count".into()),
+            )
+        }
+        Err(err) => ScorecardEntry::with_status(
+            &case.target,
+            &case.property,
+            &case.category,
+            &case.mode,
+            seed,
+            BenchmarkEngine::Forge,
+            BenchmarkStatus::Failed,
+            format!("forge execution failed: {err}"),
+        ),
+    }
+}
+
+#[derive(Debug)]
+struct ForgeRunContext {
+    project_root: PathBuf,
+    match_contract: String,
+    _scratch_dir: PathBuf,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+}
+
+fn prepare_forge_run_context(
+    case: &BenchmarkCase,
+    project_root: &Path,
+) -> Result<ForgeRunContext, String> {
+    if !project_root.exists() {
+        return Err(format!(
+            "project_root does not exist: {}",
+            project_root.display()
+        ));
+    }
+    let scratch_dir = std::env::temp_dir().join(format!(
+        "sci-fuzz-benchmark-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&scratch_dir).map_err(|err| {
+        format!(
+            "failed to create temp workdir {}: {err}",
+            scratch_dir.display()
+        )
+    })?;
+    let stdout_path = scratch_dir.join("forge.stdout.log");
+    let stderr_path = scratch_dir.join("forge.stderr.log");
+    Ok(ForgeRunContext {
+        project_root: project_root.to_path_buf(),
+        match_contract: case.target.clone(),
+        _scratch_dir: scratch_dir,
+        stdout_path,
+        stderr_path,
+    })
+}
+
+fn run_forge_command(
+    binary: &str,
+    ctx: &ForgeRunContext,
+    seed: u64,
+) -> Result<CommandOutput, String> {
+    let output = Command::new(binary)
+        .arg("test")
+        .arg("--root")
+        .arg(&ctx.project_root)
+        .arg("--match-contract")
+        .arg(&ctx.match_contract)
+        .arg("--fuzz-seed")
+        .arg(seed.to_string())
+        .arg("-vv")
+        .current_dir(&ctx.project_root)
+        .output()
+        .map_err(|err| err.to_string())?;
+    Ok(CommandOutput {
+        success: output.status.success(),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
+}
+
+#[derive(Debug)]
+struct CommandOutput {
+    success: bool,
+    stdout: String,
+    stderr: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ForgeResultSummary {
+    found: bool,
+    failed_count: Option<usize>,
+}
+
+fn parse_forge_result_summary(stdout: &str, stderr: &str, success: bool) -> ForgeResultSummary {
+    let merged = format!("{stdout}\n{stderr}");
+    let failed_count = parse_first_usize_before_keyword(&merged, "failed");
+    let found = failed_count.unwrap_or(0) > 0 || (!success && failed_count.is_none());
+    ForgeResultSummary {
+        found,
+        failed_count,
+    }
+}
+
+fn parse_first_usize_before_keyword(haystack: &str, keyword: &str) -> Option<usize> {
+    for line in haystack.lines() {
+        if !line.contains(keyword) {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        for window in parts.windows(2) {
+            if window.len() == 2 && window[1].contains(keyword) {
+                if let Ok(n) = window[0]
+                    .trim_matches(|c: char| !c.is_ascii_digit())
+                    .parse::<usize>()
+                {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -470,6 +682,59 @@ mod tests {
         assert_eq!(row.engine, BenchmarkEngine::Echidna);
         assert_eq!(row.status, BenchmarkStatus::Unavailable);
         assert!(!row.found);
+    }
+
+    #[test]
+    fn external_adapter_skips_unsupported_case_without_project_root() {
+        let adapter = ExternalComparisonAdapter {
+            engine: BenchmarkEngine::Forge,
+            binary: "sh",
+        };
+        let case = BenchmarkCase::new("Target", "campaign", "smoke", Vec::new())
+            .with_max_execs(Some(0))
+            .with_timeout(Duration::from_millis(1));
+        let row = adapter.run_case(&case, 9);
+        assert_eq!(row.engine, BenchmarkEngine::Forge);
+        assert_eq!(row.status, BenchmarkStatus::Skipped);
+        assert!(row
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("project_root"));
+    }
+
+    #[test]
+    fn prepare_forge_context_builds_temp_workdir_and_log_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let case = BenchmarkCase::new("Vault", "campaign", "smoke", Vec::new())
+            .with_project_root(dir.path());
+        let ctx = prepare_forge_run_context(&case, dir.path()).expect("context should build");
+        assert_eq!(ctx.project_root, dir.path().to_path_buf());
+        assert_eq!(ctx.match_contract, "Vault");
+        assert!(ctx.stdout_path.ends_with("forge.stdout.log"));
+        assert!(ctx.stderr_path.ends_with("forge.stderr.log"));
+    }
+
+    #[test]
+    fn parse_forge_summary_maps_failed_count_to_found() {
+        let summary =
+            parse_forge_result_summary("Suite result: FAILED. 2 failed; 3 passed", "", false);
+        assert_eq!(
+            summary,
+            ForgeResultSummary {
+                found: true,
+                failed_count: Some(2)
+            }
+        );
+        let summary_ok =
+            parse_forge_result_summary("Suite result: ok. 0 failed; 3 passed", "", true);
+        assert_eq!(
+            summary_ok,
+            ForgeResultSummary {
+                found: false,
+                failed_count: Some(0)
+            }
+        );
     }
 
     #[test]
