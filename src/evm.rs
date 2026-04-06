@@ -260,6 +260,7 @@ impl EvmExecutor {
         // Collect deferred deals and stores before dropping the EVM.
         let pending_deals = ext.cheatcodes.pending_deals.clone();
         let pending_stores = ext.cheatcodes.pending_stores.clone();
+        let pending_etches = ext.cheatcodes.pending_etches.clone();
 
         // Commit state changes into the CacheDB.
         drop(evm); // release mutable borrow on self.db
@@ -273,6 +274,18 @@ impl EvmExecutor {
         // Apply deferred vm.store() storage writes.
         for (addr, slot, value) in pending_stores {
             let _ = self.db.insert_account_storage(addr, slot, value);
+        }
+        // Apply deferred vm.etch() bytecode installations.
+        for (addr, code) in pending_etches {
+            let existing = self.db.basic_ref(addr).ok().flatten().unwrap_or_default();
+            let bytecode = revm::primitives::Bytecode::new_legacy(code);
+            self.insert_account_info(
+                addr,
+                AccountInfo {
+                    code: Some(bytecode),
+                    ..existing
+                },
+            );
         }
 
         // Convert the revm result into our own type.

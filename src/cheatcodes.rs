@@ -68,6 +68,9 @@ pub struct TxCheatcodeState {
     /// Deferred storage writes from `vm.store()`.  Applied after the
     /// transaction commits.
     pub pending_stores: Vec<(Address, U256, U256)>,
+    /// Deferred bytecode installations from `vm.etch()`.  Applied after the
+    /// transaction commits.
+    pub pending_etches: Vec<(Address, alloy_primitives::Bytes)>,
 }
 
 impl TxCheatcodeState {
@@ -339,19 +342,30 @@ pub fn dispatch<DB: revm::Database>(
     }
 
     if sel == selector(b"load(address,bytes32)") {
-        // Direct storage read — return zero as safe default.
-        // Full implementation would require reading from the journal without
-        // conflicting borrows; zero is safe since vm.load() is rarely critical
-        // for setUp() correctness.
+        // Read from the journaled state via sload.
         if args.len() >= 64 {
-            let _addr = decode_address_word(args);
-            let _slot = decode_u256_word(&args[32..]);
+            let addr = decode_address_word(args);
+            let slot = decode_u256_word(&args[32..]);
+            match context.inner.sload(addr, slot) {
+                Ok(val) => return (true, encode_u256(val.data)),
+                Err(_) => return (true, encode_u256(U256::ZERO)),
+            }
         }
         return (true, encode_u256(U256::ZERO));
     }
 
     if sel == selector(b"etch(address,bytes)") {
-        // vm.etch: set bytecode at address — complex; no-op for now
+        // vm.etch(address,bytes): install bytecode at address.
+        // Deferred like vm.store/vm.deal to avoid borrow conflicts.
+        if args.len() >= 64 {
+            let addr = decode_address_word(args);
+            let offset = decode_u256_word(&args[32..]);
+            let offset_usize = offset.saturating_to::<usize>();
+            if offset_usize < args.len() {
+                let code = alloy_primitives::Bytes::copy_from_slice(&args[offset_usize..]);
+                state.pending_etches.push((addr, code));
+            }
+        }
         return (true, bytes::Bytes::new());
     }
 
@@ -451,8 +465,10 @@ pub fn dispatch<DB: revm::Database>(
 }
 
 // ── EVM state mutation helpers ────────────────────────────────────────────────
-// Note: vm.deal() and vm.store() use deferred mutation (pending_deals /
-// pending_stores) to avoid borrow-checker conflicts with the in-flight journal.
+// Note: vm.deal(), vm.store(), and vm.etch() use deferred mutation
+// (pending_deals / pending_stores / pending_etches) to avoid borrow-checker
+// conflicts with the in-flight journal.  vm.load() reads directly from
+// journaled_state via sload.
 // The executor applies them after the transaction commits.
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
