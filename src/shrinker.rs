@@ -381,6 +381,14 @@ impl SequenceShrinker {
                 out.push(DynSolValue::Int(I256::ZERO, *bits));
                 if *v != I256::ZERO {
                     out.push(DynSolValue::Int(I256::from_raw(U256::from(1u64)), *bits));
+                    // Try -1 (common in Solidity for "uninitialized" / sentinel)
+                    out.push(DynSolValue::Int(-I256::from_raw(U256::from(1u64)), *bits));
+                    // Try the max positive value (overflow boundary)
+                    let max_pos = U256::from(1u64) << (bits - 1);
+                    out.push(DynSolValue::Int(I256::from_raw(max_pos - U256::from(1u64)), *bits));
+                    // Try the min negative value
+                    let min_neg = U256::from(1u64) << (bits - 1);
+                    out.push(DynSolValue::Int(I256::from_raw(min_neg), *bits));
                 }
             }
             DynSolValue::Bool(b) => {
@@ -394,13 +402,71 @@ impl SequenceShrinker {
                 }
             }
             DynSolValue::Array(items) | DynSolValue::FixedArray(items) => {
+                // Try empty array
                 if !items.is_empty() {
                     out.push(DynSolValue::Array(Vec::new()));
                 }
+                // Try removing each element individually
+                if items.len() > 1 {
+                    for skip in 0..items.len() {
+                        let reduced: Vec<DynSolValue> =
+                            items.iter().enumerate()
+                                .filter(|(i, _)| *i != skip)
+                                .map(|(_, v)| v.clone())
+                                .collect();
+                        if reduced.len() < items.len() {
+                            out.push(DynSolValue::Array(reduced));
+                        }
+                    }
+                }
+                // Try shrinking individual elements
+                for elem_idx in 0..items.len() {
+                    for shrunk_elem in self.shrink_dyn_sol_value(&items[elem_idx]) {
+                        let mut replacement = items.clone();
+                        replacement[elem_idx] = shrunk_elem;
+                        out.push(DynSolValue::Array(replacement));
+                    }
+                }
             }
             DynSolValue::Bytes(b) => {
+                // Try empty bytes
                 if !b.is_empty() {
                     out.push(DynSolValue::Bytes(Vec::new()));
+                }
+                // Try zeroing each byte
+                for byte_idx in 0..b.len() {
+                    if b[byte_idx] != 0 {
+                        let mut reduced = b.to_vec();
+                        reduced[byte_idx] = 0;
+                        out.push(DynSolValue::Bytes(reduced));
+                    }
+                }
+                // Try truncating
+                for trim_len in [1, b.len() / 2].into_iter().filter(|&l| l > 0 && l < b.len()) {
+                    out.push(DynSolValue::Bytes(b[..trim_len].to_vec()));
+                }
+            }
+            DynSolValue::String(s) => {
+                // Try empty string
+                if !s.is_empty() {
+                    out.push(DynSolValue::String(String::new()));
+                }
+            }
+            DynSolValue::Tuple(fields) => {
+                // Try shrinking each field individually
+                for field_idx in 0..fields.len() {
+                    for shrunk_field in self.shrink_dyn_sol_value(&fields[field_idx]) {
+                        let mut replacement = fields.clone();
+                        replacement[field_idx] = shrunk_field;
+                        out.push(DynSolValue::Tuple(replacement));
+                    }
+                }
+            }
+            DynSolValue::FixedBytes(val, size) => {
+                // Try all zeros
+                let zero = alloy_primitives::B256::ZERO;
+                if val != &zero {
+                    out.push(DynSolValue::FixedBytes(zero, *size));
                 }
             }
             _ => {}
