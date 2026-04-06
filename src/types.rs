@@ -790,6 +790,12 @@ pub struct CampaignConfig {
     /// default test address `0x42…42`.
     #[serde(default)]
     pub attacker_address: Option<Address>,
+    /// Optional directory for corpus persistence.  When set, the campaign
+    /// saves its sequence corpus to `{corpus_dir}/seq_corpus.json` at the
+    /// end of every run and loads it back at the start of the next run.
+    /// Directory is created if it does not exist.
+    #[serde(default)]
+    pub corpus_dir: Option<std::path::PathBuf>,
 }
 
 fn default_true() -> bool {
@@ -830,6 +836,7 @@ impl Default for CampaignConfig {
             fork_hydrate_deployed_bytecode: true,
             fork_expected_chain_id: None,
             attacker_address: None,
+            corpus_dir: None,
         }
     }
 }

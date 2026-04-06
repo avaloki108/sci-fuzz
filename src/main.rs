@@ -202,6 +202,7 @@ fn handle_forge(args: sci_fuzz::cli::ForgeArgs) -> Result<()> {
         rpc_url: fork_url,
         rpc_block_number: args.fork_block,
         attacker_address,
+        corpus_dir: args.corpus_dir.clone(),
         ..Default::default()
     };
 
@@ -429,13 +430,132 @@ fn handle_test(args: sci_fuzz::cli::TestArgs) -> Result<()> {
 
 #[cfg(feature = "cli")]
 fn handle_ci(args: sci_fuzz::cli::CiArgs) -> Result<()> {
+    use sci_fuzz::cli::CiOutputFormat;
+    use sci_fuzz::output::{forge_reproducer, junit_from_findings, sarif_from_findings};
+    use sci_fuzz::{campaign::Campaign, project::Project, types::CampaignConfig};
+    use std::time::Instant;
+
     println!("⚡ sci-fuzz ci");
     println!("  project : {}", args.project.display());
     println!("  format  : {:?}", args.output_format);
     println!("  timeout : {}s", args.timeout);
+    if args.github_actions {
+        println!("  mode    : GitHub Actions");
+    }
     println!();
-    println!("  (CI mode not yet implemented — coming soon)");
-    Ok(())
+
+    let project_root = args.project.canonicalize().unwrap_or(args.project.clone());
+    println!("running forge build...");
+
+    let (_project, bootstrap, artifact_count) = Project::build_and_select_targets(&project_root)?;
+    println!("discovered {} artifact(s)", artifact_count);
+    println!("starting security scan...");
+    println!();
+
+    let config = CampaignConfig {
+        timeout: std::time::Duration::from_secs(args.timeout),
+        // CI: deterministic budget (enough to be useful, fast enough to not timeout in CI)
+        max_execs: Some(50_000),
+        max_depth: 30,
+        max_snapshots: 512,
+        workers: 2,
+        seed: 0xcafebabe,
+        targets: bootstrap.runtime_targets,
+        harness: bootstrap.harness,
+        mode: sci_fuzz::types::ExecutorMode::Fast,
+        corpus_dir: args.corpus_dir.clone(),
+        ..Default::default()
+    };
+
+    let start = Instant::now();
+    let mut campaign = Campaign::new(config);
+    let findings = campaign.run()?;
+    let elapsed = start.elapsed().as_secs_f64();
+
+    // Emit GitHub Actions workflow annotations if requested.
+    if args.github_actions {
+        for f in &findings {
+            let level = match f.severity {
+                sci_fuzz::types::Severity::Critical | sci_fuzz::types::Severity::High => "error",
+                sci_fuzz::types::Severity::Medium => "warning",
+                _ => "notice",
+            };
+            // ::error/warning/notice title=<title>::<message>
+            println!(
+                "::{level} title={title}::{desc}",
+                level = level,
+                title = f.title,
+                desc = f.description,
+            );
+        }
+    }
+
+    // Build the formatted output string.
+    let tool_version = env!("CARGO_PKG_VERSION");
+    let output_str = match args.output_format {
+        CiOutputFormat::Sarif | CiOutputFormat::GitHub | CiOutputFormat::GitLab => {
+            sarif_from_findings(&findings, tool_version)
+        }
+        CiOutputFormat::Junit => junit_from_findings(&findings, "sci-fuzz", elapsed),
+    };
+
+    // Write to file or stdout.
+    if let Some(ref out_path) = args.output {
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(out_path, &output_str)
+            .with_context(|| format!("writing output to {}", out_path.display()))?;
+        println!("📄 wrote output to: {}", out_path.display());
+    } else {
+        println!("{output_str}");
+    }
+
+    // Optionally save Forge reproducers for each finding.
+    if !findings.is_empty() {
+        let repro_dir = project_root.join("test").join("repros");
+        std::fs::create_dir_all(&repro_dir)?;
+        for f in &findings {
+            let slug: String = f
+                .title
+                .chars()
+                .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                .take(32)
+                .collect::<String>()
+                .to_ascii_lowercase();
+            let repro_path = repro_dir.join(format!("Repro_{slug}.t.sol"));
+            std::fs::write(&repro_path, forge_reproducer(f))?;
+            println!("  💾 reproducer: {}", repro_path.display());
+        }
+    }
+
+    println!();
+    if findings.is_empty() {
+        println!("✅ No vulnerabilities detected ({elapsed:.1}s).");
+        Ok(())
+    } else {
+        let critical = findings
+            .iter()
+            .filter(|f| matches!(f.severity, sci_fuzz::types::Severity::Critical))
+            .count();
+        let high = findings
+            .iter()
+            .filter(|f| matches!(f.severity, sci_fuzz::types::Severity::High))
+            .count();
+
+        println!(
+            "🐛 Found {} finding(s): {} critical, {} high ({elapsed:.1}s).",
+            findings.len(),
+            critical,
+            high,
+        );
+
+        let should_fail = (args.fail_on_critical && critical > 0) || (args.fail_on_high && high > 0);
+        if should_fail {
+            process::exit(2);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "cli")]

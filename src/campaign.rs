@@ -566,6 +566,11 @@ impl Campaign {
         let mut snapshots_saved: u64 = 0;
         // Corpus of interesting sequences for splice-based crossover (capped at 64).
         let mut seq_corpus: Vec<CorpusEntry> = Vec::with_capacity(64);
+        // Load persisted corpus entries from a prior run, if a corpus_dir is set.
+        if let Some(ref dir) = self.config.corpus_dir {
+            let prior = load_corpus_from_dir(dir);
+            seq_corpus.extend(prior.into_iter().take(64));
+        }
         // Diagnostic counters for stateful property debugging.
         let mut diag_funded_deposits: u64 = 0;
         let mut diag_withdraws_ok: u64 = 0;
@@ -972,6 +977,11 @@ impl Campaign {
             findings = findings.len(),
             "campaign finished",
         );
+
+        // Persist the sequence corpus for the next run.
+        if let Some(ref dir) = self.config.corpus_dir {
+            save_corpus_to_dir(&seq_corpus, dir);
+        }
 
         Ok(CampaignReport {
             deduped_finding_count: findings.len(),
@@ -1426,10 +1436,75 @@ fn reproduces_failure(
 }
 
 // ---------------------------------------------------------------------------
+// Corpus persistence
+// ---------------------------------------------------------------------------
+
+/// Persist a sequence corpus to `{dir}/seq_corpus.json`.
+///
+/// Failures are logged as warnings but never propagate — losing corpus data
+/// between runs is graceful degradation, not a fatal error.
+fn save_corpus_to_dir(corpus: &[CorpusEntry], dir: &std::path::Path) {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        tracing::warn!("[corpus] could not create corpus dir {}: {e}", dir.display());
+        return;
+    }
+    let path = dir.join("seq_corpus.json");
+    match serde_json::to_vec(corpus) {
+        Ok(bytes) => {
+            if let Err(e) = std::fs::write(&path, bytes) {
+                tracing::warn!("[corpus] write failed {}: {e}", path.display());
+            } else {
+                tracing::info!(
+                    "[corpus] saved {} entries to {}",
+                    corpus.len(),
+                    path.display()
+                );
+            }
+        }
+        Err(e) => tracing::warn!("[corpus] serialization failed: {e}"),
+    }
+}
+
+/// Load a corpus from `{dir}/seq_corpus.json` if it exists.
+///
+/// Returns an empty `Vec` if the file is absent or fails to parse — the
+/// campaign simply starts without prior corpus data.
+fn load_corpus_from_dir(dir: &std::path::Path) -> Vec<CorpusEntry> {
+    let path = dir.join("seq_corpus.json");
+    if !path.exists() {
+        return Vec::new();
+    }
+    match std::fs::read(&path) {
+        Err(e) => {
+            tracing::warn!("[corpus] read failed {}: {e}", path.display());
+            Vec::new()
+        }
+        Ok(bytes) => match serde_json::from_slice::<Vec<CorpusEntry>>(&bytes) {
+            Ok(entries) => {
+                tracing::info!(
+                    "[corpus] loaded {} entries from {}",
+                    entries.len(),
+                    path.display()
+                );
+                entries
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[corpus] parse failed (file may be from an older version) {}: {e}",
+                    path.display()
+                );
+                Vec::new()
+            }
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Corpus entry for splice crossover
 // ---------------------------------------------------------------------------
 
 /// A corpus entry tracking a sequence and its coverage contribution.
+#[derive(Serialize, Deserialize)]
 struct CorpusEntry {
     sequence: Vec<Transaction>,
     /// Number of unique coverage edges at time of insertion.
@@ -1628,5 +1703,100 @@ mod tests {
         Campaign::new(config)
             .run()
             .expect("two deploy targets should complete");
+    }
+
+    // ── Corpus persistence tests ────────────────────────────────────────────
+
+    #[test]
+    fn save_and_load_corpus_roundtrip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let entries = vec![
+            CorpusEntry {
+                sequence: vec![
+                    Transaction {
+                        sender: Address::repeat_byte(0x01),
+                        to: Some(Address::repeat_byte(0x42)),
+                        data: Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]),
+                        value: crate::types::U256::ZERO,
+                        gas_limit: 1_000_000,
+                    },
+                ],
+                novel_edge_count: 7,
+            },
+            CorpusEntry {
+                sequence: vec![],
+                novel_edge_count: 0,
+            },
+        ];
+
+        save_corpus_to_dir(&entries, dir.path());
+
+        // File must exist.
+        assert!(dir.path().join("seq_corpus.json").exists());
+
+        let loaded = load_corpus_from_dir(dir.path());
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].novel_edge_count, 7);
+        assert_eq!(loaded[0].sequence.len(), 1);
+        assert_eq!(loaded[1].sequence.len(), 0);
+    }
+
+    #[test]
+    fn load_corpus_returns_empty_when_dir_absent() {
+        let loaded = load_corpus_from_dir(std::path::Path::new("/nonexistent/path/xyz"));
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn load_corpus_returns_empty_on_corrupt_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("seq_corpus.json");
+        std::fs::write(&path, b"not valid json!!!").expect("write");
+
+        let loaded = load_corpus_from_dir(dir.path());
+        assert!(loaded.is_empty(), "should tolerate parse errors gracefully");
+    }
+
+    #[test]
+    fn campaign_persists_corpus_when_corpus_dir_set() {
+        let corpus_dir = tempfile::tempdir().expect("tempdir");
+
+        let config = CampaignConfig {
+            timeout: Duration::from_millis(300),
+            max_execs: Some(200),
+            max_depth: 4,
+            max_snapshots: 32,
+            workers: 1,
+            seed: 123,
+            targets: Vec::new(),
+            harness: None,
+            mode: ExecutorMode::Fast,
+            rpc_url: None,
+            rpc_block_number: None,
+            attacker_address: None,
+            corpus_dir: Some(corpus_dir.path().to_path_buf()),
+            ..Default::default()
+        };
+
+        Campaign::new(config)
+            .run()
+            .expect("campaign should complete");
+
+        // The corpus file must be written (even if the campaign found nothing).
+        let corpus_file = corpus_dir.path().join("seq_corpus.json");
+        assert!(
+            corpus_file.exists(),
+            "corpus file should have been written at {}",
+            corpus_file.display()
+        );
+
+        // The file must be valid JSON (even if the array is empty).
+        let bytes = std::fs::read(&corpus_file).expect("read corpus file");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("corpus must be valid JSON");
+        assert!(
+            parsed.is_array(),
+            "corpus JSON must be an array, got: {parsed}"
+        );
     }
 }

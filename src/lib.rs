@@ -97,6 +97,10 @@ pub mod project;
 /// Foundry harness `setUp()` execution helpers (`run_setup`, selector).
 pub mod harness;
 
+// ── CI output formatters ────────────────────────────────────────────────
+
+pub mod output;
+
 // ── CLI (feature-gated) ─────────────────────────────────────────────────
 
 #[cfg(feature = "cli")]

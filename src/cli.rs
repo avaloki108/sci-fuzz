@@ -175,6 +175,10 @@ pub struct ForgeArgs {
     #[arg(long)]
     pub fail_on_critical: bool,
 
+    /// Directory for corpus persistence across runs
+    #[arg(long)]
+    pub corpus_dir: Option<PathBuf>,
+
     /// Foundry build profile to use (sets FOUNDRY_PROFILE env var during build
     /// and reads the profile's `out` directory for artifacts). Useful when the
     /// echidna harness lives outside `src/` and needs a custom profile to compile.
@@ -352,6 +356,10 @@ pub struct CiArgs {
     /// GitHub Actions mode
     #[arg(long)]
     pub github_actions: bool,
+
+    /// Directory for corpus persistence across runs
+    #[arg(long)]
+    pub corpus_dir: Option<PathBuf>,
 }
 
 /// Arguments for the `diff` subcommand
