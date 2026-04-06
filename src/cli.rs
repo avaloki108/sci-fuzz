@@ -96,7 +96,12 @@ or replace the Foundry test runner. Use `sci-fuzz forge` for in-engine fuzzing.
         name = "ci",
         about = "Run security scan for CI/CD pipelines",
         long_about = r#"
-**Not implemented yet** — stub only. Use `sci-fuzz forge` or library API for real runs.
+Run a security scan for CI/CD pipelines.
+
+Runs a real campaign (50k execs, 2 workers, configurable timeout). Emits SARIF 2.1
+or JUnit XML output. Optionally writes GitHub Actions annotations (::error/warning/notice)
+and Forge .t.sol reproducers to test/repros/. Exits with code 2 when critical or high
+findings meet the configured thresholds (distinct from build error exit 1).
 "#
     )]
     Ci(CiArgs),

@@ -2,7 +2,7 @@
 
 A coverage-guided, snapshot-based EVM fuzzer that discovers invariant violations with minimal manual specification.
 
-**Status: serious prototype.** The fuzzing loop runs, the EVM executes, the invariant checkers fire. What remains is proving it against real targets.
+**Status: production-capable prototype.** Five improvement phases complete. The fuzzing loop, EVM executor, oracle stack, CI output pipeline, and corpus persistence all run. What remains is measured validation against real targets, a semantic shrinker, and differential fuzzing.
 
 ## What This Is
 
@@ -11,6 +11,8 @@ sci-fuzz is a Rust-based smart contract fuzzer built on [revm](https://github.co
 The name stands for **S**mart **C**ontract **I**nvariant **Fuzz**er. The thesis is that the biggest barrier to effective smart contract fuzzing isn't execution speed — it's the cost of writing good invariants. sci-fuzz attacks that problem through automated invariant generation, template libraries, and economic oracle detection.
 
 ## What Works Today
+
+> Five improvement phases have been completed since initial prototype. New or significantly improved items are tagged **[Phase N]**.
 
 - **EVM execution** via revm 19.7 with snapshot/restore (CacheDB cloning)
 - **Per-contract control-flow edge coverage** via a revm inspector that records `(prev_pc, current_pc)` transitions (per attributed contract) with raw hitcounts during execution
@@ -53,7 +55,17 @@ The name stands for **S**mart **C**ontract **I**nvariant **Fuzz**er. The thesis 
 - **Structured benchmark pipeline** — `sci-fuzz benchmark` runs repeatable multi-seed benchmark cases, records first-hit / repro / finding metrics, and emits stable CSV + JSON result files plus grouped summaries
 - **Comparison schema for Echidna / Forge** — benchmark rows now include `engine` and `status`, so the same artifact format can hold measured sci-fuzz runs alongside honest `unavailable` / `skipped` external comparison rows
 - **Benchmark matrix** — 81 entries mapping EF/CF contracts to expected vulnerability types, with file-existence and category-coverage validation tests
-- **133 benchmark contracts** from EF/CF covering reentrancy, selfdestruct, overflow, cross-function attacks, property tests, and assertion tests
+- **Forge VM cheatcodes** **[Phase 1]** — `vm.warp()`, `vm.roll()`, `vm.prank()`, `vm.deal()`, `vm.expectRevert()`, `vm.assume()`, `vm.store()`, and `vm.load()` are intercepted inside the revm execution loop. Harnesses that use these cheatcodes in `setUp()` and test functions now execute correctly instead of reverting.
+- **Extended mutation engine** **[Phase 2]** — configurable mutation depth limits, sequence-splice mutations (cross-sequence segment recombination), and time-aware mutations (block timestamp / block number perturbation during calldata generation). These lift coverage on time-gated and multi-step state machines that were previously invisible to the fuzzer.
+- **Access-control oracle** **[Phase 3]** — `AccessControlOracle` detects when a non-owner sender successfully calls a function that contains `onlyOwner` / `onlyRole`-pattern reverts for other senders. Auto-registers on contracts whose ABIs include standard `Ownable` / `AccessControl` event signatures.
+- **Reentrancy oracle** **[Phase 3]** — `ReentrancyOracle` flags `SSTORE` writes inside nested calls (`call_depth > 1`) combined with net ETH profit. Integrates with the `CoverageInspector` via the `sstore_in_nested_call` flag on `ExecutionResult`.
+- **Token-flow conservation oracle** **[Phase 3]** — `TokenFlowConservationOracle` detects ERC-20 balance drain: tracks pre/post-sequence `balanceOf` for a specified token and target, fires High/Critical when the attacker gains more tokens than the target loses.
+- **CI output pipeline** **[Phase 4]** — `src/output.rs` provides three pure formatters:
+  - `sarif_from_findings()` — SARIF 2.1.0 JSON (GitHub Code Scanning, GitLab SAST, any SARIF consumer). Deduplicates the `rules` array; maps Critical/High → `"error"`, Medium → `"warning"`, Low/Info → `"note"`.
+  - `junit_from_findings()` — JUnit XML. Emits a passing testcase on clean runs so CI parsers always see at least one result.
+  - `forge_reproducer()` — compilable Solidity `.t.sol` skeleton with `vm.prank()` + `call{value:}` for each transaction in the reproducer sequence.
+- **`sci-fuzz ci` command** **[Phase 4]** — fully implemented (`handle_ci()` in `main.rs`). Runs a real campaign (50k execs, seed `0xcafebabe`, 2 workers, configurable timeout). Emits GitHub Actions `::error/warning/notice` annotations when `--github-actions` is passed. Writes Forge `.t.sol` reproducers to `test/repros/`. Exits with code `2` when critical/high findings meet configured thresholds (distinct from build error exit `1`).
+- **Corpus persistence** **[Phase 5]** — `CampaignConfig::corpus_dir` (optional `PathBuf`) enables JSON-based corpus save/load across campaign runs. Load injects up to 64 prior entries at campaign start; save runs at campaign end after the main loop. All I/O failures are `tracing::warn!` only — corpus loss never terminates a run. CLI flags: `--corpus-dir` on both `forge` and `ci` subcommands.
 
 ## What Does Not Work Yet
 
@@ -61,37 +73,45 @@ Honesty matters more than marketing. These are real gaps:
 
 - **Path IDs are a compact fingerprint, not a perfect trace.** Full canonical basic-block traces, call-depth-indexed edge keys beyond the current contract attribution, and a global path database are still out of scope. Path novelty uses bounded caches — under extreme uniqueness pressure, older path IDs may be evicted and re-novel. Native mock-flashloan txs use a deterministic synthetic path ID (no bytecode inspector).
 - **Shrinking is still a first pass.** The shrinker is deterministic and useful today, but it is not yet a full semantic reducer: it does not reason about ABI types, storage dependencies, or minimal base-state snapshots, and it does not guarantee globally minimal sequences.
-- **No distributed fuzzing** — still the case: parallel workers are threads in one process only; there is no multi-machine corpus or coordinator (see multi-worker **Scope** above).
-- **Foundry integration gaps after harness setup.** Script-based deploy flows, library-specific bootstrapping, and Forge cheatcodes (`vm.*`) are not implemented. Harness `setUp` must be plain Solidity (deploy, calls, storage); tests that rely on the Forge cheatcode VM may revert or behave incorrectly — error strings from sci-fuzz mention the lack of `vm.*`. There is still no `StdInvariant` / `targetContract` import path or parity with Foundry’s invariant runner.
-- **CLI stubs:** `sci-fuzz test`, `sci-fuzz ci`, and `sci-fuzz diff` are **not implemented** (they print a placeholder message). Use `sci-fuzz forge` or the library API for real runs.
+- **No distributed fuzzing** — parallel workers are threads in one process only; there is no multi-machine corpus or coordinator (see multi-worker **Scope** above).
+- **Parallel campaign corpus persistence not wired.** `corpus_dir` is loaded and saved only via the single-worker path in `run_with_report()`. The parallel `run_parallel_campaign()` path does not read from or write to the corpus directory.
+- **Foundry integration gaps beyond basic cheatcodes.** Script-based deploy flows, library-specific bootstrapping, `StdInvariant` / `targetContract` wiring, and multi-contract setup scripts are not implemented. Phase 1 covered the common cheatcodes (`vm.warp`, `vm.roll`, `vm.prank`, `vm.deal`, `vm.expectRevert`, `vm.assume`, `vm.store`, `vm.load`), but full equivalence with Foundry's invariant runner is not the goal.
+- **CLI stubs remaining: `sci-fuzz test` and `sci-fuzz diff`** print placeholder messages. `sci-fuzz ci` is now fully implemented. `sci-fuzz test` and `sci-fuzz diff` are not.
+- **LendingHealthOracle not implemented.** `Borrow`-event based lending health / solvency checking is planned but not yet written. The `PairwiseStorageDriftOracle` for lending-style debt-vs-collateral raw slot comparison is available but not in the default registry.
 - **External comparison execution is still partial.** `sci-fuzz benchmark` has a real measured path for sci-fuzz and a stable comparison schema for Echidna / Forge, but it does not yet orchestrate those tools end-to-end on shared targets. Their rows are reported as `unavailable` or `skipped`, never faked.
-- **Not Foundry fork-test parity.** `sci-fuzz` can fork via JSON-RPC and fuzz from live-like state, but there is **no** Forge cheatcode VM (`vm.*`), no `StdInvariant` / `targetContract` wiring, and no automatic script-based protocol setup beyond a single harness `setUp()` when using Foundry artifacts. Deep protocol bootstrapping is still manual or ABI-driven.
-- **Partial Echidna compatibility.** `EchidnaPropertyCaller` implements the core workflow (discover echidna_* functions, call them, check bool return). `EchidnaProperty` detects assertion events in logs. Neither handles revert/assert distinction with full Echidna fidelity, and the property-harness workflow (targetContract, configurable test limits, shrinking) is not implemented.
-- **Economic and conservation oracles remain heuristic despite ABI hints and probes.** Storage slot layouts (ERC-20 `totalSupply` at slot 2, balances at mapping slot 0) still match common OpenZeppelin layouts and break on proxies, diamonds, and custom storage. Classification and gating reduce some noise but do not guarantee soundness. Rate-jump, same-tx spread, and “no Transfer to vault” checks can still false-positive on extreme rounding, first-liquidity edges, donation economics, or non-standard vaults. Probe-vs-event checks can false-positive on fee-on-transfer assets, donation-style reserve moves, or non-standard vaults/pairs. **Conservation** checks (Sync window explanation, Deposit vs underlying `Transfer`) improve triage for pools and vaults but are **not** sound accounting proofs; bridges and generic **lending health/solvency** are still not modeled. **Protocol probes** are bounded per step, require ABI + classification hits for vault-specific calls (underlying `balanceOf` uses a fixed selector and does not require the asset in the target ABI map), and do not replace a full Forge cheatcode VM or deep fork/bootstrap realism.
+- **Partial Echidna compatibility.** `EchidnaPropertyCaller` implements the core workflow (discover `echidna_*` functions, call them, check bool return). `EchidnaProperty` detects assertion events in logs. Neither handles revert/assert distinction with full Echidna fidelity, and the property-harness workflow (`targetContract`, configurable test limits, shrinking) is not implemented.
+- **Economic and conservation oracles remain heuristic despite ABI hints and probes.** Storage slot layouts (ERC-20 `totalSupply` at slot 2, balances at mapping slot 0) still match common OpenZeppelin layouts and break on proxies, diamonds, and custom storage. Classification and gating reduce some noise but do not guarantee soundness. Rate-jump, same-tx spread, and “no Transfer to vault” checks can still false-positive on extreme rounding, first-liquidity edges, donation economics, or non-standard vaults. Probe-vs-event checks can false-positive on fee-on-transfer assets, donation-style reserve moves, or non-standard vaults/pairs. **Conservation** checks (Sync window explanation, Deposit vs underlying `Transfer`) improve triage for pools and vaults but are **not** sound accounting proofs; bridges and generic **lending health/solvency** are still not modeled.
 - **The 207k execs/sec number is a smoke test.** It measures empty-target throughput. Real contracts with storage and complex logic will run at 1–5k execs/sec. The number demonstrates low framework overhead, not security-testing strength.
 
 ## Architecture
 
 ```text
-campaign.rs    main loop: calibrate → (optional) parallel workers → shared corpus/feedback → execute → check → learn
-harness.rs     Foundry-style setUp() selector + one-shot setup execution on the revm executor
-evm.rs         revm 19.7 wrapper: execute, deploy, static_call, snapshot/restore, Fast/Realistic modes, edge coverage + ordered path stream
-path_id.rs     rolling path hash, per-sequence fold, native-flashloan synthetic id
-snapshot.rs    state corpus: novelty-weighted selection, power scheduling metadata, auto-pruning over real coverage
-feedback.rs    AFL++ hitcount bucketing (8 classes), virgin-bits tracking, bounded path-ID novelty
-mutator.rs     ABI-aware generation, 5 mutation strategies, value dictionary, bytecode constant extraction
-economic.rs    exploit-oriented economic invariants (ERC-4626, ERC-20 accounting, AMM swap/sync sanity, optional lending drift, probe-informed checks)
-conservation.rs    log-order helpers for reserve/Sync conservation reasoning
+campaign.rs          main loop: calibrate → (optional) parallel workers → shared corpus/feedback → execute → check → learn
+                     corpus save/load via corpus_dir at start/end of run_with_report()
+harness.rs           Foundry-style setUp() selector + one-shot setup execution on the revm executor
+evm.rs               revm 19.7 wrapper: execute, deploy, static_call, snapshot/restore, Fast/Realistic modes
+                     edge coverage + ordered path stream + call_depth tracking + sstore_in_nested_call flag [Phase 3]
+path_id.rs           rolling path hash, per-sequence fold, native-flashloan synthetic id
+snapshot.rs          state corpus: novelty-weighted selection, power scheduling metadata, auto-pruning over real coverage
+feedback.rs          AFL++ hitcount bucketing (8 classes), virgin-bits tracking, bounded path-ID novelty
+mutator.rs           ABI-aware generation, 5 mutation strategies + splice + time-aware mutations [Phase 2], value dictionary
+output.rs            SARIF 2.1 / JUnit XML / Forge .t.sol reproducer formatters [Phase 4]
+economic.rs          exploit-oriented economic invariants (ERC-4626, ERC-20 accounting, AMM swap/sync sanity, optional lending drift, probe-informed checks)
+conservation.rs      log-order helpers for reserve/Sync conservation reasoning
 conservation_oracles.rs  AmmSyncExplainedOracle, Erc4626DepositVsUnderlyingTransferOracle
-protocol_probes.rs  post-tx static_call probes (ERC-4626 / ERC-20 / AMM) into ExecutionResult
+protocol_probes.rs   post-tx static_call probes (ERC-4626 / ERC-20 / AMM) into ExecutionResult
 protocol_semantics.rs  best-effort ABI/event protocol classification and triage helpers for economic oracles
-invariant.rs   Invariant trait + default registry + EchidnaPropertyCaller
-oracle.rs      routes execution results through invariant registry; balance baselines supplied per `check` (see `capture_eth_baseline`)
-types.rs       core types built on alloy-primitives (Address, U256, B256); ExecutionResult includes tx_path_id, sequence_cumulative_logs, protocol_probes
-scoreboard.rs  stable benchmark result / summary schema + CSV / JSON writers
-benchmark.rs   benchmark case loading, sci-fuzz measurement, comparison scaffolding
-cli.rs         clap-based CLI: benchmark, forge, audit, test, ci, diff, version
-rpc.rs         JSON-RPC fork DB (RpcCacheDB), chain id, full block header parse/merge into BlockEnv, enriched deployed-target preflight (proxy hint, optional bytecode hydration)
+invariant.rs         Invariant trait + default registry + EchidnaPropertyCaller
+                     AccessControlOracle, ReentrancyOracle, TokenFlowConservationOracle [Phase 3]
+oracle.rs            routes execution results through invariant registry; balance baselines supplied per check
+types.rs             core types built on alloy-primitives (Address, U256, B256)
+                     ExecutionResult: tx_path_id, sequence_cumulative_logs, protocol_probes, sstore_in_nested_call [Phase 3]
+                     CampaignConfig: corpus_dir [Phase 5]
+scoreboard.rs        stable benchmark result / summary schema + CSV / JSON writers
+benchmark.rs         benchmark case loading, sci-fuzz measurement, comparison scaffolding
+cli.rs               clap-based CLI: benchmark, forge, audit, test, ci (implemented), diff (stub), version
+rpc.rs               JSON-RPC fork DB (RpcCacheDB), chain id, full block header parse/merge into BlockEnv
+main.rs              CLI dispatch; handle_forge(), handle_ci() [Phase 4], handle_benchmark(), handle_audit()
 ```
 
 ## Installation
@@ -118,6 +138,9 @@ sci-fuzz forge --project /path/to/foundry-project --depth 32 --max-snapshots 819
 # Reproducible run
 sci-fuzz forge --seed 42 --timeout 60
 
+# Persist corpus across runs (resumes from prior interesting inputs)
+sci-fuzz forge --project /path/to/project --corpus-dir .sci-fuzz/corpus --timeout 600
+
 # Foundry project + JSON-RPC fork (optional block pin; or set eth_rpc_url in foundry.toml)
 sci-fuzz forge --project /path/to/project --fork-url https://eth.llamarpc.com --fork-block 19000000 --timeout 600
 
@@ -126,6 +149,10 @@ export ETH_RPC_URL=https://eth.llamarpc.com
 sci-fuzz audit 0xYourTarget --chain mainnet --timeout 300
 # Multiple predeployed targets on the same fork
 sci-fuzz audit 0xVault 0xRouter 0xOracle --chain mainnet --timeout 300
+
+# CI security scan — emits SARIF/JUnit, GitHub Actions annotations, Forge reproducers
+sci-fuzz ci --project . --output-format sarif --output results.sarif --github-actions --fail-on-critical
+sci-fuzz ci --project . --output-format junit --output results.xml --corpus-dir .sci-fuzz/corpus
 
 # Run the built-in EF/CF benchmark preset and emit CSV/JSON evidence
 sci-fuzz benchmark --preset efcf-demo --seeds 1,2,3 --max-execs 5000 --output-dir target/benchmark
@@ -245,15 +272,33 @@ Progress today:
 - Multi-seed sci-fuzz measurements are real.
 - Echidna / Forge comparison rows are scaffolded but not yet measured.
 - The full 81-entry matrix is not populated yet.
+- CI output (SARIF, JUnit, Forge reproducers) is implemented and tested.
+- Corpus persistence across runs is implemented.
 
-Until the shared-target comparison rows become measured rather than scaffolded, sci-fuzz remains a working prototype rather than a production-ready benchmarked tool.
+Until the shared-target comparison rows become measured rather than scaffolded, sci-fuzz remains a strong prototype rather than a fully validated production tool.
+
+## Roadmap
+
+| Phase | Description | Status |
+|-------|-------------|--------|
+| Phase 1 | Forge VM cheatcodes (`vm.warp`, `vm.roll`, `vm.prank`, `vm.deal`, `vm.expectRevert`, `vm.assume`, `vm.store`, `vm.load`) | ✅ Complete |
+| Phase 2 | Mutation depth controls, sequence-splice mutations, time-aware mutations | ✅ Complete |
+| Phase 3 | `AccessControlOracle`, `ReentrancyOracle`, `TokenFlowConservationOracle`; `sstore_in_nested_call` in executor | ✅ Complete |
+| Phase 4 | CI output: SARIF 2.1, JUnit XML, Forge `.t.sol` reproducers; functional `sci-fuzz ci` command | ✅ Complete |
+| Phase 5 | Corpus persistence: JSON save/load across runs, `--corpus-dir` flag | ✅ Complete |
+| Phase 6 | `LendingHealthOracle`: borrow-event collateral ratio enforcement | ⬜ Not started |
+| Phase 7 | Semantic shrinker: ABI-type-aware reduction, storage-dependency ordering | ⬜ Not started |
+| Phase 8 | `sci-fuzz diff`: differential fuzzing between two implementations | ⬜ Not started |
+| Phase 9 | Parallel corpus persistence: wire `corpus_dir` into `run_parallel_campaign()` | ⬜ Not started |
+| Phase 10 | Measured benchmark matrix: 81-entry matrix with real pass/fail/time data | ⬜ Not started |
 
 ## Project Stats
 
 | Metric | Value |
 |--------|-------|
-| Rust source | ~12,000 lines in `src/` (20+ modules) |
-| Unit tests | 130+ passing (`cargo test --lib`) |
+| Rust source | ~13,500 lines in `src/` (21 modules) |
+| Unit tests | 183+ passing (`cargo test --lib`) |
+| New tests added across Phases 1–5 | 26+ (10 oracle, 12 output, 4 corpus) |
 | Benchmark contracts | 133 (from EF/CF) |
 | Benchmark matrix entries | 81 with expected bug types |
 | Dependencies | revm 19.7, alloy-primitives 0.8, clap 4, serde, rand, tiny-keccak |

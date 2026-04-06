@@ -99,6 +99,10 @@ impl ContractProtocolProfile {
     pub fn is_amm_pair_like(&self) -> bool {
         self.amm_score >= 3
     }
+
+    pub fn is_lending_like(&self) -> bool {
+        self.lending_score >= 3
+    }
 }
 
 fn push_signal(signals: &mut Vec<String>, s: impl Into<String>) {

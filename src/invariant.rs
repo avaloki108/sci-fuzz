@@ -980,6 +980,140 @@ impl Invariant for TokenFlowConservationOracle {
 }
 
 // ---------------------------------------------------------------------------
+// Built-in: LendingHealthOracle (Phase 6)
+// ---------------------------------------------------------------------------
+
+/// Detects uncollateralised or anomalous borrow patterns in lending protocols.
+///
+/// Monitors cumulative sequence logs for [`Borrow`] and [`Repay`]/[`RepayBorrow`]
+/// events, accumulates net unbacked debt, and fires when the net borrow amount
+/// exceeds [`min_net_borrow`].  Profile-gated: when [`profiles`] is provided,
+/// only logs emitted by contracts classified as lending-like (see
+/// [`crate::protocol_semantics::ContractProtocolProfile::is_lending_like`]) are
+/// considered.
+///
+/// Recognised event signatures (amount always decoded from `data[0..32]`):
+/// - `Borrow(address,address,uint256)` — simplified / generic
+/// - `Borrow(address,uint256,uint256,uint256)` — Compound-v2 style
+/// - `Repay(address,address,uint256)` — simplified / generic
+/// - `RepayBorrow(address,address,uint256,uint256,uint256)` — Compound-v2 style
+pub struct LendingHealthOracle {
+    /// Minimum net-unbacked borrow (in token base units) required to fire.
+    pub min_net_borrow: U256,
+    /// Optional ABI-derived protocol profiles for lending-contract gating.
+    /// When `None` the oracle considers every matching borrow event.
+    pub profiles: Option<ProtocolProfileMap>,
+    /// Fuzzer-controlled attacker address.  Used to escalate severity to
+    /// [`Severity::High`] when the attacker also gains ETH in the sequence.
+    pub attacker: Address,
+}
+
+impl Invariant for LendingHealthOracle {
+    fn name(&self) -> &str {
+        "lending-health"
+    }
+
+    fn check(
+        &self,
+        _pre_balances: &HashMap<Address, U256>,
+        result: &ExecutionResult,
+        sequence: &[Transaction],
+    ) -> Option<Finding> {
+        let borrow_t_a = keccak256(b"Borrow(address,address,uint256)");
+        let borrow_t_b = keccak256(b"Borrow(address,uint256,uint256,uint256)");
+        let repay_t_a = keccak256(b"Repay(address,address,uint256)");
+        let repay_t_b = keccak256(b"RepayBorrow(address,address,uint256,uint256,uint256)");
+
+        let logs = if result.sequence_cumulative_logs.is_empty() {
+            &result.logs
+        } else {
+            &result.sequence_cumulative_logs
+        };
+
+        let mut total_borrow = U256::ZERO;
+        let mut total_repay = U256::ZERO;
+
+        for log in logs {
+            let Some(&topic0) = log.topics.first() else {
+                continue;
+            };
+
+            // Profile gating: only consider events from lending-like contracts
+            // when profile data is available.
+            if let Some(ref pmap) = self.profiles {
+                match pmap.get(&log.address) {
+                    Some(p) if p.is_lending_like() => {}
+                    _ => continue,
+                }
+            }
+
+            if log.data.len() < 32 {
+                continue;
+            }
+            let amount = U256::from_be_slice(&log.data[..32]);
+            if amount.is_zero() {
+                continue;
+            }
+
+            if topic0 == borrow_t_a || topic0 == borrow_t_b {
+                total_borrow = total_borrow.saturating_add(amount);
+            } else if topic0 == repay_t_a || topic0 == repay_t_b {
+                total_repay = total_repay.saturating_add(amount);
+            }
+        }
+
+        let net_borrow = total_borrow.saturating_sub(total_repay);
+        if net_borrow < self.min_net_borrow {
+            return None;
+        }
+
+        // Escalate to High if the attacker also gained ETH this sequence.
+        let attacker_profit = result
+            .state_diff
+            .balance_changes
+            .get(&self.attacker)
+            .and_then(|(pre, post)| post.checked_sub(*pre))
+            .unwrap_or(U256::ZERO);
+
+        let severity = if attacker_profit > U256::ZERO {
+            Severity::High
+        } else {
+            Severity::Medium
+        };
+
+        let contract = sequence
+            .first()
+            .and_then(|tx| tx.to)
+            .unwrap_or(Address::ZERO);
+
+        Some(Finding {
+            severity,
+            title: format!(
+                "Lending health violation: {net_borrow} net unbacked borrow units detected"
+            ),
+            description: format!(
+                "Net uncollateralised borrow: {net_borrow} base units \
+                 (total borrow {total_borrow}, repaid {total_repay}). \
+                 Lending position may be undercollateralised or an unbacked \
+                 flash-borrow left residual debt.{}",
+                if attacker_profit > U256::ZERO {
+                    format!(" Attacker profit: {attacker_profit} wei.")
+                } else {
+                    String::new()
+                },
+            ),
+            contract,
+            reproducer: sequence.to_vec(),
+            exploit_profit: if attacker_profit > U256::ZERO {
+                Some(attacker_profit)
+            } else {
+                None
+            },
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
 
@@ -1087,10 +1221,16 @@ impl InvariantRegistry {
             profiles: pmap.clone(),
         }));
         reg.add(Box::new(Erc4626FirstDepositorInflationOracle {
-            profiles: pmap,
+            profiles: pmap.clone(),
         }));
         // Phase 3 additions: reentrancy oracle (always on — profit gate reduces noise).
         reg.add(Box::new(ReentrancyOracle { attacker }));
+        // Phase 6: LendingHealthOracle (profile-gated — no-op on non-lending targets).
+        reg.add(Box::new(LendingHealthOracle {
+            min_net_borrow: U256::from(1_000_000_000_000_000_000u64), // 1 token unit (18 dp)
+            profiles: pmap,
+            attacker,
+        }));
         reg
     }
 
@@ -1301,8 +1441,8 @@ mod tests {
         // UniswapV2StyleSwapReserve, AmmSyncExplained, Erc4626PreviewVsDepositEvent,
         // UniswapV2StyleSyncVsGetReserves, Erc4626RateJumpWithoutTokenFlow,
         // Erc4626DepositVsUnderlyingTransfer, Erc4626FirstDepositorInflation,
-        // ReentrancyOracle (20 total)
-        assert_eq!(reg.len(), 20);
+        // ReentrancyOracle, LendingHealthOracle (21 total)
+        assert_eq!(reg.len(), 21);
         assert!(!reg.is_empty());
     }
 
@@ -1491,8 +1631,8 @@ mod tests {
         let attacker = Address::repeat_byte(0x99);
         let tokens = vec![Address::repeat_byte(0xA1), Address::repeat_byte(0xA2)];
         let reg = InvariantRegistry::with_erc20(attacker, &tokens);
-        // 20 defaults + 2 ERC20Supply invariants
-        assert_eq!(reg.len(), 22);
+        // 21 defaults + 2 ERC20Supply invariants
+        assert_eq!(reg.len(), 23);
     }
 
     // -- EchidnaPropertyCaller tests ------------------------------------------
@@ -1848,5 +1988,201 @@ mod tests {
         let seq = dummy_sequence(target);
 
         assert!(oracle.check(&HashMap::new(), &result, &seq).is_none());
+    }
+
+    // -- LendingHealthOracle tests --------------------------------------------
+
+    fn make_borrow_log(contract: Address, amount: U256) -> Log {
+        let borrow_t = keccak256(b"Borrow(address,address,uint256)");
+        Log {
+            address: contract,
+            topics: vec![borrow_t],
+            data: Bytes::from(amount.to_be_bytes::<32>().to_vec()),
+        }
+    }
+
+    fn make_repay_log(contract: Address, amount: U256) -> Log {
+        let repay_t = keccak256(b"Repay(address,address,uint256)");
+        Log {
+            address: contract,
+            topics: vec![repay_t],
+            data: Bytes::from(amount.to_be_bytes::<32>().to_vec()),
+        }
+    }
+
+    #[test]
+    fn lending_health_fires_on_simple_borrow_event() {
+        let attacker = Address::repeat_byte(0xAA);
+        let lending = Address::repeat_byte(0x10);
+        let oracle = LendingHealthOracle {
+            min_net_borrow: U256::from(1u64),
+            profiles: None,
+            attacker,
+        };
+
+        let log = make_borrow_log(lending, U256::from(1_000_000u64));
+        let mut result = make_result(true, HashMap::new());
+        result.sequence_cumulative_logs = vec![log];
+        let seq = dummy_sequence(lending);
+
+        let finding = oracle.check(&HashMap::new(), &result, &seq);
+        assert!(finding.is_some());
+        let f = finding.unwrap();
+        assert_eq!(f.severity, Severity::Medium);
+        assert!(f.title.contains("Lending health"));
+    }
+
+    #[test]
+    fn lending_health_fires_on_compound_style_borrow_event() {
+        let attacker = Address::repeat_byte(0xAA);
+        let lending = Address::repeat_byte(0x10);
+        let oracle = LendingHealthOracle {
+            min_net_borrow: U256::from(1u64),
+            profiles: None,
+            attacker,
+        };
+
+        // Compound-v2 style: Borrow(address,uint256,uint256,uint256)
+        // data = [borrowAmount, accountBorrows, totalBorrows] (each 32 bytes)
+        let borrow_t = keccak256(b"Borrow(address,uint256,uint256,uint256)");
+        let amount = U256::from(5_000_000u64);
+        let mut data = vec![0u8; 96];
+        data[..32].copy_from_slice(&amount.to_be_bytes::<32>());
+        let log = Log {
+            address: lending,
+            topics: vec![borrow_t],
+            data: Bytes::from(data),
+        };
+
+        let mut result = make_result(true, HashMap::new());
+        result.sequence_cumulative_logs = vec![log];
+        let seq = dummy_sequence(lending);
+
+        let finding = oracle.check(&HashMap::new(), &result, &seq);
+        assert!(finding.is_some());
+        let f = finding.unwrap();
+        assert_eq!(f.severity, Severity::Medium);
+        assert!(f.title.contains("unbacked"));
+    }
+
+    #[test]
+    fn lending_health_suppressed_below_threshold() {
+        let attacker = Address::repeat_byte(0xAA);
+        let lending = Address::repeat_byte(0x10);
+        let oracle = LendingHealthOracle {
+            min_net_borrow: U256::from(1_000_000_000_000_000_000u64), // 1e18
+            profiles: None,
+            attacker,
+        };
+
+        let log = make_borrow_log(lending, U256::from(100u64)); // dust
+        let mut result = make_result(true, HashMap::new());
+        result.sequence_cumulative_logs = vec![log];
+        let seq = dummy_sequence(lending);
+
+        assert!(oracle.check(&HashMap::new(), &result, &seq).is_none());
+    }
+
+    #[test]
+    fn lending_health_suppressed_when_fully_repaid() {
+        let attacker = Address::repeat_byte(0xAA);
+        let lending = Address::repeat_byte(0x10);
+        let oracle = LendingHealthOracle {
+            min_net_borrow: U256::from(1u64),
+            profiles: None,
+            attacker,
+        };
+
+        let borrow_log = make_borrow_log(lending, U256::from(1_000_000u64));
+        let repay_log = make_repay_log(lending, U256::from(1_000_000u64)); // fully repaid
+        let mut result = make_result(true, HashMap::new());
+        result.sequence_cumulative_logs = vec![borrow_log, repay_log];
+        let seq = dummy_sequence(lending);
+
+        assert!(oracle.check(&HashMap::new(), &result, &seq).is_none());
+    }
+
+    #[test]
+    fn lending_health_escalates_to_high_with_attacker_profit() {
+        let attacker = Address::repeat_byte(0xAA);
+        let lending = Address::repeat_byte(0x10);
+        let oracle = LendingHealthOracle {
+            min_net_borrow: U256::from(1u64),
+            profiles: None,
+            attacker,
+        };
+
+        let log = make_borrow_log(lending, U256::from(1_000_000u64));
+        // Attacker gained 1 ETH during the sequence.
+        let mut bc = HashMap::new();
+        bc.insert(
+            attacker,
+            (U256::ZERO, U256::from(1_000_000_000_000_000_000u64)),
+        );
+        let mut result = make_result(true, bc);
+        result.sequence_cumulative_logs = vec![log];
+        let seq = dummy_sequence(lending);
+
+        let finding = oracle.check(&HashMap::new(), &result, &seq);
+        assert!(finding.is_some());
+        let f = finding.unwrap();
+        assert_eq!(f.severity, Severity::High);
+        assert!(f.exploit_profit.is_some());
+    }
+
+    #[test]
+    fn lending_health_suppressed_on_non_lending_profile() {
+        use std::sync::Arc;
+        let attacker = Address::repeat_byte(0xAA);
+        let lending = Address::repeat_byte(0x10);
+
+        // Profile says ERC20, not lending.
+        let mut profile = crate::protocol_semantics::ContractProtocolProfile::default();
+        profile.erc20_score = 5;
+        profile.lending_score = 0;
+        let mut pmap = HashMap::new();
+        pmap.insert(lending, profile);
+
+        let oracle = LendingHealthOracle {
+            min_net_borrow: U256::from(1u64),
+            profiles: Some(Arc::new(pmap)),
+            attacker,
+        };
+
+        let log = make_borrow_log(lending, U256::from(1_000_000u64));
+        let mut result = make_result(true, HashMap::new());
+        result.sequence_cumulative_logs = vec![log];
+        let seq = dummy_sequence(lending);
+
+        assert!(oracle.check(&HashMap::new(), &result, &seq).is_none());
+    }
+
+    #[test]
+    fn lending_health_fires_on_lending_profile() {
+        use std::sync::Arc;
+        let attacker = Address::repeat_byte(0xAA);
+        let lending = Address::repeat_byte(0x10);
+
+        // Profile says lending_score = 4 → is_lending_like() returns true.
+        let mut profile = crate::protocol_semantics::ContractProtocolProfile::default();
+        profile.lending_score = 4;
+        let mut pmap = HashMap::new();
+        pmap.insert(lending, profile);
+
+        let oracle = LendingHealthOracle {
+            min_net_borrow: U256::from(1u64),
+            profiles: Some(Arc::new(pmap)),
+            attacker,
+        };
+
+        let log = make_borrow_log(lending, U256::from(1_000_000u64));
+        let mut result = make_result(true, HashMap::new());
+        result.sequence_cumulative_logs = vec![log];
+        let seq = dummy_sequence(lending);
+
+        let finding = oracle.check(&HashMap::new(), &result, &seq);
+        assert!(finding.is_some());
+        let f = finding.unwrap();
+        assert_eq!(f.severity, Severity::Medium);
     }
 }
