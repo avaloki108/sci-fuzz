@@ -673,12 +673,15 @@ impl Campaign {
 
                 // vm.assume(false) → treat as precondition rejection, skip
                 // invariant checks and snapshot saving for this sequence.
-                if result.assume_violated {
-                    continue;
-                }
+
 
                 // Diagnostic: track deposit/withdraw patterns.
                 if result.success && tx.data.len() >= 4 {
+                // Skip invariant checks on expected reverts — they are intentional.
+                if result.revert_was_expected {
+                    continue;
+                }
+
                     let sel: [u8; 4] = [tx.data[0], tx.data[1], tx.data[2], tx.data[3]];
                     if sel == DEPOSIT_SEL && tx.value > U256::ZERO {
                         diag_funded_deposits += 1;
