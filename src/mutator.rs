@@ -536,6 +536,11 @@ impl TxMutator {
         for target in &targets {
             address_pool.push(target.address);
 
+            // Seed dictionary with target contract address so ABI arg generation
+            // biases toward known contracts (40% contract targets, 40% dictionary,
+            // 20% random).
+            dict.address_values.push(target.address);
+
             // Seed dictionary from deployed bytecode.
             dict.seed_from_bytecode(&target.deployed_bytecode);
 
