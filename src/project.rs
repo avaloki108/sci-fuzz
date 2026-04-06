@@ -495,7 +495,8 @@ impl Project {
 
     /// Get the output directory for artifacts
     pub fn get_out_dir(&self) -> PathBuf {
-        self.config
+        let from_config = self
+            .config
             .as_ref()
             .and_then(|c| {
                 c.profile
@@ -503,8 +504,24 @@ impl Project {
                     .and_then(|p| p.out.as_ref())
                     .cloned()
             })
-            .map(|path| self.resolve_project_path(path))
-            .unwrap_or_else(|| self.root.join("out"))
+            .map(|path| self.resolve_project_path(path));
+
+        if let Some(ref out) = from_config {
+            if out.exists() {
+                return out.clone();
+            }
+        }
+
+        // Preferred manual-build directory (e.g. built with echidna source include).
+        // This is prioritized over the standard `out/` when present because it
+        // typically was built specifically for fuzzing (smaller artifact set,
+        // echidna harnesses included).
+        let scifuzz_out = self.root.join("out-scifuzz");
+        if scifuzz_out.exists() {
+            return scifuzz_out;
+        }
+
+        from_config.unwrap_or_else(|| self.root.join("out"))
     }
 
     /// Check if this is a valid Foundry project
