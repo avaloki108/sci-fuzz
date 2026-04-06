@@ -88,6 +88,7 @@ pub mod rpc;
 // ── Benchmark scoreboard ────────────────────────────────────────────────
 
 pub mod benchmark;
+pub mod diff;
 pub mod scoreboard;
 
 // ── Foundry integration ─────────────────────────────────────────────────

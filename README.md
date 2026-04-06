@@ -2,7 +2,7 @@
 
 A coverage-guided, snapshot-based EVM fuzzer that discovers invariant violations with minimal manual specification.
 
-**Status: production-capable prototype.** Six improvement phases complete. The fuzzing loop, EVM executor, oracle stack (including lending health detection), CI output pipeline, and corpus persistence all run. What remains is measured validation against real targets, a semantic shrinker, and differential fuzzing.
+**Status: production-capable prototype.** Six improvement phases complete. The fuzzing loop, EVM executor, oracle stack (including lending health detection), CI output pipeline, corpus persistence, and a narrow `sci-fuzz diff` MVP all run. What remains is measured validation against real targets and a semantic shrinker.
 
 ## What This Is
 
@@ -77,7 +77,7 @@ Honesty matters more than marketing. These are real gaps:
 - **Shrinking is still a first pass.** The shrinker is deterministic and useful today, but it is not yet a full semantic reducer: it does not reason about ABI types, storage dependencies, or minimal base-state snapshots, and it does not guarantee globally minimal sequences.
 - **No distributed fuzzing** — parallel workers are threads in one process only; there is no multi-machine corpus or coordinator (see multi-worker **Scope** above).
 - **Foundry integration gaps beyond basic cheatcodes.** Script-based deploy flows, library-specific bootstrapping, `StdInvariant` / `targetContract` wiring, and multi-contract setup scripts are not implemented. Phase 1 covered the common cheatcodes (`vm.warp`, `vm.roll`, `vm.prank`, `vm.deal`, `vm.expectRevert`, `vm.assume`, `vm.store`, `vm.load`), but full equivalence with Foundry's invariant runner is not the goal.
-- **`sci-fuzz diff` is still a stub.** `sci-fuzz test` now runs a thin in-engine campaign wrapper for the current Foundry project, but differential fuzzing is not implemented.
+- **`sci-fuzz diff` is now an MVP differential executor, not a semantic proof system.** It compares two local Foundry artifacts/contract targets by replaying identical generated calls and reports reproducible divergences: success/revert asymmetry, ABI-decoded output differences when output ABIs match, raw return-data differences when decode is unavailable, and lightweight log topic0 sequence/count differences. It does **not** prove correctness, semantic equivalence, or cross-chain behavior.
 - **External comparison execution is still partial.** Forge now has a real measured path for Foundry-project benchmark cases only; Echidna and non-project cases are still `skipped`/`unavailable` with explicit reasons.
 - **Partial Echidna compatibility.** `EchidnaPropertyCaller` implements the core workflow (discover `echidna_*` functions, call them, check bool return). `EchidnaProperty` detects assertion events in logs. Neither handles revert/assert distinction with full Echidna fidelity, and the property-harness workflow (`targetContract`, configurable test limits, shrinking) is not implemented.
 - **Economic and conservation oracles remain heuristic despite ABI hints and probes.** Storage slot layouts (ERC-20 `totalSupply` at slot 2, balances at mapping slot 0) still match common OpenZeppelin layouts and break on proxies, diamonds, and custom storage. Classification and gating reduce some noise but do not guarantee soundness. Rate-jump, same-tx spread, and “no Transfer to vault” checks can still false-positive on extreme rounding, first-liquidity edges, donation economics, or non-standard vaults. Probe-vs-event checks can false-positive on fee-on-transfer assets, donation-style reserve moves, or non-standard vaults/pairs. **Conservation** checks (Sync window explanation, Deposit vs underlying `Transfer`) improve triage for pools and vaults but are **not** sound accounting proofs; bridges are still not modeled. `LendingHealthOracle` covers common `Borrow`-event patterns but is not a full collateral-ratio proof — multi-asset positions, health-factor math, and liquidation thresholds are not modeled.
@@ -110,7 +110,7 @@ types.rs             core types built on alloy-primitives (Address, U256, B256)
                      CampaignConfig: corpus_dir [Phase 5]
 scoreboard.rs        stable benchmark result / summary schema + CSV / JSON writers
 benchmark.rs         benchmark case loading, sci-fuzz measurement, Forge project comparison path, comparison scaffolding
-cli.rs               clap-based CLI: benchmark, forge, audit, test (thin wrapper), ci (implemented), diff (stub), version
+cli.rs               clap-based CLI: benchmark, forge, audit, test (thin wrapper), ci (implemented), diff (MVP differential executor), version
 rpc.rs               JSON-RPC fork DB (RpcCacheDB), chain id, full block header parse/merge into BlockEnv
 main.rs              CLI dispatch; handle_forge(), handle_ci() [Phase 4], handle_benchmark(), handle_audit()
 ```
@@ -160,6 +160,9 @@ sci-fuzz benchmark --preset efcf-demo --seeds 1,2,3 --max-execs 5000 --output-di
 
 # Benchmark a real Foundry project with the same schema
 sci-fuzz benchmark --project /path/to/foundry-project --target Vault --property campaign --category Campaign --seeds 1,2,3 --max-execs 5000
+
+# Differential execution MVP between two local Foundry targets
+sci-fuzz diff ImplA ImplB --project . --max-execs 2000 --depth 8 --seed 42
 
 # Show version
 sci-fuzz version
@@ -289,7 +292,7 @@ Until the shared-target comparison rows become measured rather than scaffolded, 
 | Phase 5 | Corpus persistence: JSON save/load across runs, `--corpus-dir` flag | ✅ Complete |
 | Phase 6 | `LendingHealthOracle`: borrow-event net-debt detection, profile-gated, severity escalation | ✅ Complete |
 | Phase 7 | Semantic shrinker: ABI-type-aware reduction, storage-dependency ordering | ⬜ Not started |
-| Phase 8 | `sci-fuzz diff`: differential fuzzing between two implementations | ⬜ Not started |
+| Phase 8 | `sci-fuzz diff`: differential execution MVP between two implementations | ✅ Narrow MVP implemented |
 | Phase 9 | Parallel corpus persistence: wire `corpus_dir` into `run_parallel_campaign()` | ✅ Complete |
 | Phase 10 | Measured benchmark matrix: 81-entry matrix with real pass/fail/time data | ⬜ Not started |
 
