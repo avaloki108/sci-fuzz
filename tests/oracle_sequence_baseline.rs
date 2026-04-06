@@ -38,7 +38,7 @@ fn balance_increase_fires_with_root_state_baseline() {
         .insert(attacker, (ten_eth, new_bal));
 
     let seq = vec![empty_tx(attacker)];
-    let findings = oracle.check(&pre, &result, &seq);
+    let findings = oracle.check(&pre, &sci_fuzz::types::ProtocolProbeReport::default(), &result, &seq);
     assert!(
         findings
             .iter()
@@ -69,7 +69,7 @@ fn stale_campaign_root_baseline_does_not_false_positive_on_snapshot_state() {
     let correct_pre = HashMap::from([(attacker, ten_eth)]);
     let stale_high = HashMap::from([(attacker, wei_eth(100))]);
 
-    let correct_findings = oracle.check(&correct_pre, &result, &seq);
+    let correct_findings = oracle.check(&correct_pre, &sci_fuzz::types::ProtocolProbeReport::default(), &result, &seq);
     assert!(
         !correct_findings.is_empty(),
         "expected gain vs correct baseline to be reported"
@@ -77,7 +77,7 @@ fn stale_campaign_root_baseline_does_not_false_positive_on_snapshot_state() {
 
     // Stale baseline (100 ETH) while actual sequence start was 10 ETH: post-tx
     // balance is still below 100 ETH → no spurious "profit" vs stale root.
-    let stale_findings = oracle.check(&stale_high, &result, &seq);
+    let stale_findings = oracle.check(&stale_high, &sci_fuzz::types::ProtocolProbeReport::default(), &result, &seq);
     assert!(
         stale_findings.is_empty(),
         "stale high baseline must not fire BalanceIncrease when new < old baseline"

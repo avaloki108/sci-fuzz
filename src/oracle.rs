@@ -32,7 +32,7 @@ pub fn capture_eth_baseline(executor: &EvmExecutor, attacker: Address) -> HashMa
 /// let oracle = OracleEngine::new(attacker_address);
 /// let pre = capture_eth_baseline(&executor, attacker_address);
 /// // … after each tx in a sequence …
-/// let findings = oracle.check(&pre, &result, &sequence);
+/// let findings = oracle.check(&pre, &crate::types::ProtocolProbeReport::default(), &result, &sequence);
 /// ```
 pub struct OracleEngine {
     /// Invariant registry used for violation checks.

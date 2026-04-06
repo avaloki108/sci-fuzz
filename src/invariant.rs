@@ -9,7 +9,7 @@ use tiny_keccak::{Hasher, Keccak};
 
 use crate::conservation_oracles::{
     AmmSyncExplainedOracle, Erc4626DepositVsUnderlyingTransferOracle,
-    Erc4626FirstDepositorInflationOracle,
+    Erc4626FirstDepositorInflationOracle, Erc4626StrictAccountingDriftOracle,
 };
 
 use crate::economic::{
@@ -1231,6 +1231,9 @@ impl InvariantRegistry {
         reg.add(Box::new(Erc4626FirstDepositorInflationOracle {
             profiles: pmap.clone(),
         }));
+        reg.add(Box::new(Erc4626StrictAccountingDriftOracle {
+            profiles: pmap.clone(),
+        }));
         // Phase 3 additions: reentrancy oracle (always on — profit gate reduces noise).
         reg.add(Box::new(ReentrancyOracle { attacker }));
         // Phase 6: LendingHealthOracle (profile-gated — no-op on non-lending targets).
@@ -1332,7 +1335,7 @@ mod tests {
         let result = make_result(true, bc);
         let seq = dummy_sequence(attacker);
 
-        let finding = inv.check(&pre, &result, &seq);
+        let finding = inv.check(&pre, &crate::types::ProtocolProbeReport::default(), &result, &seq);
         assert!(finding.is_some());
         let f = finding.unwrap();
         assert_eq!(f.severity, Severity::Critical);
@@ -1356,7 +1359,7 @@ mod tests {
         let result = make_result(true, bc);
         let seq = dummy_sequence(attacker);
 
-        assert!(inv.check(&pre, &result, &seq).is_none());
+        assert!(inv.check(&pre, &crate::types::ProtocolProbeReport::default(), &result, &seq).is_none());
     }
 
     #[test]
@@ -1416,7 +1419,7 @@ mod tests {
         };
         let seq = dummy_sequence(contract);
 
-        let finding = inv.check(&pre, &result, &seq);
+        let finding = inv.check(&pre, &crate::types::ProtocolProbeReport::default(), &result, &seq);
         assert!(finding.is_some());
         assert_eq!(finding.unwrap().severity, Severity::High);
     }
@@ -1436,7 +1439,7 @@ mod tests {
         let pre = HashMap::new();
         let seq = dummy_sequence(contract);
 
-        assert!(inv.check(&pre, &result, &seq).is_none());
+        assert!(inv.check(&pre, &crate::types::ProtocolProbeReport::default(), &result, &seq).is_none());
     }
 
     #[test]
@@ -1468,7 +1471,7 @@ mod tests {
         let result = make_result(true, bc);
         let seq = dummy_sequence(attacker);
 
-        let findings = reg.check_all(&pre, &result, &seq);
+        let findings = reg.check_all(&pre, &crate::types::ProtocolProbeReport::default(), &result, &seq);
         // At least the balance-increase invariant should fire.
         assert!(!findings.is_empty());
     }
@@ -1477,7 +1480,7 @@ mod tests {
     fn empty_registry_returns_no_findings() {
         let reg = InvariantRegistry::new();
         let result = make_result(true, HashMap::new());
-        assert!(reg.check_all(&HashMap::new(), &result, &[]).is_empty());
+        assert!(reg.check_all(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &result, &[]).is_empty());
     }
 
     // -- EchidnaProperty & ERC20SupplyInvariant tests -------------------------
@@ -1878,7 +1881,7 @@ mod tests {
         let result = make_result_with_sstore_in_nested_call(bc, true);
         let seq = dummy_sequence(Address::repeat_byte(0xCC));
 
-        let finding = oracle.check(&pre, &result, &seq);
+        let finding = oracle.check(&pre, &crate::types::ProtocolProbeReport::default(), &result, &seq);
         assert!(finding.is_some());
         let f = finding.unwrap();
         assert_eq!(f.severity, Severity::High);
@@ -1900,7 +1903,7 @@ mod tests {
         let result = make_result_with_sstore_in_nested_call(bc, false);
         let seq = dummy_sequence(Address::repeat_byte(0xCC));
 
-        assert!(oracle.check(&pre, &result, &seq).is_none());
+        assert!(oracle.check(&pre, &crate::types::ProtocolProbeReport::default(), &result, &seq).is_none());
     }
 
     #[test]
@@ -1913,7 +1916,7 @@ mod tests {
         let result = make_result_with_sstore_in_nested_call(HashMap::new(), true);
         let seq = dummy_sequence(Address::repeat_byte(0xCC));
 
-        assert!(oracle.check(&pre, &result, &seq).is_none());
+        assert!(oracle.check(&pre, &crate::types::ProtocolProbeReport::default(), &result, &seq).is_none());
     }
 
     // -- TokenFlowConservationOracle tests ------------------------------------

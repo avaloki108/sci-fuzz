@@ -241,6 +241,121 @@ impl Invariant for Erc4626FirstDepositorInflationOracle {
 }
 
 // ---------------------------------------------------------------------------
+// ERC-4626: Strict Pre/Post Sequence Accounting Drift
+// ---------------------------------------------------------------------------
+
+/// Extracts the values from `pre_probes` and `result.protocol_probes`, subtracts the 
+/// sequence event delta expectation, and flags unexpected shifts.
+/// (Detects slippage drift or hidden balance mutations in DeFi invariants).
+pub struct Erc4626StrictAccountingDriftOracle {
+    pub profiles: Option<ProtocolProfileMap>,
+}
+
+impl Default for Erc4626StrictAccountingDriftOracle {
+    fn default() -> Self {
+        Self { profiles: None }
+    }
+}
+
+impl Invariant for Erc4626StrictAccountingDriftOracle {
+    fn name(&self) -> &str {
+        "economic-erc4626-strict-accounting-drift"
+    }
+
+    fn check(
+        &self,
+        _pre_balances: &HashMap<Address, U256>,
+        pre_probes: &crate::types::ProtocolProbeReport,
+        result: &ExecutionResult,
+        sequence: &[Transaction],
+    ) -> Option<Finding> {
+        if !result.success {
+            return None;
+        }
+
+        let logs = crate::conservation::effective_logs(result);
+
+        // Iterate over vaults in post-probes
+        for (vault, post_snap) in &result.protocol_probes.per_contract {
+            let pre_snap = match pre_probes.per_contract.get(vault) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let post_erc = match &post_snap.erc4626 {
+                Some(e) => e,
+                None => continue,
+            };
+            let pre_erc = match &pre_snap.erc4626 {
+                Some(e) => e,
+                None => continue,
+            };
+
+            if suppress_erc4626_rate_gated(lookup_profile(&self.profiles, *vault)) {
+                continue;
+            }
+
+            // Must have tracked initial vs final `totalAssets`
+            let pre_assets = match pre_erc.total_assets.as_ref().and_then(probe_u256) {
+                Some(a) => a,
+                None => continue,
+            };
+            let post_assets = match post_erc.total_assets.as_ref().and_then(probe_u256) {
+                Some(a) => a,
+                None => continue,
+            };
+
+            // Get the asset token to track underlying transfers
+            let asset_token = match post_erc.asset.as_ref() {
+                Some(ProbeStatus::Ok(ProbeScalar::Address(a))) => Some(*a),
+                _ => None,
+            };
+
+            // Phase 2 logic: extract expected deltas
+            let deltas = crate::conservation::compute_vault_event_deltas(logs, *vault, asset_token);
+
+            // Phase 3 & 4 logic: Reconciliation
+            // Expectation: post_assets = pre_assets + deposit_assets - withdraw_assets
+            let expected_assets = pre_assets
+                .saturating_add(deltas.deposit_assets)
+                .saturating_sub(deltas.withdraw_assets);
+            
+            if materially_divergent_probe_u256(expected_assets, post_assets) {
+                let drift = if post_assets > expected_assets {
+                    format!("unexplained growth of {}", post_assets - expected_assets)
+                } else {
+                    format!("unexplained shrinkage of {}", expected_assets - post_assets)
+                };
+
+                let base = format!(
+                    "Vault {vault}: Strict accounting drift detected! `totalAssets` probe shows {post_assets}, but sequence events imply {expected_assets} (started at {pre_assets}, +{} deposited, -{} withdrawn). Evidence of {drift}.",
+                    deltas.deposit_assets, deltas.withdraw_assets
+                );
+                
+                let desc = append_triage_simple(
+                    base,
+                    *vault,
+                    lookup_profile(&self.profiles, *vault),
+                    "ERC-4626 strict conservation of underlying assets across events, no hidden mutation.",
+                    "Comparison of `totalAssets()` pre/post relative to `Deposit`/`Withdraw` event summations.",
+                    "Some vaults slowly accrue external yields without events. Triage if profit magnitude is exploitable.",
+                );
+
+                return Some(Finding {
+                    severity: Severity::High,
+                    title: format!("Economic: ERC-4626 hidden asset drift ({vault})"),
+                    description: desc,
+                    contract: *vault,
+                    reproducer: sequence.to_vec(),
+                    exploit_profit: None, 
+                });
+            }
+        }
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ERC-4626: Deposit assets vs ERC-20 Transfer to vault (same tx)
 // ---------------------------------------------------------------------------
 
@@ -414,7 +529,7 @@ mod tests {
         );
 
         let inv = Erc4626DepositVsUnderlyingTransferOracle::default();
-        let f = inv.check(&HashMap::new(), &r, &[]).expect("finding");
+        let f = inv.check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &r, &[]).expect("finding");
         assert!(f.title.contains("Deposit"));
         assert!(f.description.contains("1000"));
         assert!(f.description.contains("underlying asset"));
@@ -441,7 +556,7 @@ mod tests {
         );
 
         let inv = Erc4626DepositVsUnderlyingTransferOracle::default();
-        let f = inv.check(&HashMap::new(), &r, &[]).expect("finding");
+        let f = inv.check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &r, &[]).expect("finding");
         assert!(f.description.contains("balanceOf"));
         assert!(f.description.contains("9999"));
     }
@@ -470,7 +585,7 @@ mod tests {
         r.logs = vec![s1, s2];
 
         let inv = AmmSyncExplainedOracle::default();
-        let f = inv.check(&HashMap::new(), &r, &[]).expect("finding");
+        let f = inv.check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &r, &[]).expect("finding");
         assert!(f.title.contains("Sync"));
         assert!(f.description.contains("Swap"));
     }
@@ -507,7 +622,7 @@ mod tests {
         r.success = true;
         r.logs = vec![s1, sw, s2];
         let inv = AmmSyncExplainedOracle::default();
-        assert!(inv.check(&HashMap::new(), &r, &[]).is_none());
+        assert!(inv.check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &r, &[]).is_none());
     }
 
     #[test]
@@ -524,6 +639,54 @@ mod tests {
             },
         );
         let inv = Erc4626DepositVsUnderlyingTransferOracle::default();
-        assert!(inv.check(&HashMap::new(), &r, &[]).is_none());
+        assert!(inv.check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &r, &[]).is_none());
+    }
+    #[test]
+    fn drift_oracle_fires_on_hidden_drift() {
+        let vault = Address::repeat_byte(0x55);
+        let mut r = ExecutionResult::default();
+        r.success = true; // no logs, just probe diff
+
+        // Pre probes (started at 1000)
+        let mut pre_rep = crate::types::ProtocolProbeReport::default();
+        let mut pre_erc = Erc4626ProbeSnapshot::default();
+        pre_erc.total_assets = Some(ProbeStatus::Ok(ProbeScalar::U256(U256::from(1000u64))));
+        pre_rep.per_contract.insert(vault, ContractProbeSnapshot { erc4626: Some(pre_erc), ..Default::default() });
+
+        // Post probes (jumped to 2000 unexpectedly)
+        let mut post_erc = Erc4626ProbeSnapshot::default();
+        post_erc.total_assets = Some(ProbeStatus::Ok(ProbeScalar::U256(U256::from(2000u64))));
+        r.protocol_probes.per_contract.insert(vault, ContractProbeSnapshot { erc4626: Some(post_erc), ..Default::default() });
+
+        let inv = Erc4626StrictAccountingDriftOracle::default();
+        let f = inv.check(&HashMap::new(), &pre_rep, &r, &[]).expect("finding");
+        assert!(f.title.contains("hidden asset drift"));
+        assert!(f.description.contains("unexplained growth of 1000"));
+        assert!(f.description.contains("shows 2000"));
+        assert!(f.description.contains("imply 1000"));
+    }
+
+    #[test]
+    fn drift_oracle_quiet_on_expected_growth() {
+        let vault = Address::repeat_byte(0x66);
+        let mut r = ExecutionResult::default();
+        r.success = true;
+        
+        // Deposit 500
+        r.logs.push(deposit_log(vault, 500));
+
+        let mut pre_rep = crate::types::ProtocolProbeReport::default();
+        let mut pre_erc = Erc4626ProbeSnapshot::default();
+        pre_erc.total_assets = Some(ProbeStatus::Ok(ProbeScalar::U256(U256::from(1000u64))));
+        // Need to add asset probe so it doesn't fail
+        pre_erc.asset = Some(ProbeStatus::Ok(ProbeScalar::Address(Address::repeat_byte(0x99))));
+        pre_rep.per_contract.insert(vault, ContractProbeSnapshot { erc4626: Some(pre_erc), ..Default::default() });
+
+        let mut post_erc = Erc4626ProbeSnapshot::default();
+        post_erc.total_assets = Some(ProbeStatus::Ok(ProbeScalar::U256(U256::from(1500u64))));
+        r.protocol_probes.per_contract.insert(vault, ContractProbeSnapshot { erc4626: Some(post_erc), ..Default::default() });
+
+        let inv = Erc4626StrictAccountingDriftOracle::default();
+        assert!(inv.check(&HashMap::new(), &pre_rep, &r, &[]).is_none());
     }
 }

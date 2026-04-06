@@ -176,7 +176,7 @@ impl BenchmarkLoop {
 
                         // Oracle checks.
                         let oracle_findings =
-                            self.oracle.check(&pre_seq_balances, &result, &sequence);
+                            self.oracle.check(&pre_seq_balances, &sci_fuzz::types::ProtocolProbeReport::default(), &result, &sequence);
                         for mut f in oracle_findings {
                             f.reproducer = sequence.clone();
                             let h = f.dedup_hash();

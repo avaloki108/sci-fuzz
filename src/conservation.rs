@@ -109,6 +109,78 @@ pub fn first_pair_sync_change_missing_explanation(
     None
 }
 
+/// Summed values from `Deposit`, `Withdraw`, and `Transfer` logs targeting a specific vault
+/// over a sequence of execution logs. This "expectation" forms the event-implied intent
+/// for later comparison against probe-deltas (Phase 2).
+#[derive(Debug, Clone, Default)]
+pub struct VaultEventDeltas {
+    pub deposit_assets: U256,
+    pub deposit_shares: U256,
+    pub withdraw_assets: U256,
+    pub withdraw_shares: U256,
+    /// Sum of all `Transfer(from, vault, amount)` observed in the logs on the tracked asset.
+    pub asset_transfers_in: U256,
+    /// Sum of all `Transfer(vault, to, amount)` observed in the logs on the tracked asset.
+    pub asset_transfers_out: U256,
+}
+
+/// Parses cumulative logs to form a strict event-sum expectation of asset/share movements for a vault.
+pub fn compute_vault_event_deltas(
+    logs: &[Log],
+    vault: crate::types::Address,
+    asset_token: Option<crate::types::Address>,
+) -> VaultEventDeltas {
+    use crate::economic::address_to_b256;
+    use crate::protocol_semantics::{
+        topic_erc20_transfer, topic_erc4626_deposit, topic_erc4626_withdraw,
+    };
+
+    let dep_t = topic_erc4626_deposit();
+    let wit_t = topic_erc4626_withdraw();
+    let xfer_t = topic_erc20_transfer();
+    let vault_b256 = address_to_b256(vault);
+
+    let mut deltas = VaultEventDeltas::default();
+
+    for log in logs {
+        let topic0 = match log.topics.first().copied() {
+            Some(t) => t,
+            None => continue,
+        };
+
+        if log.address == vault {
+            if topic0 == dep_t && log.data.len() >= 64 {
+                let assets = U256::from_be_slice(&log.data[..32]);
+                let shares = U256::from_be_slice(&log.data[32..64]);
+                deltas.deposit_assets = deltas.deposit_assets.saturating_add(assets);
+                deltas.deposit_shares = deltas.deposit_shares.saturating_add(shares);
+            } else if topic0 == wit_t && log.data.len() >= 64 {
+                let assets = U256::from_be_slice(&log.data[..32]);
+                let shares = U256::from_be_slice(&log.data[32..64]);
+                deltas.withdraw_assets = deltas.withdraw_assets.saturating_add(assets);
+                deltas.withdraw_shares = deltas.withdraw_shares.saturating_add(shares);
+            }
+        }
+
+        if let Some(asset) = asset_token {
+            if log.address == asset && topic0 == xfer_t && log.topics.len() >= 3 && log.data.len() >= 32 {
+                let from = log.topics[1];
+                let to = log.topics[2];
+                let amount = U256::from_be_slice(&log.data[..32]);
+
+                if to == vault_b256 {
+                    deltas.asset_transfers_in = deltas.asset_transfers_in.saturating_add(amount);
+                }
+                if from == vault_b256 {
+                    deltas.asset_transfers_out = deltas.asset_transfers_out.saturating_add(amount);
+                }
+            }
+        }
+    }
+
+    deltas
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,5 +252,57 @@ mod tests {
         let pair = Address::repeat_byte(0xCC);
         let logs = vec![sync_log(pair, 5, 5), sync_log(pair, 5, 5)];
         assert!(first_pair_sync_change_missing_explanation(&logs).is_none());
+    }
+
+    #[test]
+    fn compute_vault_event_deltas_correctness() {
+        use crate::protocol_semantics::{topic_erc20_transfer, topic_erc4626_deposit, topic_erc4626_withdraw};
+        use crate::economic::address_to_b256;
+        
+        let vault = Address::repeat_byte(0x11);
+        let asset = Address::repeat_byte(0x22);
+
+        let mut dr = [0u8; 64];
+        dr[24..32].copy_from_slice(&1000u64.to_be_bytes()); // assets
+        dr[56..64].copy_from_slice(&900u64.to_be_bytes());  // shares
+        let deposit_log = Log {
+            address: vault,
+            topics: vec![topic_erc4626_deposit(), B256::ZERO, B256::ZERO],
+            data: Bytes::copy_from_slice(&dr),
+        };
+
+        let mut wr = [0u8; 64];
+        wr[24..32].copy_from_slice(&500u64.to_be_bytes()); // assets
+        wr[56..64].copy_from_slice(&450u64.to_be_bytes()); // shares
+        let withdraw_log = Log {
+            address: vault,
+            topics: vec![topic_erc4626_withdraw(), B256::ZERO, B256::ZERO, B256::ZERO],
+            data: Bytes::copy_from_slice(&wr),
+        };
+
+        let transfer_in = Log {
+            address: asset,
+            topics: vec![topic_erc20_transfer(), B256::ZERO, address_to_b256(vault)],
+            data: Bytes::copy_from_slice(&U256::from(1000u64).to_be_bytes::<32>()),
+        };
+
+        let transfer_out = Log {
+            address: asset,
+            topics: vec![topic_erc20_transfer(), address_to_b256(vault), B256::ZERO],
+            data: Bytes::copy_from_slice(&U256::from(500u64).to_be_bytes::<32>()),
+        };
+
+        // Some unrelated log
+        let unrelated = sync_log(Address::repeat_byte(0x99), 10, 10);
+
+        let logs = vec![deposit_log, transfer_in, withdraw_log, transfer_out, unrelated];
+        let deltas = compute_vault_event_deltas(&logs, vault, Some(asset));
+
+        assert_eq!(deltas.deposit_assets, U256::from(1000u64));
+        assert_eq!(deltas.deposit_shares, U256::from(900u64));
+        assert_eq!(deltas.withdraw_assets, U256::from(500u64));
+        assert_eq!(deltas.withdraw_shares, U256::from(450u64));
+        assert_eq!(deltas.asset_transfers_in, U256::from(1000u64));
+        assert_eq!(deltas.asset_transfers_out, U256::from(500u64));
     }
 }

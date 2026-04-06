@@ -150,7 +150,7 @@ fn real_target_prop_false_found() {
                     sequence.push(tx.clone());
 
                     // Check built-in invariants (sequence includes current tx).
-                    let oracle_findings = oracle.check(&pre_seq_balances, &result, &sequence);
+                    let oracle_findings = oracle.check(&pre_seq_balances, &sci_fuzz::types::ProtocolProbeReport::default(), &result, &sequence);
                     for f in oracle_findings {
                         let mut finding = f;
                         let mut repro = sequence.clone();

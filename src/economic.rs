@@ -86,17 +86,21 @@ fn withdraw_topic() -> B256 {
     keccak256(b"Withdraw(address,address,address,uint256,uint256)")
 }
 
-/// `previewDeposit` return vs `Deposit` event shares: allow tiny rounding (>0.1% relative and >3 wei).
+/// `previewDeposit` return vs `Deposit` event shares (or pre/post sequence comparisons):
+/// Allow minor arithmetic rounding but catch material deviations.
+/// Tuned to 1 bps (0.01% / 10000 denominator) and a flat 10 wei minimum noise floor.
 pub(crate) fn materially_divergent_probe_u256(a: U256, b: U256) -> bool {
     if a == b {
         return false;
     }
     let (min_v, max_v) = if a < b { (a, b) } else { (b, a) };
     if min_v.is_zero() {
-        return max_v > U256::ZERO;
+        // Flat tolerance for zero-starts
+        return max_v > U256::from(10u64);
     }
     let diff = max_v - min_v;
-    diff * U256::from(1000u64) > min_v && diff > U256::from(3u64)
+    // Divergence requires diff > 10 wei AND diff > 0.01% of min_v (1 bps)
+    diff * U256::from(10_000u64) > min_v && diff > U256::from(10u64)
 }
 
 fn last_sync_reserves_in_logs(logs: &[crate::types::Log], pair: Address) -> Option<(U256, U256)> {
@@ -1345,7 +1349,7 @@ mod tests {
         r.logs.push(log);
         let inv = Erc4626EventAnomalyOracle::default();
         let f = inv
-            .check(&HashMap::new(), &r, &[tx_dummy()])
+            .check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &r, &[tx_dummy()])
             .expect("finding");
         assert!(f.title.contains("impossible Deposit"));
     }
@@ -1366,7 +1370,7 @@ mod tests {
         // No storage_writes for token — triggers
         let inv = Erc20MintWithoutSupplyWriteOracle::default();
         let f = inv
-            .check(&HashMap::new(), &r, &[tx_dummy()])
+            .check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &r, &[tx_dummy()])
             .expect("finding");
         assert!(f.title.contains("totalSupply"));
     }
@@ -1384,7 +1388,7 @@ mod tests {
         let mut tx = tx_dummy();
         tx.sender = holder;
         let inv = Erc20BalanceStorageWithoutTransferOracle::default();
-        let f = inv.check(&HashMap::new(), &r, &[tx]).expect("finding");
+        let f = inv.check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &r, &[tx]).expect("finding");
         assert!(f.title.contains("without Transfer"));
     }
 
@@ -1407,7 +1411,7 @@ mod tests {
             min_debt: U256::from(10u64),
         };
         let f = inv
-            .check(&HashMap::new(), &r, &[tx_dummy()])
+            .check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &r, &[tx_dummy()])
             .expect("finding");
         assert!(f.title.contains("debt exceeds collateral"));
     }
@@ -1434,7 +1438,7 @@ mod tests {
 
         let inv = Erc4626ExchangeRateJumpOracle::default();
         let f = inv
-            .check(&HashMap::new(), &r, &[tx_dummy()])
+            .check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &r, &[tx_dummy()])
             .expect("finding");
         assert!(f.title.contains("exchange rate"));
     }
@@ -1454,7 +1458,7 @@ mod tests {
         r.logs.push(log);
         let inv = Erc20BurnWithoutSupplyWriteOracle::default();
         let f = inv
-            .check(&HashMap::new(), &r, &[tx_dummy()])
+            .check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &r, &[tx_dummy()])
             .expect("finding");
         assert!(f.title.contains("burn"));
         assert!(f.title.contains("totalSupply"));
@@ -1482,7 +1486,7 @@ mod tests {
 
         let inv = Erc4626WithdrawRateJumpOracle::default();
         let f = inv
-            .check(&HashMap::new(), &r, &[tx_dummy()])
+            .check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &r, &[tx_dummy()])
             .expect("finding");
         assert!(f.title.contains("withdraw"));
         assert!(f.title.contains("jump") || f.title.contains("plunge"));
@@ -1510,7 +1514,7 @@ mod tests {
 
         let inv = Erc4626SameTransactionDepositRateSpreadOracle::default();
         let f = inv
-            .check(&HashMap::new(), &r, &[tx_dummy()])
+            .check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &r, &[tx_dummy()])
             .expect("finding");
         assert!(f.title.contains("same-tx"));
         assert!(f.title.contains("spread"));
@@ -1543,7 +1547,7 @@ mod tests {
         });
         let inv = UniswapV2StyleSwapReserveOracle::default();
         let f = inv
-            .check(&HashMap::new(), &r, &[tx_dummy()])
+            .check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &r, &[tx_dummy()])
             .expect("finding");
         assert!(f.title.contains("AMM swap"));
     }
@@ -1570,7 +1574,7 @@ mod tests {
 
         let inv = Erc4626RateJumpWithoutTokenFlowOracle::default();
         let f = inv
-            .check(&HashMap::new(), &res, &[tx_dummy()])
+            .check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &res, &[tx_dummy()])
             .expect("finding");
         assert!(f.title.contains("rate shock"));
     }
@@ -1605,7 +1609,7 @@ mod tests {
             max_multiplier: U256::from(5u64),
             profiles: Some(Arc::new(m)),
         };
-        assert!(inv.check(&HashMap::new(), &res, &[tx_dummy()]).is_none());
+        assert!(inv.check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &res, &[tx_dummy()]).is_none());
     }
 
     #[test]
@@ -1630,7 +1634,7 @@ mod tests {
         let inv = Erc20BalanceStorageWithoutTransferOracle {
             profiles: Some(Arc::new(m)),
         };
-        assert!(inv.check(&HashMap::new(), &r, &[tx]).is_none());
+        assert!(inv.check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &r, &[tx]).is_none());
     }
 
     fn erc4626_profile_vault(_vault: Address) -> ContractProtocolProfile {
@@ -1677,7 +1681,7 @@ mod tests {
             profiles: Some(Arc::new(m)),
         };
         let f = inv
-            .check(&HashMap::new(), &r, &[tx_dummy()])
+            .check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &r, &[tx_dummy()])
             .expect("finding");
         assert!(f.title.contains("previewDeposit"));
         assert!(f.description.contains("previewDeposit"));
@@ -1718,7 +1722,7 @@ mod tests {
         let inv = Erc4626PreviewVsDepositEventOracle {
             profiles: Some(Arc::new(m)),
         };
-        assert!(inv.check(&HashMap::new(), &r, &[tx_dummy()]).is_none());
+        assert!(inv.check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &r, &[tx_dummy()]).is_none());
     }
 
     #[test]
@@ -1743,7 +1747,7 @@ mod tests {
         let inv = Erc4626PreviewVsDepositEventOracle {
             profiles: Some(Arc::new(m)),
         };
-        assert!(inv.check(&HashMap::new(), &r, &[tx_dummy()]).is_none());
+        assert!(inv.check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &r, &[tx_dummy()]).is_none());
     }
 
     fn amm_profile_pair(_pair: Address) -> ContractProtocolProfile {
@@ -1784,7 +1788,7 @@ mod tests {
             profiles: Some(Arc::new(m)),
         };
         let f = inv
-            .check(&HashMap::new(), &r, &[tx_dummy()])
+            .check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &r, &[tx_dummy()])
             .expect("finding");
         assert!(f.title.contains("getReserves"));
         assert!(f.description.contains("getReserves"));
@@ -1819,6 +1823,6 @@ mod tests {
         let inv = UniswapV2StyleSyncVsGetReservesOracle {
             profiles: Some(Arc::new(m)),
         };
-        assert!(inv.check(&HashMap::new(), &r, &[tx_dummy()]).is_none());
+        assert!(inv.check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &r, &[tx_dummy()]).is_none());
     }
 }
