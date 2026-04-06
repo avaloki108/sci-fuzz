@@ -154,6 +154,143 @@ pub fn bootstrap_targets(
     let mut deployed_targets: Vec<ContractInfo> = Vec::new();
     let mut deploy_failures: Vec<DeployFailureReport> = Vec::new();
 
+    // ── Library linking pre-pass ──────────────────────────────────────────────
+    // Some contracts (e.g. Echidna harnesses built with internal Solidity
+    // libraries) have bytecode with 20-byte placeholder slots that must be
+    // filled with the deployed address of each library before the contract can
+    // be deployed.  We detect these via the `link_references` map populated at
+    // artifact-load time.
+    //
+    // Strategy:
+    //   1. Collect all targets that need linking (non-empty link_references).
+    //   2. Build a name→bytecode map from the full target list (libraries
+    //      themselves have empty link_references and a name matching what other
+    //      contracts want to link against).
+    //   3. Deploy each required library once, track its address.
+    //   4. Clone and patch the bytecode of every target that references them.
+    //
+    // Libraries are deployed from `work_targets`; they are NOT added to
+    // `deployed_targets` (they're internals, not fuzz targets).
+
+    let mut lib_addresses: std::collections::HashMap<String, Address> =
+        std::collections::HashMap::new();
+
+    // Collect names of libraries that are needed.
+    let needed_libs: std::collections::HashSet<String> = work_targets
+        .iter()
+        .flat_map(|t| t.link_references.keys().cloned())
+        .collect();
+
+    if !needed_libs.is_empty() {
+        eprintln!(
+            "[bootstrap] library linking needed for: {:?}",
+            needed_libs
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+
+        // Find library bytecode from targets or harness.
+        let all_candidates: Vec<&ContractInfo> = work_targets
+            .iter()
+            .chain(config.harness.as_ref())
+            .collect();
+
+        for lib_name in &needed_libs {
+            // Look for a target whose name matches the library name AND has no
+            // link_references of its own (i.e. it's a leaf library).
+            let lib_candidate = all_candidates.iter().find(|t| {
+                t.name.as_deref() == Some(lib_name.as_str()) && t.link_references.is_empty()
+            });
+            match lib_candidate {
+                Some(lib) => {
+                    let lib_bc = deployment_bytecode(lib);
+                    if lib_bc.is_empty() {
+                        eprintln!(
+                            "[bootstrap] WARNING: library {} has no bytecode — linking will be incomplete",
+                            lib_name
+                        );
+                        continue;
+                    }
+                    match executor.deploy(attacker, lib_bc) {
+                        Ok(addr) => {
+                            eprintln!(
+                                "[bootstrap] deployed library {} at {addr:#x}",
+                                lib_name
+                            );
+                            lib_addresses.insert(lib_name.clone(), addr);
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[bootstrap] WARNING: failed to deploy library {}: {e:#} — linking will be incomplete",
+                                lib_name
+                            );
+                        }
+                    }
+                }
+                None => {
+                    eprintln!(
+                        "[bootstrap] WARNING: no artifact found for library {} — linking will be incomplete",
+                        lib_name
+                    );
+                }
+            }
+        }
+    }
+
+    /// Patch a contract's creation bytecode in-place with deployed library addresses.
+    /// Returns a new `Bytes` if any patching was done, or `None` if nothing needed patching.
+    fn apply_link_references(
+        creation_bytecode: &Bytes,
+        link_references: &std::collections::HashMap<String, Vec<usize>>,
+        lib_addresses: &std::collections::HashMap<String, Address>,
+    ) -> Option<Bytes> {
+        if link_references.is_empty() {
+            return None;
+        }
+        let mut bc = creation_bytecode.to_vec();
+        for (lib_name, offsets) in link_references {
+            if let Some(addr) = lib_addresses.get(lib_name) {
+                for &offset in offsets {
+                    if offset + 20 <= bc.len() {
+                        bc[offset..offset + 20].copy_from_slice(addr.as_slice());
+                    } else {
+                        eprintln!(
+                            "[bootstrap] WARNING: link offset {} out of bounds for lib {} (bc len {})",
+                            offset, lib_name, bc.len()
+                        );
+                    }
+                }
+            } else {
+                eprintln!(
+                    "[bootstrap] WARNING: library {} not deployed — bytecode placeholder NOT patched",
+                    lib_name
+                );
+            }
+        }
+        Some(Bytes::from(bc))
+    }
+
+    // Apply linking to work_targets that need it. We rebuild the vec so we can
+    // patch creation_bytecode without mutating the original config.
+    let work_targets: Vec<ContractInfo> = work_targets
+        .into_iter()
+        .map(|mut t| {
+            if let Some(ref bc) = t.creation_bytecode.clone() {
+                if let Some(patched) =
+                    apply_link_references(bc, &t.link_references, &lib_addresses)
+                {
+                    t.creation_bytecode = Some(patched);
+                }
+            }
+            t
+        })
+        .collect();
+
+    // Also patch the harness if needed (handled separately below, but we need
+    // the patched bytecode there too).  We do this by carrying `lib_addresses`
+    // through to the harness section.
+
     for target in &work_targets {
         let deploy_bytecode = deployment_bytecode(target);
         if !deploy_bytecode.is_empty() {
@@ -168,6 +305,7 @@ pub fn bootstrap_targets(
                         deployed_source_map: target.deployed_source_map.clone(),
                         source_file_list: target.source_file_list.clone(),
                         abi: target.abi.clone(),
+                        link_references: target.link_references.clone(),
                     });
                 }
                 Err(e) => {
@@ -206,12 +344,18 @@ pub fn bootstrap_targets(
     };
 
     if let Some(ref harness) = config.harness {
-        let deploy_bytecode = deployment_bytecode(harness);
-        if deploy_bytecode.is_empty() {
+        let harness_bc = if !harness.link_references.is_empty() {
+            let base_bc = deployment_bytecode(harness);
+            apply_link_references(&base_bc, &harness.link_references, &lib_addresses)
+                .unwrap_or(base_bc)
+        } else {
+            deployment_bytecode(harness)
+        };
+        if harness_bc.is_empty() {
             anyhow::bail!("harness contract has no bytecode to deploy");
         }
 
-        let deployed_addr = executor.deploy(attacker, deploy_bytecode)?;
+        let deployed_addr = executor.deploy(attacker, harness_bc)?;
         setup_report.harness_name = harness.name.clone();
         setup_report.harness_address = Some(deployed_addr);
         deployed_targets.push(ContractInfo {
@@ -223,6 +367,7 @@ pub fn bootstrap_targets(
             deployed_source_map: harness.deployed_source_map.clone(),
             source_file_list: harness.source_file_list.clone(),
             abi: harness.abi.clone(),
+            link_references: harness.link_references.clone(),
         });
 
         let has_setup = harness

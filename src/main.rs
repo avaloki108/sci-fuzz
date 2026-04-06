@@ -433,6 +433,7 @@ fn handle_audit(args: sci_fuzz::cli::AuditArgs) -> Result<()> {
             deployed_source_map: None,
             source_file_list: vec![],
             abi: abi_val,
+            link_references: Default::default(),
         });
     }
 

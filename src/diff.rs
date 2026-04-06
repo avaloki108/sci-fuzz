@@ -565,6 +565,7 @@ fn build_diff_mutator(
         deployed_source_map: contract.deployed_source_map.clone(),
         source_file_list: contract.source_file_list.clone(),
         abi: filtered_abi,
+        link_references: Default::default(),
     };
 
     Ok(TxMutator::new(vec![filtered_contract]))
@@ -762,6 +763,7 @@ mod tests {
             deployed_source_map: None,
             source_file_list: vec![],
             abi: None,
+            link_references: Default::default(),
         };
         let b = a.clone();
         let shared = compute_shared_functions(&a, &b);

@@ -1324,6 +1324,7 @@ mod tests {
             deployed_source_map: None,
             source_file_list: vec![],
             abi: Some(abi),
+            link_references: Default::default(),
         }];
 
         TxMutator::new(targets)
@@ -1406,6 +1407,7 @@ mod tests {
             deployed_source_map: None,
             source_file_list: vec![],
             abi: Some(abi),
+            link_references: Default::default(),
         }];
 
         let m = TxMutator::new(targets);

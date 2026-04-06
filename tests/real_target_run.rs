@@ -112,6 +112,7 @@ fn real_target_prop_false_found() {
         deployed_source_map: None,
             source_file_list: vec![],
                 abi: Some(abi),
+        link_references: Default::default(),
     };
 
     // Wire up sub-systems.
@@ -298,6 +299,7 @@ fn real_target_prop_stateful_found_via_fuzzing() {
         deployed_source_map: None,
             source_file_list: vec![],
                 abi: Some(abi),
+        link_references: Default::default(),
     };
 
     let mut mutator = TxMutator::new(vec![target]);
@@ -426,6 +428,7 @@ fn campaign_with_real_target() {
         deployed_source_map: None,
             source_file_list: vec![],
                 abi: Some(abi),
+        link_references: Default::default(),
     };
 
     let config = CampaignConfig {
@@ -493,6 +496,7 @@ fn scorecard_prop_false() {
         deployed_source_map: None,
             source_file_list: vec![],
                 abi: Some(abi),
+        link_references: Default::default(),
     }]);
 
     let mut rng = StdRng::seed_from_u64(42);
@@ -586,6 +590,7 @@ fn campaign_solves_prop_stateful() {
         deployed_source_map: None,
             source_file_list: vec![],
                 abi: Some(abi),
+        link_references: Default::default(),
     };
 
     let config = CampaignConfig {

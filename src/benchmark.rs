@@ -399,6 +399,7 @@ fn load_compiled_fixture_case(
             deployed_source_map: None,
             source_file_list: vec![],
             abi,
+            link_references: Default::default(),
         }],
     )
     .with_timeout(timeout)

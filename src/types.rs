@@ -85,6 +85,14 @@ pub struct ContractInfo {
     pub source_file_list: Vec<String>,
     /// Full JSON ABI (as produced by `solc --abi`).
     pub abi: Option<serde_json::Value>,
+    /// Library link references: map from library contract name to list of
+    /// byte offsets (in the creation bytecode) where the 20-byte address
+    /// placeholder needs to be patched before deployment.
+    ///
+    /// Key = library contract name (e.g. `"Helpers"`).  Built from the
+    /// `bytecode.linkReferences` section of a Foundry artifact.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub link_references: HashMap<String, Vec<usize>>,
 }
 
 /// Clone `contract` and replace its ABI with one that omits named functions
@@ -104,6 +112,7 @@ pub fn contract_info_for_mutator(contract: &ContractInfo, strip_names: &[&str]) 
         deployed_source_map: contract.deployed_source_map.clone(),
         source_file_list: contract.source_file_list.clone(),
         abi,
+        link_references: contract.link_references.clone(),
     }
 }
 

@@ -1,0 +1,141 @@
+⚡ sci-fuzz — Smart Contract Invariant Fuzzer
+
+  project : /home/dok/BUGZ/cantina/sablier_2/flow
+  depth   : 50
+  timeout : 300s
+  workers : 2
+  seed    : 0
+
+found project: /home/dok/BUGZ/cantina/sablier_2/flow
+running forge build...
+discovered 187 artifact(s)
+selected 7 runtime fuzz target(s) + harness FlowEchidna
+starting campaign...
+
+[2m2026-04-06T19:36:05.912006Z[0m [33m WARN[0m [bootstrap] skipping target SablierFlow — deploy failed: deploy reverted: 0x
+[2m2026-04-06T19:36:05.912015Z[0m [33m WARN[0m [bootstrap] deploy diagnostic:
+[bootstrap] harness FlowEchidna (0x033bcc7C995ce7Cf7889BA498C5659F0CA540256) uses constructor-only setup (no setUp())
+[campaign] bootstrap mode: LocalDeploy (7 target(s) after deploy/attach)
+[campaign] setup: 1 deploy failure(s) recorded (see logs)
+[campaign] synthesized 5 ABI-inferred invariant(s):
+  ↳ SupplyIntegrityOracle for MockERC20_18 (0xa1c331e9363c8122f71161910b89bd9d258e48ca) — 1 mint, 0 burn selectors
+  ↳ SupplyIntegrityOracle for MockERC20_6 (0xa4b2acd4a8acaf70bddc587ba81fc6b2387900b8) — 1 mint, 0 burn selectors
+  ↳ AccessControlSlotOracle for FlowEchidna (0x033bcc7c995ce7cf7889ba498c5659f0ca540256)
+  ↳ PauseStateOracle for FlowEchidna (0x033bcc7c995ce7cf7889ba498c5659f0ca540256)
+  ↳ GetterStabilityOracle — monitoring 4 contracts for indirect state mutations
+[campaign] target 0xD1f176B2a6780571094fBB18B02b39D8b8dEeC37 bytecode=2398 abi=true
+[campaign] no echidna_* properties found in ABI for 0xD1f176B2a6780571094fBB18B02b39D8b8dEeC37
+[campaign] target 0x37Bd04C5bBb8EA716507539BCc3415a1fB9eBa02 bytecode=44 abi=true
+[campaign] no echidna_* properties found in ABI for 0x37Bd04C5bBb8EA716507539BCc3415a1fB9eBa02
+[campaign] target 0xc5088fAEB236cB4e8296b71fe38e71e7fd749F94 bytecode=44 abi=true
+[campaign] no echidna_* properties found in ABI for 0xc5088fAEB236cB4e8296b71fe38e71e7fd749F94
+[campaign] target 0xA26c7979f32E95F8372B8d2E61D00FF4C90cF1e4 bytecode=44 abi=true
+[campaign] no echidna_* properties found in ABI for 0xA26c7979f32E95F8372B8d2E61D00FF4C90cF1e4
+[campaign] target 0xA1c331E9363C8122f71161910b89bD9d258e48ca bytecode=1997 abi=true
+[campaign] no echidna_* properties found in ABI for 0xA1c331E9363C8122f71161910b89bD9d258e48ca
+[campaign] target 0xA4b2aCD4A8aCaf70BDdc587ba81fc6b2387900B8 bytecode=1997 abi=true
+[campaign] no echidna_* properties found in ABI for 0xA4b2aCD4A8aCaf70BDdc587ba81fc6b2387900B8
+[campaign] target 0x033bcc7C995ce7Cf7889BA498C5659F0CA540256 bytecode=11590 abi=true
+[campaign]   property: echidna_aggregate_eq_streams_plus_revenue (selector 0xbdb1419c)
+[campaign]   property: echidna_balance_eq_refundable_plus_covered (selector 0xb8975377)
+[campaign]   property: echidna_covered_lte_balance (selector 0xfa779058)
+[campaign]   property: echidna_erc20_gte_aggregate (selector 0x6d51bb78)
+[campaign]   property: echidna_insolvent_covered_eq_balance (selector 0x26d2c127)
+[campaign]   property: echidna_paused_iff_rps_zero (selector 0xa01bda10)
+[campaign]   property: echidna_snapshot_lte_now (selector 0x81c93db2)
+[campaign]   property: echidna_solvent_covered_eq_total (selector 0xd4c7052a)
+[campaign]   property: echidna_total_gte_covered (selector 0x7ee416bd)
+[campaign]   property: echidna_voided_no_uncovered (selector 0x69cd5c0f)
+[campaign] registered 10 echidna properties at 0x033bcc7C995ce7Cf7889BA498C5659F0CA540256
+[campaign] 1 property callers built, 7 deployed targets
+[2m2026-04-06T19:36:05.915060Z[0m [32m INFO[0m calibration phase started
+[2m2026-04-06T19:36:05.919239Z[0m [32m INFO[0m calibration complete [3melapsed_ms[0m[2m=[0m4 [3mseeds[0m[2m=[0m56
+[2m2026-04-06T19:36:05.919401Z[0m [32m INFO[0m parallel campaign started [3mtimeout_s[0m[2m=[0m300 [3mmax_depth[0m[2m=[0m50 [3mworkers[0m[2m=[0m2 [3mtargets[0m[2m=[0m7
+[fuzz] started | targets=7 | timeout=300s | depth=300 | workers=2
+[fuzz] 5s/300s | 102 exec/s | 509 total | cov: 9552 edges | snaps: 483 | findings: 1 | 294s left
+[fuzz] 11s/300s | 27 exec/s | 664 total | cov: 10716 edges | snaps: 627 | findings: 1 | 289s left
+[fuzz] 16s/300s | 16 exec/s | 754 total | cov: 10728 edges | snaps: 708 | findings: 1 | 283s left
+[fuzz] 23s/300s | 25 exec/s | 907 total | cov: 11449 edges | snaps: 854 | findings: 1 | 277s left
+[fuzz] 28s/300s | 7 exec/s | 945 total | cov: 11450 edges | snaps: 887 | findings: 1 | 271s left
+[campaign] (parallel w0) execs=1000 cov=11450 snaps=934 findings=1
+[fuzz] 34s/300s | 14 exec/s | 1023 total | cov: 11450 edges | snaps: 952 | findings: 1 | 266s left
+[fuzz] 39s/300s | 11 exec/s | 1086 total | cov: 11450 edges | snaps: 1000 | findings: 1 | 260s left
+[fuzz] 45s/300s | 31 exec/s | 1266 total | cov: 11583 edges | snaps: 1000 | findings: 2 | 254s left
+[fuzz] 53s/300s | 5 exec/s | 1304 total | cov: 11587 edges | snaps: 1000 | findings: 2 | 247s left
+[fuzz] 60s/300s | 10 exec/s | 1378 total | cov: 11611 edges | snaps: 1000 | findings: 2 | 239s left
+[fuzz] 68s/300s | 3 exec/s | 1398 total | cov: 11611 edges | snaps: 1000 | findings: 2 | 232s left
+[fuzz] 75s/300s | 11 exec/s | 1482 total | cov: 11650 edges | snaps: 1000 | findings: 2 | 224s left
+[fuzz] 82s/300s | 6 exec/s | 1519 total | cov: 11650 edges | snaps: 1000 | findings: 2 | 217s left
+[fuzz] 88s/300s | 6 exec/s | 1553 total | cov: 12141 edges | snaps: 1000 | findings: 2 | 212s left
+[fuzz] 93s/300s | 10 exec/s | 1611 total | cov: 12143 edges | snaps: 1000 | findings: 2 | 206s left
+[fuzz] 99s/300s | 6 exec/s | 1648 total | cov: 12175 edges | snaps: 1000 | findings: 2 | 200s left
+[fuzz] 105s/300s | 15 exec/s | 1737 total | cov: 12182 edges | snaps: 1000 | findings: 2 | 195s left
+[fuzz] 111s/300s | 6 exec/s | 1775 total | cov: 12770 edges | snaps: 1000 | findings: 2 | 189s left
+[fuzz] 117s/300s | 31 exec/s | 1965 total | cov: 13188 edges | snaps: 1000 | findings: 2 | 183s left
+[fuzz] 124s/300s | 11 exec/s | 2045 total | cov: 13200 edges | snaps: 1000 | findings: 2 | 175s left
+[fuzz] 131s/300s | 15 exec/s | 2144 total | cov: 13341 edges | snaps: 1000 | findings: 2 | 168s left
+[fuzz] 138s/300s | 14 exec/s | 2245 total | cov: 13342 edges | snaps: 1000 | findings: 2 | 161s left
+[fuzz] 145s/300s | 7 exec/s | 2298 total | cov: 13342 edges | snaps: 1000 | findings: 2 | 154s left
+[fuzz] 153s/300s | 6 exec/s | 2346 total | cov: 13703 edges | snaps: 1000 | findings: 2 | 146s left
+[fuzz] 161s/300s | 6 exec/s | 2392 total | cov: 13704 edges | snaps: 1000 | findings: 2 | 139s left
+[fuzz] 168s/300s | 10 exec/s | 2471 total | cov: 13706 edges | snaps: 1000 | findings: 2 | 131s left
+[fuzz] 176s/300s | 9 exec/s | 2546 total | cov: 13954 edges | snaps: 1000 | findings: 2 | 123s left
+[fuzz] 185s/300s | 8 exec/s | 2609 total | cov: 14195 edges | snaps: 1000 | findings: 2 | 115s left
+[fuzz] 193s/300s | 14 exec/s | 2722 total | cov: 14301 edges | snaps: 1000 | findings: 2 | 107s left
+[fuzz] 201s/300s | 12 exec/s | 2825 total | cov: 14482 edges | snaps: 1000 | findings: 2 | 98s left
+[fuzz] 210s/300s | 12 exec/s | 2932 total | cov: 14603 edges | snaps: 1000 | findings: 2 | 90s left
+[fuzz] 219s/300s | 6 exec/s | 2987 total | cov: 14603 edges | snaps: 1000 | findings: 2 | 80s left
+[fuzz] 228s/300s | 10 exec/s | 3076 total | cov: 14604 edges | snaps: 1000 | findings: 2 | 71s left
+[fuzz] 237s/300s | 5 exec/s | 3119 total | cov: 14604 edges | snaps: 1000 | findings: 2 | 62s left
+[fuzz] 242s/300s | 16 exec/s | 3197 total | cov: 14604 edges | snaps: 1000 | findings: 2 | 57s left
+[fuzz] 252s/300s | 6 exec/s | 3257 total | cov: 14604 edges | snaps: 1000 | findings: 2 | 48s left
+[fuzz] 261s/300s | 4 exec/s | 3292 total | cov: 14604 edges | snaps: 1000 | findings: 2 | 38s left
+[fuzz] 271s/300s | 8 exec/s | 3365 total | cov: 14606 edges | snaps: 1000 | findings: 2 | 29s left
+[fuzz] 276s/300s | 14 exec/s | 3433 total | cov: 14607 edges | snaps: 1000 | findings: 2 | 24s left
+[fuzz] 285s/300s | 7 exec/s | 3497 total | cov: 14608 edges | snaps: 1000 | findings: 2 | 14s left
+[fuzz] 290s/300s | 7 exec/s | 3531 total | cov: 14609 edges | snaps: 1000 | findings: 2 | 9s left
+[2m2026-04-06T19:41:06.427605Z[0m [32m INFO[0m parallel campaign finished [3mtotal_execs[0m[2m=[0m3582 [3melapsed_s[0m[2m=[0m300.5
+
+────────────────────────────────────────────────────────────
+  CAMPAIGN SUMMARY
+────────────────────────────────────────────────────────────
+  Duration      : 300.5s
+  Executions    : 3582 (12 exec/s)
+  Raw findings  : 13
+  Unique bugs   : 2
+  First hit at  : 54 execs
+  First hit in  : 130ms
+
+  🐛  Found 2 unique violation(s):
+
+  ┌───────────────────────────────────────────────────────────
+  │ [0] 🟠 HIGH
+  │     Unexpected supply change on 0xa4b2acd4a8acaf70bddc587ba81fc6b2387900b8
+  ├───────────────────────────────────────────────────────────
+  │ Contract : 0xa4b2acd4a8acaf70bddc587ba81fc6b2387900b8
+  │
+  │ Token 0xa4b2acd4a8acaf70bddc587ba81fc6b2387900b8 had storage writes without a known mint or burn selector being called.  The total supply may have been manipulated through an unconventional path.
+  │
+  │ Sequence : 1 tx(s)
+  │   [0] 0xd1f176b2a6780571094fbb18b02b39d8b8deec37 → 0xa4b2acd4a8acaf70bddc587ba81fc6b2387900b8  sel=095ea7b3 value=0
+  │
+  │ Replay   : sci-fuzz replay --sequence <corpus_dir>/findings/0.json
+  └───────────────────────────────────────────────────────────
+
+  ┌───────────────────────────────────────────────────────────
+  │ [1] 🟠 HIGH
+  │     Unexpected supply change on 0xa1c331e9363c8122f71161910b89bd9d258e48ca
+  ├───────────────────────────────────────────────────────────
+  │ Contract : 0xa1c331e9363c8122f71161910b89bd9d258e48ca
+  │
+  │ Token 0xa1c331e9363c8122f71161910b89bd9d258e48ca had storage writes without a known mint or burn selector being called.  The total supply may have been manipulated through an unconventional path.
+  │
+  │ Sequence : 1 tx(s)
+  │   [0] 0xd1f176b2a6780571094fbb18b02b39d8b8deec37 → 0xa1c331e9363c8122f71161910b89bd9d258e48ca  sel=095ea7b3 value=0
+  │
+  │ Replay   : sci-fuzz replay --sequence <corpus_dir>/findings/1.json
+  └───────────────────────────────────────────────────────────
+
+  ── Severity breakdown ──
+    🟠 HIGH       : 2
+

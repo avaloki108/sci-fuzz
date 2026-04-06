@@ -1,0 +1,27 @@
+⚡ sci-fuzz — Smart Contract Invariant Fuzzer
+
+  project : /home/dok/BUGZ/cantina/sablier_2/lockup
+  depth   : 50
+  timeout : 300s
+  workers : 2
+  seed    : 0
+
+found project: /home/dok/BUGZ/cantina/sablier_2/lockup
+running forge build...
+WARNING: `forge build` failed, but artifacts directory exists — using pre-built artifacts.
+  Reason: project error: `forge build` failed in /home/dok/BUGZ/cantina/sablier_2/lockup: Warning: This is a nightly build of Foundry. It is recommended to use the latest stable version. To mute this warning set `FOUNDRY_DISABLE_NIGHTLY_WARNING` in your environment. 
+
+Error: failed to extract foundry config:
+foundry.toml error: TOML parse error at line 1, column 7
+  |
+1 | src = ["src", "echidna"]
+  |       ^^^^^^^^^^^^^^^^^^
+invalid type: sequence, expected a map
+ in foundry.toml TOML file
+discovered 296 artifact(s)
+selected 14 runtime fuzz target(s) + harness DAI_Lockup_Dynamic_Fork_Test
+starting campaign...
+
+[2m2026-04-06T19:53:06.126770Z[0m [33m WARN[0m [bootstrap] skipping target LockupEchidna — deploy failed: deploy reverted: 0x
+[2m2026-04-06T19:53:06.126777Z[0m [33m WARN[0m [bootstrap] deploy diagnostic:
+Error: deploy reverted: 0x

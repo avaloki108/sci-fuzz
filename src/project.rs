@@ -361,7 +361,22 @@ impl Project {
         program: impl AsRef<OsStr>,
     ) -> Result<(Self, FuzzBootstrap, usize)> {
         let mut project = Self::load(root)?;
-        project.build_with_program(program)?;
+        if let Err(build_err) = project.build_with_program(&program) {
+            // If the build failed but an `out` directory already exists with
+            // artifacts, warn and continue rather than hard-failing.  This
+            // handles projects whose foundry.toml uses nightly-only features
+            // (e.g. `src = ["src", "echidna"]`) that the stable `forge build`
+            // may reject, but for which artifacts were pre-built.
+            let out_dir = project.get_out_dir();
+            if out_dir.exists() {
+                eprintln!(
+                    "WARNING: `forge build` failed, but artifacts directory exists — using pre-built artifacts.\n  Reason: {}",
+                    build_err
+                );
+            } else {
+                return Err(build_err);
+            }
+        }
         let artifact_count = project.load_artifacts_from_out()?.len();
         let bootstrap = project.prepare_fuzz_bootstrap()?;
 
@@ -705,6 +720,11 @@ fn parse_artifact_file(artifact_path: &Path, out_dir: &Path) -> Result<ContractI
     let deployed_source_map = crate::source_map::extract_deployed_source_map(&artifact);
     let source_file_list = crate::source_map::extract_source_file_list(&artifact);
 
+    // Extract library link references from `bytecode.linkReferences`.
+    // Format: { "src/libraries/Foo.sol": { "Foo": [{ "start": N, "length": 20 }, ...] } }
+    // We flatten it to: HashMap<lib_name, Vec<byte_offset>>.
+    let link_references = extract_link_references(&artifact);
+
     Ok(ContractInfo {
         address: synthetic_contract_address(&source_path, &contract_name),
         deployed_bytecode,
@@ -714,6 +734,7 @@ fn parse_artifact_file(artifact_path: &Path, out_dir: &Path) -> Result<ContractI
         deployed_source_map,
         source_file_list,
         abi,
+        link_references,
     })
 }
 
@@ -746,6 +767,46 @@ fn extract_source_path(artifact: &Value, artifact_path: &Path, out_dir: &Path) -
     rel.parent()
         .map(|parent| parent.to_string_lossy().replace('\\', "/"))
         .unwrap_or_default()
+}
+
+/// Parse `bytecode.linkReferences` from a Forge artifact and return a flat map
+/// `library_contract_name → Vec<byte_offset>`.
+///
+/// The raw JSON looks like:
+/// ```json
+/// { "src/libraries/Foo.sol": { "Foo": [{"start": 16378, "length": 20}, ...] } }
+/// ```
+/// We discard the source-file key and key only by library name.
+fn extract_link_references(artifact: &Value) -> std::collections::HashMap<String, Vec<usize>> {
+    let mut map = std::collections::HashMap::new();
+    let refs = match artifact
+        .get("bytecode")
+        .and_then(|b| b.get("linkReferences"))
+        .or_else(|| artifact.get("evm").and_then(|e| e.get("bytecode")).and_then(|b| b.get("linkReferences")))
+        .and_then(Value::as_object)
+    {
+        Some(r) => r,
+        None => return map,
+    };
+    for (_source_file, libs) in refs {
+        if let Some(libs_obj) = libs.as_object() {
+            for (lib_name, offsets_arr) in libs_obj {
+                if let Some(offsets) = offsets_arr.as_array() {
+                    let byte_offsets: Vec<usize> = offsets
+                        .iter()
+                        .filter_map(|o| o.get("start").and_then(Value::as_u64))
+                        .map(|s| s as usize)
+                        .collect();
+                    if !byte_offsets.is_empty() {
+                        map.entry(lib_name.clone())
+                            .or_insert_with(Vec::new)
+                            .extend(byte_offsets);
+                    }
+                }
+            }
+        }
+    }
+    map
 }
 
 fn extract_bytecode(

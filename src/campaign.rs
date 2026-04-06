@@ -195,6 +195,7 @@ impl Campaign {
                         deployed_source_map: target.deployed_source_map.clone(),
                         source_file_list: target.source_file_list.clone(),
                         abi: target.abi.clone(),
+                        link_references: Default::default(),
                     }),
                     Err(e) => eprintln!("[replay] skipping target — deploy failed: {e}"),
                 }
@@ -1134,15 +1135,72 @@ fn run_parallel_campaign(
     let config = Arc::new(config);
 
     let start = Instant::now();
+    let timeout_s = config.timeout.as_secs();
     tracing::info!(
-        timeout_s = config.timeout.as_secs(),
+        timeout_s,
         max_depth = config.max_depth,
         workers = worker_count,
         targets = config.targets.len(),
         "parallel campaign started",
     );
 
+    eprintln!(
+        "[fuzz] started | targets={} | timeout={}s | depth={} | workers={}",
+        deployed_targets.len(),
+        timeout_s,
+        config.timeout.as_secs(),
+        worker_count,
+    );
+
     std::thread::scope(|s| {
+        // Progress reporter thread — prints every 5s to stderr.
+        {
+            let shared = Arc::clone(&shared);
+            let total_execs = Arc::clone(&total_execs);
+            let config = Arc::clone(&config);
+            s.spawn(move || {
+                let progress_interval = std::time::Duration::from_secs(5);
+                let mut last_report_execs: u64 = 0;
+                let mut last_report_time = start;
+                loop {
+                    std::thread::sleep(progress_interval);
+                    let elapsed = start.elapsed();
+                    if elapsed >= config.timeout {
+                        break;
+                    }
+                    let execs = total_execs.load(Ordering::Relaxed);
+                    let dt = last_report_time.elapsed().as_secs_f64().max(0.001);
+                    let eps = (execs - last_report_execs) as f64 / dt;
+                    last_report_execs = execs;
+                    last_report_time = Instant::now();
+
+                    let (cov_edges, snap_count, finding_count, revert_count) = {
+                        if let Ok(g) = shared.lock() {
+                            let cov = g.feedback.total_coverage();
+                            let snaps = g.snapshots.len();
+                            let finds = g.findings.len();
+                            (cov, snaps, finds, 0u64)
+                        } else {
+                            (0, 0, 0, 0)
+                        }
+                    };
+                    let _ = revert_count; // parallel path doesn't track reverts yet
+                    let remaining = config.timeout.saturating_sub(elapsed).as_secs();
+                    eprintln!(
+                        "[fuzz] {:.0}s/{}s | {:.0} exec/s | {} total | cov: {} edges | snaps: {} | findings: {} | {}s left",
+                        elapsed.as_secs_f64(),
+                        timeout_s,
+                        eps,
+                        execs,
+                        cov_edges,
+                        snap_count,
+                        finding_count,
+                        remaining,
+                    );
+                }
+            });
+        }
+
         for worker_id in 0..worker_count {
             let shared = Arc::clone(&shared);
             let total_execs = Arc::clone(&total_execs);
@@ -1940,6 +1998,7 @@ mod tests {
                 deployed_source_map: None,
                 source_file_list: vec![],
                 abi: None,
+                link_references: Default::default(),
             }],
             harness: None,
             mode: ExecutorMode::Fast,
@@ -1981,6 +2040,7 @@ mod tests {
             deployed_source_map: None,
             source_file_list: vec![],
             abi: Some(abi.clone()),
+            link_references: Default::default(),
         };
         let config = CampaignConfig {
             timeout: Duration::from_millis(400),
