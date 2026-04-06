@@ -671,6 +671,12 @@ impl Campaign {
                 total_execs += 1;
                 sequence.push(tx.clone());
 
+                // vm.assume(false) → treat as precondition rejection, skip
+                // invariant checks and snapshot saving for this sequence.
+                if result.assume_violated {
+                    continue;
+                }
+
                 // Diagnostic: track deposit/withdraw patterns.
                 if result.success && tx.data.len() >= 4 {
                     let sel: [u8; 4] = [tx.data[0], tx.data[1], tx.data[2], tx.data[3]];

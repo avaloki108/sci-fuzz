@@ -152,6 +152,11 @@ pub struct ExecutionResult {
     /// Ordered dynamic control-flow path fingerprint for this transaction (see [`crate::path_id`]).
     #[serde(default)]
     pub tx_path_id: B256,
+    /// `true` when `vm.assume(false)` was triggered during this transaction.
+    /// The campaign loop should skip invariant checks and treat the sequence
+    /// as if it reverted (precondition guard).
+    #[serde(default)]
+    pub assume_violated: bool,
 }
 
 impl Default for ExecutionResult {
@@ -167,6 +172,7 @@ impl Default for ExecutionResult {
             sequence_cumulative_logs: Vec::new(),
             protocol_probes: ProtocolProbeReport::default(),
             tx_path_id: B256::ZERO,
+            assume_violated: false,
         }
     }
 }

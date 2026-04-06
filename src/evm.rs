@@ -282,6 +282,7 @@ impl EvmExecutor {
         let pending_deals = ext.cheatcodes.pending_deals.clone();
         let pending_stores = ext.cheatcodes.pending_stores.clone();
         let pending_etches = ext.cheatcodes.pending_etches.clone();
+        let assume_violated = ext.cheatcodes.assume_violation;
 
         // Commit state changes into the CacheDB.
         drop(evm); // release mutable borrow on self.db
@@ -310,7 +311,7 @@ impl EvmExecutor {
         }
 
         // Convert the revm result into our own type.
-        let exec_result = self.convert_result(
+        let mut exec_result = self.convert_result(
             &result,
             &state,
             &pre_balances,
@@ -318,6 +319,7 @@ impl EvmExecutor {
             dataflow,
             tx_path_id,
         )?;
+        exec_result.assume_violated = assume_violated;
         Ok(exec_result)
     }
 
@@ -607,6 +609,7 @@ impl EvmExecutor {
             sequence_cumulative_logs: Vec::new(),
             protocol_probes: Default::default(),
             tx_path_id,
+            assume_violated: false,
         })
     }
 
