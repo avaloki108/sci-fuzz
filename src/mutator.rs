@@ -411,6 +411,30 @@ fn generate_typed_arg_named(
         // --- bytes32 -----------------------------------------------------
         "bytes32" => dict.random_word(rng).0.to_vec(),
 
+        // --- bytes (dynamic) ---------------------------------------------
+        "bytes" => {
+            let len: usize = rng.gen_range(0..33);
+            let mut buf = Vec::with_capacity(64);
+            buf.extend_from_slice(&U256::from(32u64).to_be_bytes::<32>()); // offset
+            buf.extend_from_slice(&U256::from(len as u64).to_be_bytes::<32>()); // length
+            buf.extend(rng.gen::<[u8; 32]>());
+            buf.truncate(64 + len);
+            buf
+        }
+
+        // --- string (dynamic) --------------------------------------------
+        "string" => {
+            let len: usize = rng.gen_range(0..16);
+            let mut buf = Vec::with_capacity(64);
+            buf.extend_from_slice(&U256::from(32u64).to_be_bytes::<32>());
+            buf.extend_from_slice(&U256::from(len as u64).to_be_bytes::<32>());
+            for _ in 0..len {
+                buf.push(rng.gen_range(0x20..0x7f));
+            }
+            buf.resize(64, 0);
+            buf
+        }
+
         // --- unknown / dynamic types — random 32 bytes -------------------
         _ => rng.gen::<[u8; 32]>().to_vec(),
     }
@@ -444,15 +468,36 @@ fn generate_typed_arg_from_input(
         return rng.gen::<[u8; 32]>().to_vec();
     }
 
-    // Strip array suffix for now — fuzz a single element as head.
-    let base_typ = if typ.ends_with("[]") || typ.ends_with(']') {
-        // For dynamic arrays, just generate 0 (empty array head word).
-        return U256::ZERO.to_be_bytes::<32>().to_vec();
-    } else {
-        typ
-    };
+    // --- dynamic arrays (type[]) ---
+    if typ.ends_with("[]") {
+        let base = &typ[..typ.len() - 2];
+        let count: usize = rng.gen_range(0..4);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&U256::from(64u64).to_be_bytes::<32>()); // offset
+        buf.extend_from_slice(&U256::from(count as u64).to_be_bytes::<32>()); // length
+        for _ in 0..count {
+            buf.extend(generate_typed_arg_named(base, name, dict, rng));
+        }
+        while buf.len() % 32 != 0 {
+            buf.push(0);
+        }
+        return buf;
+    }
 
-    generate_typed_arg_named(base_typ, name, dict, rng)
+    // --- fixed-size arrays (type[N]) ---
+    if let Some(inner) = typ.strip_suffix(']') {
+        if let Some((base, rest)) = inner.rsplit_once('[') {
+            if let Ok(n) = rest.parse::<usize>() {
+                let mut buf = Vec::new();
+                for _ in 0..n {
+                    buf.extend(generate_typed_arg_named(base, name, dict, rng));
+                }
+                return buf;
+            }
+        }
+    }
+
+    generate_typed_arg_named(typ, name, dict, rng)
 }
 
 // ---------------------------------------------------------------------------

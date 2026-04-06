@@ -129,6 +129,8 @@ pub struct RpcCacheDB {
     accounts: Arc<Mutex<HashMap<RevmAddress, AccountInfo>>>,
     /// Storage cache: (address, slot) → value.
     storage: Arc<Mutex<HashMap<(RevmAddress, RevmU256), RevmU256>>>,
+    /// Code hash cache: code_hash -> bytecode (populated from eth_getCode).
+    code_hash_cache: Arc<Mutex<HashMap<revm::primitives::B256, Bytecode>>>,
     /// Request counter for unique JSON-RPC IDs.
     req_id: Arc<AtomicU64>,
 }
@@ -144,6 +146,7 @@ impl RpcCacheDB {
             block,
             accounts: Arc::new(Mutex::new(HashMap::new())),
             storage: Arc::new(Mutex::new(HashMap::new())),
+            code_hash_cache: Arc::new(Mutex::new(HashMap::new())),
             req_id: Arc::new(AtomicU64::new(1)),
         })
     }
@@ -219,13 +222,23 @@ impl RpcCacheDB {
             Some(Bytecode::new_raw(revm::primitives::Bytes::from(code_bytes)))
         };
 
+        let code_hash = code
+                .as_ref()
+                .map(|c| c.hash_slow())
+                .unwrap_or(revm::primitives::KECCAK_EMPTY);
+
+        // Cache code by hash for code_by_hash_ref lookups.
+        if let Some(ref bytecode) = code {
+            self.code_hash_cache
+                .lock()
+                .unwrap()
+                .insert(code_hash, bytecode.clone());
+        }
+
         Ok(AccountInfo {
             balance,
             nonce,
-            code_hash: code
-                .as_ref()
-                .map(|c| c.hash_slow())
-                .unwrap_or(revm::primitives::KECCAK_EMPTY),
+            code_hash,
             code,
         })
     }
@@ -267,11 +280,13 @@ impl Clone for RpcCacheDB {
     fn clone(&self) -> Self {
         let accounts = self.accounts.lock().unwrap().clone();
         let storage = self.storage.lock().unwrap().clone();
+        let code_hash_cache = self.code_hash_cache.lock().unwrap().clone();
         Self {
             url: self.url.clone(),
             block: self.block,
             accounts: Arc::new(Mutex::new(accounts)),
             storage: Arc::new(Mutex::new(storage)),
+            code_hash_cache: Arc::new(Mutex::new(code_hash_cache)),
             req_id: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -619,7 +634,11 @@ impl DatabaseRef for RpcCacheDB {
         Ok(Some(info))
     }
 
-    fn code_by_hash_ref(&self, _code_hash: RevmB256) -> Result<Bytecode, Self::Error> {
+    fn code_by_hash_ref(&self, code_hash: RevmB256) -> Result<Bytecode, Self::Error> {
+        if let Some(bytecode) = self.code_hash_cache.lock().unwrap().get(&code_hash) {
+            return Ok(bytecode.clone());
+        }
+        // Fallback: return empty (EXTCODECOPY from unknown hash).
         Ok(Bytecode::new())
     }
 
