@@ -232,6 +232,8 @@ pub struct Erc4626ProbeSnapshot {
     /// `balanceOf(vault)` on the underlying asset (post-state), when `asset` resolves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asset_balance_of_vault: Option<ProbeStatus>,
+    pub convert_to_shares: Option<ProbeStatus>,
+    pub convert_to_assets: Option<ProbeStatus>,
     pub deposit_rows: Vec<Erc4626DepositProbeRow>,
     pub withdraw_rows: Vec<Erc4626WithdrawProbeRow>,
 }

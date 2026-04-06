@@ -147,6 +147,7 @@ impl Invariant for Erc4626EventAnomalyOracle {
     fn check(
         &self,
         _pre_balances: &HashMap<Address, U256>,
+        _pre_probes: &crate::types::ProtocolProbeReport,
         result: &ExecutionResult,
         sequence: &[Transaction],
     ) -> Option<Finding> {
@@ -246,6 +247,7 @@ impl Invariant for Erc20MintWithoutSupplyWriteOracle {
     fn check(
         &self,
         _pre_balances: &HashMap<Address, U256>,
+        _pre_probes: &crate::types::ProtocolProbeReport,
         result: &ExecutionResult,
         sequence: &[Transaction],
     ) -> Option<Finding> {
@@ -342,6 +344,7 @@ impl Invariant for Erc20BalanceStorageWithoutTransferOracle {
     fn check(
         &self,
         _pre_balances: &HashMap<Address, U256>,
+        _pre_probes: &crate::types::ProtocolProbeReport,
         result: &ExecutionResult,
         sequence: &[Transaction],
     ) -> Option<Finding> {
@@ -439,6 +442,7 @@ impl Invariant for Erc4626ExchangeRateJumpOracle {
     fn check(
         &self,
         _pre_balances: &HashMap<Address, U256>,
+        _pre_probes: &crate::types::ProtocolProbeReport,
         result: &ExecutionResult,
         sequence: &[Transaction],
     ) -> Option<Finding> {
@@ -578,6 +582,7 @@ impl Invariant for Erc20BurnWithoutSupplyWriteOracle {
     fn check(
         &self,
         _pre_balances: &HashMap<Address, U256>,
+        _pre_probes: &crate::types::ProtocolProbeReport,
         result: &ExecutionResult,
         sequence: &[Transaction],
     ) -> Option<Finding> {
@@ -673,6 +678,7 @@ impl Invariant for Erc4626WithdrawRateJumpOracle {
     fn check(
         &self,
         _pre_balances: &HashMap<Address, U256>,
+        _pre_probes: &crate::types::ProtocolProbeReport,
         result: &ExecutionResult,
         sequence: &[Transaction],
     ) -> Option<Finding> {
@@ -810,6 +816,7 @@ impl Invariant for Erc4626SameTransactionDepositRateSpreadOracle {
     fn check(
         &self,
         _pre_balances: &HashMap<Address, U256>,
+        _pre_probes: &crate::types::ProtocolProbeReport,
         result: &ExecutionResult,
         sequence: &[Transaction],
     ) -> Option<Finding> {
@@ -908,6 +915,7 @@ impl Invariant for UniswapV2StyleSwapReserveOracle {
     fn check(
         &self,
         _pre_balances: &HashMap<Address, U256>,
+        _pre_probes: &crate::types::ProtocolProbeReport,
         result: &ExecutionResult,
         sequence: &[Transaction],
     ) -> Option<Finding> {
@@ -987,6 +995,7 @@ impl Invariant for Erc4626PreviewVsDepositEventOracle {
     fn check(
         &self,
         _pre_balances: &HashMap<Address, U256>,
+        _pre_probes: &crate::types::ProtocolProbeReport,
         result: &ExecutionResult,
         sequence: &[Transaction],
     ) -> Option<Finding> {
@@ -1075,6 +1084,7 @@ impl Invariant for UniswapV2StyleSyncVsGetReservesOracle {
     fn check(
         &self,
         _pre_balances: &HashMap<Address, U256>,
+        _pre_probes: &crate::types::ProtocolProbeReport,
         result: &ExecutionResult,
         sequence: &[Transaction],
     ) -> Option<Finding> {
@@ -1156,6 +1166,7 @@ impl Invariant for Erc4626RateJumpWithoutTokenFlowOracle {
     fn check(
         &self,
         _pre_balances: &HashMap<Address, U256>,
+        _pre_probes: &crate::types::ProtocolProbeReport,
         result: &ExecutionResult,
         sequence: &[Transaction],
     ) -> Option<Finding> {
@@ -1254,6 +1265,7 @@ impl Invariant for PairwiseStorageDriftOracle {
     fn check(
         &self,
         _pre_balances: &HashMap<Address, U256>,
+        _pre_probes: &crate::types::ProtocolProbeReport,
         result: &ExecutionResult,
         sequence: &[Transaction],
     ) -> Option<Finding> {

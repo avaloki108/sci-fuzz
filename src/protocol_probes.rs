@@ -370,3 +370,124 @@ mod tests {
         assert_eq!(r1, U256::from(9u64));
     }
 }
+
+pub fn capture_pre_sequence_probes(
+    executor: &EvmExecutor,
+    caller: Address,
+    profiles: &ProtocolProfileMap,
+    abis: &HashMap<Address, JsonAbi>,
+    sequence: &[crate::types::Transaction],
+) -> ProtocolProbeReport {
+    let mut calls_left = MAX_STATIC_CALLS_PER_STEP;
+    let mut report = ProtocolProbeReport::default();
+
+    let mut set: HashSet<Address> = HashSet::new();
+    for tx in sequence {
+        if let Some(to) = tx.to {
+            set.insert(to);
+        }
+    }
+    
+    for addr in set {
+        let Some(prof) = profiles.get(&addr) else {
+            continue;
+        };
+        let Some(abi) = abis.get(&addr) else {
+            continue;
+        };
+
+        let mut snap = ContractProbeSnapshot::default();
+
+        if prof.is_erc4626_like() {
+            let mut e = Erc4626ProbeSnapshot::default();
+            if has_function(abi, "asset") {
+                if let Some(data) = encode_call(abi, "asset", &[]) {
+                    if let Some((ok, out)) =
+                        run_probe(executor, caller, addr, data, &mut calls_left)
+                    {
+                        e.asset = Some(status_address(ok, &out));
+                    }
+                }
+            }
+            if has_function(abi, "totalAssets") {
+                if let Some(data) = encode_call(abi, "totalAssets", &[]) {
+                    if let Some((ok, out)) =
+                        run_probe(executor, caller, addr, data, &mut calls_left)
+                    {
+                        e.total_assets = Some(status_u256(ok, &out));
+                    }
+                }
+            }
+            if has_function(abi, "convertToShares") {
+                // To get a meaningful conversion, we need to know how much to convert.
+                // We don't know the decimals of the asset out of the box, but we can try 1_000_000 and 1 ether.
+                let amount = U256::from(1_000_000_000_000_000_000u128); // 1e18
+                if let Some(data) = encode_call(abi, "convertToShares", &[DynSolValue::Uint(amount, 256)]) {
+                    if let Some((ok, out)) = run_probe(executor, caller, addr, data, &mut calls_left) {
+                        e.convert_to_shares = Some(status_u256(ok, &out));
+                    }
+                }
+            }
+            if has_function(abi, "convertToAssets") {
+                let amount = U256::from(1_000_000_000_000_000_000u128); // 1e18
+                if let Some(data) = encode_call(abi, "convertToAssets", &[DynSolValue::Uint(amount, 256)]) {
+                    if let Some((ok, out)) = run_probe(executor, caller, addr, data, &mut calls_left) {
+                        e.convert_to_assets = Some(status_u256(ok, &out));
+                    }
+                }
+            }
+
+            if let Some(ProbeStatus::Ok(ProbeScalar::Address(asset_token))) = e.asset.as_ref() {
+                let data = encode_erc20_balance_of(addr);
+                if let Some((ok, out)) =
+                    run_probe(executor, caller, *asset_token, data, &mut calls_left)
+                {
+                    e.asset_balance_of_vault = Some(status_u256(ok, &out));
+                }
+            }
+            if e.asset.is_some() || e.total_assets.is_some() || e.asset_balance_of_vault.is_some() || e.convert_to_shares.is_some() || e.convert_to_assets.is_some() {
+                snap.erc4626 = Some(e);
+            }
+        }
+
+        if prof.is_erc20_like() {
+            let mut t = Erc20ProbeSnapshot::default();
+            if has_function(abi, "totalSupply") {
+                if let Some(data) = encode_call(abi, "totalSupply", &[]) {
+                    if let Some((ok, out)) = run_probe(executor, caller, addr, data, &mut calls_left) {
+                        t.total_supply = Some(status_u256(ok, &out));
+                    }
+                }
+            }
+            if has_function(abi, "balanceOf") {
+                if let Some(data) = encode_call(abi, "balanceOf", &[DynSolValue::Address(caller)]) {
+                    if let Some((ok, out)) = run_probe(executor, caller, addr, data, &mut calls_left) {
+                        t.balance_of_caller = Some(status_u256(ok, &out));
+                    }
+                }
+            }
+            if t.total_supply.is_some() || t.balance_of_caller.is_some() {
+                snap.erc20 = Some(t);
+            }
+        }
+
+        if prof.is_amm_pair_like() && has_function(abi, "getReserves") {
+            if let Some(data) = encode_call(abi, "getReserves", &[]) {
+                if let Some((ok, out)) = run_probe(executor, caller, addr, data, &mut calls_left) {
+                    let (r0, r1) = status_reserves(ok, &out);
+                    snap.amm = Some(AmmProbeSnapshot {
+                        reserve0: r0,
+                        reserve1: r1,
+                    });
+                }
+            }
+        }
+
+        if snap.erc4626.is_some() || snap.erc20.is_some() || snap.amm.is_some() {
+            report.per_contract.insert(addr, snap);
+        }
+    }
+
+    report
+}
+

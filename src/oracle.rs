@@ -76,11 +76,12 @@ impl OracleEngine {
     pub fn check(
         &self,
         pre_sequence_balances: &HashMap<Address, U256>,
+        pre_sequence_probes: &crate::types::ProtocolProbeReport,
         result: &ExecutionResult,
         sequence: &[Transaction],
     ) -> Vec<Finding> {
         self.registry
-            .check_all(pre_sequence_balances, result, sequence)
+            .check_all(pre_sequence_balances, pre_sequence_probes, result, sequence)
     }
 
     /// The attacker address this engine was configured with.
@@ -106,7 +107,7 @@ mod tests {
     #[test]
     fn no_findings_on_empty_result() {
         let engine = OracleEngine::new(Address::ZERO);
-        let findings = engine.check(&HashMap::new(), &empty_result(), &[]);
+        let findings = engine.check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &empty_result(), &[]);
         assert!(findings.is_empty());
     }
 
@@ -133,7 +134,7 @@ mod tests {
             gas_limit: 30_000_000,
         };
 
-        let findings = engine.check(&pre, &result, &[tx]);
+        let findings = engine.check(&pre, &crate::types::ProtocolProbeReport::default(), &result, &[tx]);
         assert!(!findings.is_empty());
         assert!(findings.iter().any(|f| f.severity == Severity::Critical));
     }
@@ -145,7 +146,7 @@ mod tests {
         let registry = InvariantRegistry::new();
         let engine = OracleEngine::with_invariants(attacker, registry);
 
-        let findings = engine.check(&HashMap::new(), &empty_result(), &[]);
+        let findings = engine.check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &empty_result(), &[]);
         assert!(findings.is_empty());
     }
 

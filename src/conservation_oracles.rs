@@ -48,6 +48,7 @@ impl Invariant for AmmSyncExplainedOracle {
     fn check(
         &self,
         _pre_balances: &HashMap<Address, U256>,
+        _pre_probes: &crate::types::ProtocolProbeReport,
         result: &ExecutionResult,
         sequence: &[Transaction],
     ) -> Option<Finding> {
@@ -123,6 +124,7 @@ impl Invariant for Erc4626FirstDepositorInflationOracle {
     fn check(
         &self,
         _pre_balances: &HashMap<Address, U256>,
+        _pre_probes: &crate::types::ProtocolProbeReport,
         result: &ExecutionResult,
         sequence: &[Transaction],
     ) -> Option<Finding> {
@@ -291,6 +293,7 @@ impl Invariant for Erc4626DepositVsUnderlyingTransferOracle {
     fn check(
         &self,
         _pre_balances: &HashMap<Address, U256>,
+        _pre_probes: &crate::types::ProtocolProbeReport,
         result: &ExecutionResult,
         sequence: &[Transaction],
     ) -> Option<Finding> {

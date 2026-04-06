@@ -40,6 +40,7 @@ pub trait Invariant: Send + Sync {
     fn check(
         &self,
         pre_balances: &HashMap<Address, U256>,
+        _pre_probes: &crate::types::ProtocolProbeReport,
         result: &ExecutionResult,
         sequence: &[Transaction],
     ) -> Option<Finding>;
@@ -65,6 +66,7 @@ impl Invariant for BalanceIncrease {
     fn check(
         &self,
         pre_balances: &HashMap<Address, U256>,
+        _pre_probes: &crate::types::ProtocolProbeReport,
         result: &ExecutionResult,
         sequence: &[Transaction],
     ) -> Option<Finding> {
@@ -141,6 +143,7 @@ impl Invariant for UnexpectedRevert {
     fn check(
         &self,
         _pre_balances: &HashMap<Address, U256>,
+        _pre_probes: &crate::types::ProtocolProbeReport,
         result: &ExecutionResult,
         sequence: &[Transaction],
     ) -> Option<Finding> {
@@ -194,6 +197,7 @@ impl Invariant for SelfDestructDetector {
     fn check(
         &self,
         pre_balances: &HashMap<Address, U256>,
+        _pre_probes: &crate::types::ProtocolProbeReport,
         result: &ExecutionResult,
         sequence: &[Transaction],
     ) -> Option<Finding> {
@@ -279,6 +283,7 @@ impl Invariant for EchidnaProperty {
     fn check(
         &self,
         _pre_balances: &HashMap<Address, U256>,
+        _pre_probes: &crate::types::ProtocolProbeReport,
         result: &ExecutionResult,
         sequence: &[Transaction],
     ) -> Option<Finding> {
@@ -483,6 +488,7 @@ impl Invariant for FlashloanEconomicOracle {
     fn check(
         &self,
         pre_balances: &HashMap<Address, U256>,
+        _pre_probes: &crate::types::ProtocolProbeReport,
         result: &ExecutionResult,
         sequence: &[Transaction],
     ) -> Option<Finding> {
@@ -580,6 +586,7 @@ impl Invariant for ERC20SupplyInvariant {
     fn check(
         &self,
         _pre_balances: &HashMap<Address, U256>,
+        _pre_probes: &crate::types::ProtocolProbeReport,
         result: &ExecutionResult,
         sequence: &[Transaction],
     ) -> Option<Finding> {
@@ -754,6 +761,7 @@ impl Invariant for AccessControlOracle {
     fn check(
         &self,
         _pre_balances: &HashMap<Address, U256>,
+        _pre_probes: &crate::types::ProtocolProbeReport,
         result: &ExecutionResult,
         sequence: &[Transaction],
     ) -> Option<Finding> {
@@ -820,6 +828,7 @@ impl Invariant for ReentrancyOracle {
     fn check(
         &self,
         pre_balances: &HashMap<Address, U256>,
+        _pre_probes: &crate::types::ProtocolProbeReport,
         result: &ExecutionResult,
         sequence: &[Transaction],
     ) -> Option<Finding> {
@@ -904,6 +913,7 @@ impl Invariant for TokenFlowConservationOracle {
     fn check(
         &self,
         _pre_balances: &HashMap<Address, U256>,
+        _pre_probes: &crate::types::ProtocolProbeReport,
         result: &ExecutionResult,
         sequence: &[Transaction],
     ) -> Option<Finding> {
@@ -1012,6 +1022,7 @@ impl Invariant for LendingHealthOracle {
     fn check(
         &self,
         _pre_balances: &HashMap<Address, U256>,
+        _pre_probes: &crate::types::ProtocolProbeReport,
         result: &ExecutionResult,
         sequence: &[Transaction],
     ) -> Option<Finding> {
@@ -1135,12 +1146,13 @@ impl InvariantRegistry {
     pub fn check_all(
         &self,
         pre_balances: &HashMap<Address, U256>,
+        pre_probes: &crate::types::ProtocolProbeReport,
         result: &ExecutionResult,
         sequence: &[Transaction],
     ) -> Vec<Finding> {
         self.invariants
             .iter()
-            .filter_map(|inv| inv.check(pre_balances, result, sequence))
+            .filter_map(|inv| inv.check(pre_balances, pre_probes, result, sequence))
             .collect()
     }
 
@@ -1357,7 +1369,7 @@ mod tests {
         let result = make_result(false, HashMap::new());
         let seq = dummy_sequence(target);
 
-        let finding = inv.check(&HashMap::new(), &result, &seq);
+        let finding = inv.check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &result, &seq);
         assert!(finding.is_some());
         assert_eq!(finding.unwrap().severity, Severity::Low);
     }
@@ -1372,7 +1384,7 @@ mod tests {
 
         let seq = dummy_sequence(target);
         // Should be None because gas_used < min_gas_threshold
-        assert!(inv.check(&HashMap::new(), &result, &seq).is_none());
+        assert!(inv.check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &result, &seq).is_none());
     }
 
     #[test]
@@ -1381,7 +1393,7 @@ mod tests {
         let result = make_result(true, HashMap::new());
         let seq = dummy_sequence(Address::ZERO);
 
-        assert!(inv.check(&HashMap::new(), &result, &seq).is_none());
+        assert!(inv.check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &result, &seq).is_none());
     }
 
     #[test]
@@ -1506,7 +1518,7 @@ mod tests {
         let result = make_result_with_logs(true, vec![log]);
         let seq = dummy_sequence(contract);
 
-        let finding = inv.check(&HashMap::new(), &result, &seq);
+        let finding = inv.check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &result, &seq);
         assert!(finding.is_some());
         let f = finding.unwrap();
         assert_eq!(f.severity, Severity::High);
@@ -1531,7 +1543,7 @@ mod tests {
         let result = make_result_with_logs(true, vec![log]);
         let seq = dummy_sequence(contract);
 
-        let finding = inv.check(&HashMap::new(), &result, &seq);
+        let finding = inv.check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &result, &seq);
         assert!(finding.is_some());
         let f = finding.unwrap();
         assert_eq!(f.severity, Severity::High);
@@ -1556,7 +1568,7 @@ mod tests {
         let result = make_result_with_logs(true, vec![log]);
         let seq = dummy_sequence(contract);
 
-        assert!(inv.check(&HashMap::new(), &result, &seq).is_none());
+        assert!(inv.check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &result, &seq).is_none());
     }
 
     #[test]
@@ -1586,7 +1598,7 @@ mod tests {
         let result = make_result_with_logs(true, vec![log]);
         let seq = dummy_sequence(token);
 
-        let finding = inv.check(&HashMap::new(), &result, &seq);
+        let finding = inv.check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &result, &seq);
         assert!(finding.is_some());
         let f = finding.unwrap();
         assert_eq!(f.severity, Severity::Medium);
@@ -1619,7 +1631,7 @@ mod tests {
         let result = make_result_with_logs(true, vec![log]);
         let seq = dummy_sequence(other);
 
-        assert!(inv.check(&HashMap::new(), &result, &seq).is_none());
+        assert!(inv.check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &result, &seq).is_none());
     }
 
     #[test]
@@ -1759,7 +1771,7 @@ mod tests {
             gas_limit: 30_000_000,
         }];
 
-        let finding = oracle.check(&HashMap::new(), &result, &seq);
+        let finding = oracle.check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &result, &seq);
         assert!(finding.is_some());
         let f = finding.unwrap();
         assert_eq!(f.severity, Severity::Critical);
@@ -1789,7 +1801,7 @@ mod tests {
             gas_limit: 30_000_000,
         }];
 
-        assert!(oracle.check(&HashMap::new(), &result, &seq).is_none());
+        assert!(oracle.check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &result, &seq).is_none());
     }
 
     #[test]
@@ -1812,7 +1824,7 @@ mod tests {
             value: U256::ZERO,
             gas_limit: 30_000_000,
         }];
-        assert!(oracle.check(&HashMap::new(), &result, &seq).is_none());
+        assert!(oracle.check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &result, &seq).is_none());
     }
 
     #[test]
@@ -1935,7 +1947,7 @@ mod tests {
         result.sequence_cumulative_logs = logs;
         let seq = dummy_sequence(target);
 
-        let finding = oracle.check(&HashMap::new(), &result, &seq);
+        let finding = oracle.check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &result, &seq);
         assert!(finding.is_some());
         let f = finding.unwrap();
         assert_eq!(f.severity, Severity::High);
@@ -1960,7 +1972,7 @@ mod tests {
         result.sequence_cumulative_logs = logs;
         let seq = dummy_sequence(target);
 
-        assert!(oracle.check(&HashMap::new(), &result, &seq).is_none());
+        assert!(oracle.check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &result, &seq).is_none());
     }
 
     #[test]
@@ -1981,7 +1993,7 @@ mod tests {
         result.sequence_cumulative_logs = logs;
         let seq = dummy_sequence(target);
 
-        assert!(oracle.check(&HashMap::new(), &result, &seq).is_none());
+        assert!(oracle.check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &result, &seq).is_none());
     }
 
     // -- LendingHealthOracle tests --------------------------------------------
@@ -2019,7 +2031,7 @@ mod tests {
         result.sequence_cumulative_logs = vec![log];
         let seq = dummy_sequence(lending);
 
-        let finding = oracle.check(&HashMap::new(), &result, &seq);
+        let finding = oracle.check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &result, &seq);
         assert!(finding.is_some());
         let f = finding.unwrap();
         assert_eq!(f.severity, Severity::Medium);
@@ -2052,7 +2064,7 @@ mod tests {
         result.sequence_cumulative_logs = vec![log];
         let seq = dummy_sequence(lending);
 
-        let finding = oracle.check(&HashMap::new(), &result, &seq);
+        let finding = oracle.check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &result, &seq);
         assert!(finding.is_some());
         let f = finding.unwrap();
         assert_eq!(f.severity, Severity::Medium);
@@ -2074,7 +2086,7 @@ mod tests {
         result.sequence_cumulative_logs = vec![log];
         let seq = dummy_sequence(lending);
 
-        assert!(oracle.check(&HashMap::new(), &result, &seq).is_none());
+        assert!(oracle.check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &result, &seq).is_none());
     }
 
     #[test]
@@ -2093,7 +2105,7 @@ mod tests {
         result.sequence_cumulative_logs = vec![borrow_log, repay_log];
         let seq = dummy_sequence(lending);
 
-        assert!(oracle.check(&HashMap::new(), &result, &seq).is_none());
+        assert!(oracle.check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &result, &seq).is_none());
     }
 
     #[test]
@@ -2117,7 +2129,7 @@ mod tests {
         result.sequence_cumulative_logs = vec![log];
         let seq = dummy_sequence(lending);
 
-        let finding = oracle.check(&HashMap::new(), &result, &seq);
+        let finding = oracle.check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &result, &seq);
         assert!(finding.is_some());
         let f = finding.unwrap();
         assert_eq!(f.severity, Severity::High);
@@ -2148,7 +2160,7 @@ mod tests {
         result.sequence_cumulative_logs = vec![log];
         let seq = dummy_sequence(lending);
 
-        assert!(oracle.check(&HashMap::new(), &result, &seq).is_none());
+        assert!(oracle.check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &result, &seq).is_none());
     }
 
     #[test]
@@ -2174,7 +2186,7 @@ mod tests {
         result.sequence_cumulative_logs = vec![log];
         let seq = dummy_sequence(lending);
 
-        let finding = oracle.check(&HashMap::new(), &result, &seq);
+        let finding = oracle.check(&HashMap::new(), &crate::types::ProtocolProbeReport::default(), &result, &seq);
         assert!(finding.is_some());
         let f = finding.unwrap();
         assert_eq!(f.severity, Severity::Medium);

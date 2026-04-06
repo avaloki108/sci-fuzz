@@ -667,6 +667,13 @@ impl Campaign {
             // a one-time campaign-root baseline (fuzzing often resumes from
             // non-root corpus snapshots).
             let pre_seq_balances = capture_eth_baseline(&executor, attacker);
+            let pre_sequence_probes = crate::protocol_probes::capture_pre_sequence_probes(
+                &executor,
+                attacker,
+                &protocol_profiles,
+                &target_abis,
+                &final_sequence
+            );
             let mut reached_exec_budget = false;
             let mut sequence: Vec<Transaction> = Vec::with_capacity(final_sequence.len());
             let mut cumulative_logs: Vec<crate::types::Log> = Vec::new();
@@ -724,7 +731,7 @@ impl Campaign {
                 );
 
                 // --- Oracle / invariant checks -----------------------------
-                let new_findings = oracle.check(&pre_seq_balances, &result, &sequence);
+                let new_findings = oracle.check(&pre_seq_balances, &pre_sequence_probes, &result, &sequence);
                 if !new_findings.is_empty() {
                     for mut f in new_findings {
                         finding_count += 1;
@@ -1168,7 +1175,14 @@ fn parallel_worker_loop(
 
         let db_snapshot = executor.snapshot();
         let pre_seq_balances = capture_eth_baseline(&executor, attacker);
-        let mut reached_exec_budget = false;
+            let pre_sequence_probes = crate::protocol_probes::capture_pre_sequence_probes(
+                &executor,
+                attacker,
+                &protocol_profiles,
+                &target_abis,
+                &final_sequence
+            );
+            let mut reached_exec_budget = false;
         let mut sequence: Vec<Transaction> = Vec::with_capacity(final_sequence.len());
         let mut cumulative_logs: Vec<crate::types::Log> = Vec::new();
         let mut sequence_path_id = B256::ZERO;
@@ -1213,7 +1227,7 @@ fn parallel_worker_loop(
                 &mut result,
             );
 
-            let new_findings = oracle.check(&pre_seq_balances, &result, &sequence);
+            let new_findings = oracle.check(&pre_seq_balances, &pre_sequence_probes, &result, &sequence);
             if !new_findings.is_empty() {
                 for mut f in new_findings {
                     let mut repro = sequence.clone();
@@ -1418,6 +1432,13 @@ fn reproduces_failure(
 ) -> bool {
     executor.restore(base_snapshot.clone());
     let pre_seq_balances = capture_eth_baseline(executor, attacker);
+    let pre_sequence_probes = crate::protocol_probes::capture_pre_sequence_probes(
+        executor,
+        attacker,
+        protocol_profiles,
+        target_abis,
+        sequence,     // sequence is passed to `execute_seq_with_feedback`
+    );
 
     let mut executed: Vec<Transaction> = Vec::with_capacity(sequence.len());
     let mut cumulative_logs: Vec<crate::types::Log> = Vec::new();
@@ -1442,7 +1463,7 @@ fn reproduces_failure(
         );
 
         if oracle
-            .check(&pre_seq_balances, &result, &executed)
+            .check(&pre_seq_balances, &pre_sequence_probes, &result, &executed)
             .iter()
             .any(|candidate| candidate.failure_id() == target_failure)
         {
