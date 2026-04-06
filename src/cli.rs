@@ -34,10 +34,6 @@ pub struct Cli {
     #[arg(short, long, global = true)]
     pub config: Option<PathBuf>,
 
-    /// Output format
-    #[arg(long, global = true, default_value = "text")]
-    pub output_format: OutputFormat,
-
     /// Disable colors in output
     #[arg(long, global = true)]
     pub no_color: bool,
@@ -241,7 +237,7 @@ pub struct ForgeArgs {
     pub selector_weight: Vec<String>,
 
     /// Output format: text, json, sarif, junit.
-    #[arg(long, value_enum, default_value = "text")]
+    #[arg(long, default_value = "text")]
     pub output_format: String,
 
     /// Save campaign report as JSON to output dir.
