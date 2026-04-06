@@ -252,6 +252,182 @@ contract Repro_{slug} is Test {{
     )
 }
 
+// ── Rich text report ────────────────────────────────────────────────────────
+
+/// Severity badge for terminal display.
+fn severity_badge(sev: Severity) -> &'static str {
+    match sev {
+        Severity::Critical => "🔴 CRITICAL",
+        Severity::High => "🟠 HIGH",
+        Severity::Medium => "🟡 MEDIUM",
+        Severity::Low => "🔵 LOW",
+        Severity::Info => "⚪ INFO",
+    }
+}
+
+/// Format ETH value from wei for display.
+fn format_wei(wei: &U256) -> String {
+    if wei.is_zero() {
+        return "0".into();
+    }
+    // U256 to u128: take the lower 128 bits.
+    let wei_u128 = u128::from_be_bytes({
+        let bytes = wei.to_be_bytes::<32>();
+        bytes[16..].try_into().unwrap_or([0u8; 16])
+    });
+    let eth = wei_u128 as f64 / 1e18;
+    if eth >= 1.0 {
+        format!("{:.4} ETH", eth)
+    } else {
+        format!("{} wei", wei)
+    }
+}
+
+/// Print a rich, human-readable campaign summary with findings.
+pub fn print_campaign_summary(
+    findings: &[Finding],
+    total_execs: u64,
+    elapsed_ms: u64,
+    finding_count: usize,
+    deduped_count: usize,
+    first_hit_execs: Option<u64>,
+    first_hit_ms: Option<u64>,
+    generate_replay: bool,
+) {
+    let elapsed_secs = elapsed_ms as f64 / 1000.0;
+    let execs_per_sec = if elapsed_secs > 0.0 {
+        total_execs as f64 / elapsed_secs
+    } else {
+        0.0
+    };
+
+    println!();
+    let sep = "─".repeat(60);
+    println!("{sep}");
+    println!("  CAMPAIGN SUMMARY");
+    println!("{sep}");
+    println!("  Duration      : {elapsed_secs:.1}s");
+    println!("  Executions    : {total_execs} ({execs_per_sec:.0} exec/s)");
+    println!("  Raw findings  : {finding_count}");
+    println!("  Unique bugs   : {deduped_count}");
+    if let Some(hit) = first_hit_execs {
+        println!("  First hit at  : {hit} execs", );
+    }
+    if let Some(ms) = first_hit_ms {
+        println!("  First hit in  : {ms}ms");
+    }
+    println!();
+
+    if findings.is_empty() {
+        println!("  ✅  No invariant violations found.");
+        println!();
+        return;
+    }
+
+    // Count by severity.
+    let mut by_sev: std::collections::HashMap<Severity, usize> = std::collections::HashMap::new();
+    for f in findings {
+        *by_sev.entry(f.severity.clone()).or_insert(0) += 1;
+    }
+
+    println!("  🐛  Found {} unique violation(s):", findings.len());
+    println!();
+
+    for (i, finding) in findings.iter().enumerate() {
+        let badge = severity_badge(finding.severity.clone());
+        println!("  ┌───────────────────────────────────────────────────────────");
+        println!("  │ [{i}] {badge}");
+        println!("  │     {title}", title = finding.title);
+        println!("  ├───────────────────────────────────────────────────────────");
+        println!("  │ Contract : {contract:#x}", contract = finding.contract);
+
+        // Exploit profit.
+        if let Some(ref profit) = finding.exploit_profit {
+            if !profit.is_zero() {
+                println!("  │ Profit   : {profit}", profit = format_wei(profit));
+            }
+        }
+
+        // Description.
+        println!("  │");
+        for line in finding.description.lines() {
+            println!("  │ {line}");
+        }
+
+        // Reproducer.
+        let seq_len = finding.reproducer.len();
+        println!("  │");
+        println!("  │ Sequence : {seq_len} tx(s)");
+        for (j, tx) in finding.reproducer.iter().enumerate() {
+            let sel_hex = if tx.data.len() >= 4 {
+                hex::encode(&tx.data[..4])
+            } else {
+                "(none)".into()
+            };
+            println!(
+                "  │   [{j}] {sender:#x} → {to:#x}  sel={sel_hex} value={value}",
+                sender = tx.sender,
+                to = tx.to.unwrap_or(crate::types::Address::ZERO),
+                value = if tx.value.is_zero() { "0".into() } else { format_wei(&tx.value) },
+            );
+        }
+
+        if generate_replay {
+            println!("  │");
+            println!("  │ Replay   : sci-fuzz replay --sequence <corpus_dir>/findings/{i}.json");
+        }
+        println!("  └───────────────────────────────────────────────────────────");
+        println!();
+    }
+
+    // Severity breakdown.
+    println!("  ── Severity breakdown ──");
+    for sev in &[Severity::Critical, Severity::High, Severity::Medium, Severity::Low, Severity::Info] {
+        if let Some(&count) = by_sev.get(sev) {
+            println!("    {:12} : {}", severity_badge(sev.clone()), count);
+        }
+    }
+    println!();
+}
+
+/// JSON report output — machine-readable campaign results.
+pub fn json_report(
+    findings: &[Finding],
+    total_execs: u64,
+    elapsed_ms: u64,
+    finding_count: usize,
+    deduped_count: usize,
+    first_hit_execs: Option<u64>,
+    first_hit_ms: Option<u64>,
+    test_mode: &str,
+) -> String {
+    let report = serde_json::json!({
+        "tool": "sci-fuzz",
+        "test_mode": test_mode,
+        "executions": total_execs,
+        "elapsed_ms": elapsed_ms,
+        "raw_findings": finding_count,
+        "unique_findings": deduped_count,
+        "first_hit_execs": first_hit_execs,
+        "first_hit_ms": first_hit_ms,
+        "findings": findings.iter().map(|f| serde_json::json!({
+            "severity": format!("{:?}", f.severity),
+            "title": f.title,
+            "description": f.description,
+            "contract": format!("{:#x}", f.contract),
+            "exploit_profit": f.exploit_profit.as_ref().map(|p| format!("{:#x}", p)),
+            "sequence_length": f.reproducer.len(),
+            "sequence": f.reproducer.iter().map(|tx| serde_json::json!({
+                "sender": format!("{:#x}", tx.sender),
+                "to": tx.to.map(|a| format!("{:#x}", a)),
+                "data": format!("0x{}", hex::encode(&tx.data)),
+                "value": format!("{:#x}", tx.value),
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    });
+    serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into())
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

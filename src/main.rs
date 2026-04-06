@@ -246,21 +246,56 @@ fn handle_forge(args: sci_fuzz::cli::ForgeArgs) -> Result<()> {
     };
 
     let mut campaign = Campaign::new(config);
-    let findings = campaign.run()?;
+    let report = campaign.run_with_report()?;
+    let findings: Vec<sci_fuzz::types::Finding> = report
+        .findings
+        .into_iter()
+        .map(|r| r.finding)
+        .collect();
 
-    println!();
-    if findings.is_empty() {
-        println!("✅ No invariant violations found.");
-    } else {
-        println!("🐛 Found {} invariant violation(s):", findings.len());
-        for (i, finding) in findings.iter().enumerate() {
-            println!(
-                "  [{i}] [{sev}] {title}",
-                sev = finding.severity,
-                title = finding.title,
-            );
-            println!("       {}", finding.description);
+    let generate_replay = !args.no_replay;
+    sci_fuzz::output::print_campaign_summary(
+        &findings,
+        report.total_execs,
+        report.elapsed_ms,
+        report.finding_count,
+        report.deduped_finding_count,
+        report.first_hit_execs,
+        report.first_hit_time_ms,
+        generate_replay,
+    );
+
+    // Save JSON report if requested.
+    if args.save_report {
+        let json = sci_fuzz::output::json_report(
+            &findings,
+            report.total_execs,
+            report.elapsed_ms,
+            report.finding_count,
+            report.deduped_finding_count,
+            report.first_hit_execs,
+            report.first_hit_time_ms,
+            &format!("{:?}", args.mode),
+        );
+        let out_path = args
+            .output
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let report_path = std::path::Path::new(out_path).join("sci-fuzz-report.json");
+        if let Err(e) = std::fs::write(&report_path, &json) {
+            eprintln!("[warn] failed to save report: {e}");
+        } else {
+            eprintln!("[report] saved to {}", report_path.display());
         }
+    }
+
+    // Exit 1 on critical findings if requested.
+    if args.fail_on_critical
+        && findings
+            .iter()
+            .any(|f| matches!(f.severity, sci_fuzz::types::Severity::Critical))
+    {
+        std::process::exit(1);
     }
 
     Ok(())
