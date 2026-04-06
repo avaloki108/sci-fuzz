@@ -113,7 +113,9 @@ findings meet the configured thresholds (distinct from build error exit 1).
         name = "diff",
         about = "Compare two implementations via differential fuzzing",
         long_about = r#"
-Not implemented yet.
+Run narrow in-engine differential execution on two local Foundry artifacts.
+This reports reproducible divergences (success/revert, outputs, logs) and
+does not claim semantic equivalence.
 "#
     )]
     Diff(DiffArgs),
@@ -372,27 +374,43 @@ pub struct CiArgs {
 /// Arguments for the `diff` subcommand
 #[derive(Parser, Debug)]
 pub struct DiffArgs {
-    /// First implementation path or address
+    /// First implementation target (contract name or source.sol:Contract)
     pub impl_a: String,
 
-    /// Second implementation path or address
+    /// Second implementation target (contract name or source.sol:Contract)
     pub impl_b: String,
 
-    /// Reference specification path or address
+    /// Foundry project root
+    #[arg(short, long, default_value = ".")]
+    pub project: PathBuf,
+
+    /// Optional contract-name filter applied before resolving impl_a/impl_b
+    #[arg(long)]
+    pub match_contract: Option<String>,
+
+    /// Reference specification path or address (not implemented for MVP)
     #[arg(long)]
     pub reference: Option<String>,
 
-    /// Tolerance for numerical differences
-    #[arg(long, default_value = "0.01")]
-    pub tolerance: f64,
-
-    /// RPC URL for on-chain implementations
+    /// RPC URL for on-chain implementations (not implemented for MVP)
     #[arg(long)]
     pub rpc_url: Option<String>,
 
     /// Timeout in seconds
     #[arg(long, default_value = "300")]
     pub timeout: u64,
+
+    /// Deterministic RNG seed
+    #[arg(long)]
+    pub seed: Option<u64>,
+
+    /// Maximum number of differential executions
+    #[arg(long, default_value = "1000")]
+    pub max_execs: u64,
+
+    /// Maximum sequence depth before reset
+    #[arg(long, default_value = "8")]
+    pub depth: u32,
 
     /// Output directory for diff results
     #[arg(short, long)]

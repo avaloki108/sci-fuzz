@@ -633,12 +633,80 @@ fn handle_ci(args: sci_fuzz::cli::CiArgs) -> Result<()> {
 
 #[cfg(feature = "cli")]
 fn handle_diff(args: sci_fuzz::cli::DiffArgs) -> Result<()> {
+    use sci_fuzz::diff::{run_project_diff, DiffConfig};
+
+    if args.reference.is_some() {
+        anyhow::bail!("--reference is not implemented in MVP diff mode");
+    }
+    if args.rpc_url.is_some() {
+        anyhow::bail!("--rpc-url is not supported in MVP diff mode");
+    }
+    if args.depth == 0 {
+        anyhow::bail!("--depth must be >= 1");
+    }
+
     println!("⚡ sci-fuzz diff");
+    println!("  project   : {}", args.project.display());
     println!("  impl-a    : {}", args.impl_a);
     println!("  impl-b    : {}", args.impl_b);
-    println!("  tolerance : {}", args.tolerance);
+    if let Some(ref pat) = args.match_contract {
+        println!("  match-contract: {pat}");
+    }
+    println!("  timeout   : {}s", args.timeout);
+    println!("  seed      : {}", args.seed.unwrap_or(0xD1FF));
+    println!("  max-execs : {}", args.max_execs);
+    println!("  depth     : {}", args.depth);
     println!();
-    println!("  (differential fuzzing not yet implemented — coming soon)");
+
+    let report = run_project_diff(
+        &args.project,
+        &args.impl_a,
+        &args.impl_b,
+        args.match_contract.as_deref(),
+        DiffConfig {
+            timeout: std::time::Duration::from_secs(args.timeout),
+            seed: args.seed.unwrap_or(0xD1FF),
+            max_execs: args.max_execs,
+            depth: args.depth,
+            shrink: true,
+        },
+    )?;
+
+    println!("  shared functions: {}", report.shared_functions.len());
+    if !report.skipped_functions.is_empty() {
+        println!("  skipped shared signatures:");
+        for s in &report.skipped_functions {
+            println!("    - {s}");
+        }
+    }
+    println!("  execs: {}", report.execs);
+
+    if let Some(div) = &report.divergence {
+        println!();
+        println!("⚠️  divergence found:");
+        println!("  type      : {:?}", div.mismatch);
+        if let Some(ref f) = div.function {
+            println!("  function  : {f}");
+        }
+        if let Some(sel) = div.selector {
+            println!("  selector  : 0x{}", hex::encode(sel));
+        }
+        println!("  seq-len   : {}", div.sequence.len());
+        println!("  note      : {}", div.note);
+    } else {
+        println!("✅ no divergence observed within configured budget");
+    }
+
+    if let Some(out_dir) = args.output {
+        std::fs::create_dir_all(&out_dir)?;
+        let report_path = report.save_to_dir(&out_dir)?;
+        println!("  💾 wrote {}", report_path.display());
+        if let Some(div) = &report.divergence {
+            let finding_path = div.to_finding(Address::ZERO).save_to_dir(&out_dir)?;
+            println!("  💾 wrote {}", finding_path.display());
+        }
+    }
+
     Ok(())
 }
 
@@ -684,9 +752,30 @@ fn init_logging(verbosity: &sci_fuzz::cli::Verbosity) {
 
 #[cfg(test)]
 mod tests {
+    use sci_fuzz::cli::DiffArgs;
+
     #[test]
     fn version_is_set() {
         let version = env!("CARGO_PKG_VERSION");
         assert!(!version.is_empty());
+    }
+
+    #[test]
+    fn diff_handler_no_longer_stubbed_and_validates_flags() {
+        let args = DiffArgs {
+            impl_a: "A".into(),
+            impl_b: "B".into(),
+            project: ".".into(),
+            match_contract: None,
+            reference: Some("spec".into()),
+            rpc_url: None,
+            timeout: 1,
+            seed: Some(1),
+            max_execs: 1,
+            depth: 1,
+            output: None,
+        };
+        let err = super::handle_diff(args).unwrap_err();
+        assert!(err.to_string().contains("--reference is not implemented"));
     }
 }
