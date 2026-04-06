@@ -4,7 +4,6 @@ openmemory.md
 ci-run.log
 docs/
 logs/
-
 # Benchmark / CI artifacts
 benchmark-results.json
 benchmark-results.txt
