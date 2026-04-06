@@ -2230,3 +2230,17 @@ mod tests {
         assert_eq!(f.severity, Severity::Medium);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Opt-in Timelock support
+// ---------------------------------------------------------------------------
+
+impl InvariantRegistry {
+    /// Opt-in registry with the generic TimelockStateMachineOracle.
+    /// Keeps the default registry low-noise. Use this when auditing
+    /// timelocked reward distributors, governance queues, or delayed execution contracts.
+    pub fn with_timelock(mut self) -> Self {
+        self.add(Box::new(crate::inferred_invariants::TimelockStateMachineOracle::new()));
+        self
+    }
+}
