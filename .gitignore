@@ -2,6 +2,7 @@
 .env
 openmemory.md
 ci-run.log
+docs/
 
 # Benchmark / CI artifacts
 benchmark-results.json

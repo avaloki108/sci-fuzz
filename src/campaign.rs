@@ -631,6 +631,7 @@ impl Campaign {
         // --- Main fuzzing loop ---------------------------------------------
         let start = Instant::now();
         let mut total_execs: u64 = 0;
+        let mut total_reverts: u64 = 0;
         let mut findings: Vec<CampaignFindingRecord> = Vec::new();
         let mut seen_finding_hashes: HashSet<u64> = HashSet::new();
         let mut finding_count: usize = 0;
@@ -642,6 +643,19 @@ impl Campaign {
         let mut diag_funded_deposits: u64 = 0;
         let mut diag_withdraws_ok: u64 = 0;
         let mut diag_deposit_then_withdraw: u64 = 0;
+        // Time-based progress tracking (every 5 seconds to stderr).
+        let progress_interval = std::time::Duration::from_secs(5);
+        let mut last_progress = start;
+        let timeout_s = self.config.timeout.as_secs();
+
+        // Print initial "started" banner so the user knows the campaign is live.
+        eprintln!(
+            "[fuzz] started | targets={} | timeout={}s | depth={} | mode={:?}",
+            deployed_targets.len(),
+            timeout_s,
+            self.config.max_depth,
+            self.config.test_mode,
+        );
 
         tracing::info!(
             timeout_s = self.config.timeout.as_secs(),
@@ -764,6 +778,9 @@ impl Campaign {
                 result.sequence_cumulative_logs = cumulative_logs.clone();
 
                 total_execs += 1;
+                if !result.success {
+                    total_reverts += 1;
+                }
                 sequence.push(tx.clone());
 
                 // vm.assume(false) → treat as precondition rejection, skip
@@ -1019,28 +1036,33 @@ impl Campaign {
             // iteration starts fresh (or from a chosen snapshot).
             executor.restore(db_snapshot);
 
-            // Periodic stats logging.
-            if total_execs % 500 == 0 && total_execs > 0 {
+            // Periodic stats logging — time-based (every 5 s) so it's
+            // visible regardless of exec speed.
+            if last_progress.elapsed() >= progress_interval {
+                last_progress = Instant::now();
                 let elapsed = start.elapsed().as_secs_f64();
-                let prop_count: usize = findings
-                    .iter()
-                    .filter(|record| record.finding.title.contains("echidna"))
-                    .count();
+                let eps = total_execs as f64 / elapsed.max(0.001);
+                let rev_pct = if total_execs > 0 {
+                    total_reverts as f64 / total_execs as f64 * 100.0
+                } else {
+                    0.0
+                };
+                let remaining = timeout_s.saturating_sub(elapsed as u64);
                 eprintln!(
-                    "[campaign] execs={total_execs} speed={:.0}/s state_chg={successful_state_changes} snaps_saved={snapshots_saved} cov={} snaps={} findings={} prop_findings={prop_count} deposits={diag_funded_deposits} withdraws={diag_withdraws_ok} dep+wdr={diag_deposit_then_withdraw}",
-                    total_execs as f64 / elapsed,
+                    "[fuzz] {elapsed:.0}s/{timeout_s}s | {eps:.0} exec/s | {total_execs} total | cov: {} edges | snaps: {} | findings: {} | rev: {rev_pct:.0}% | {remaining}s left",
                     feedback.total_coverage(),
                     snapshots.len(),
                     findings.len(),
                 );
                 tracing::info!(
                     total_execs,
-                    execs_per_sec = format_args!("{:.0}", total_execs as f64 / elapsed),
+                    execs_per_sec = format_args!("{eps:.0}"),
                     state_changes = successful_state_changes,
                     snapshots_saved,
                     coverage = feedback.total_coverage(),
                     snapshots = snapshots.len(),
                     findings = findings.len(),
+                    revert_pct = format_args!("{rev_pct:.1}"),
                     "progress",
                 );
             }

@@ -493,6 +493,24 @@ pub fn dispatch<DB: revm::Database>(
         return (true, encode_u256(U256::ZERO));
     }
 
+    // makeAddr(string name) — returns deterministic address from name.
+    // Forge: privateKey = keccak256(abi.encodePacked(name)); addr = vm.addr(privateKey)
+    // We implement: keccak256(name bytes) → last 20 bytes as address (consistent
+    // with the vm.addr(uint256) implementation above).
+    if sel == selector(b"makeAddr(string)") {
+        let name_bytes = decode_abi_string(args);
+        // Compute keccak256 of raw name bytes (same as keccak256(abi.encodePacked(name))).
+        use tiny_keccak::{Hasher as _, Keccak};
+        let mut k = Keccak::v256();
+        k.update(name_bytes.as_ref());
+        let mut hash = [0u8; 32];
+        k.finalize(&mut hash);
+        // Use last 20 bytes as address (matches current vm.addr(uint256) behaviour).
+        let mut out = [0u8; 32];
+        out[12..].copy_from_slice(&hash[12..]);
+        return (true, bytes::Bytes::copy_from_slice(&out));
+    }
+
     if sel == selector(b"sign(uint256,bytes32)") {
         // VM signing: return dummy (v=27, r=0, s=0)
         let mut out = vec![0u8; 96];
@@ -551,6 +569,58 @@ pub fn dispatch<DB: revm::Database>(
         return (true, encode_u256(U256::from(1u64))); // return true
     }
 
+    // ── Fork management cheatcodes (no-ops in local mode) ────────────────────
+    // These are called by harnesses that also support fork mode. In local mode
+    // we accept them silently so setUp() can complete.
+    if sel == selector(b"createFork(string)")
+        || sel == selector(b"createFork(string,uint256)")
+        || sel == selector(b"createFork(string,bytes32)")
+        || sel == selector(b"createSelectFork(string)")
+        || sel == selector(b"createSelectFork(string,uint256)")
+        || sel == selector(b"createSelectFork(string,bytes32)")
+    {
+        // Returns a fork ID (uint256). Return 0.
+        return (true, encode_u256(U256::ZERO));
+    }
+
+    if sel == selector(b"selectFork(uint256)") {
+        // vm.selectFork(forkId) — no-op in local mode.
+        return (true, bytes::Bytes::new());
+    }
+
+    if sel == selector(b"activeFork()") {
+        // Returns current fork ID (uint256). Return 0.
+        return (true, encode_u256(U256::ZERO));
+    }
+
+    if sel == selector(b"rollFork(uint256)") {
+        // vm.rollFork(blockNumber) — advance block number like vm.roll.
+        if args.len() >= 32 {
+            let num = decode_u256_word(args);
+            let num64: u64 = num.saturating_to::<u64>();
+            context.env.block.number = revm::primitives::U256::from(num64);
+            state.pending_roll = Some(num64);
+        }
+        return (true, bytes::Bytes::new());
+    }
+
+    if sel == selector(b"rollFork(uint256,uint256)") {
+        // vm.rollFork(forkId, blockNumber) — no-op.
+        return (true, bytes::Bytes::new());
+    }
+
+    if sel == selector(b"makePersistent(address)")
+        || sel == selector(b"makePersistent(address,address)")
+        || sel == selector(b"makePersistent(address,address,address)")
+        || sel == selector(b"makePersistent(address[])")
+        || sel == selector(b"revokePersistent(address)")
+        || sel == selector(b"revokePersistent(address[])")
+        || sel == selector(b"isPersistent(address)")
+    {
+        // Persistence across forks — no-op. isPersistent returns false/0.
+        return (true, encode_u256(U256::ZERO));
+    }
+
     // ── Breakpoints / debugging (no-op) ──────────────────────────────────────
 
     if sel == selector(b"breakpoint(string)")
@@ -598,6 +668,13 @@ fn decode_abi_bytes(args: &[u8], word_offset: usize) -> alloy_primitives::Bytes 
         return alloy_primitives::Bytes::new();
     }
     alloy_primitives::Bytes::copy_from_slice(&args[data_start..data_start + len])
+}
+
+/// Decode an ABI `string` argument from the args slice.
+/// `string` is ABI-encoded identically to `bytes`: offset → length → data.
+/// We treat the first word as a pointer to the string data.
+fn decode_abi_string(args: &[u8]) -> alloy_primitives::Bytes {
+    decode_abi_bytes(args, 0)
 }
 
 /// Try to match a sub-call against registered mocked calls.
