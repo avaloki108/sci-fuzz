@@ -633,92 +633,77 @@ fn handle_ci(args: sci_fuzz::cli::CiArgs) -> Result<()> {
 
 #[cfg(feature = "cli")]
 fn handle_diff(args: sci_fuzz::cli::DiffArgs) -> Result<()> {
-    use sci_fuzz::diff::{DiffConfig, DiffRunner};
+    use sci_fuzz::diff::{run_project_diff, DiffConfig};
 
-    // Reject unsupported flags with a clear message rather than silently ignoring.
     if args.reference.is_some() {
-        anyhow::bail!(
-            "--reference is not supported: on-chain reference comparison \
-             requires --rpc-url which is not yet implemented for `sci-fuzz diff`"
-        );
+        anyhow::bail!("--reference is not implemented in MVP diff mode");
     }
     if args.rpc_url.is_some() {
-        anyhow::bail!(
-            "--rpc-url is not supported: on-chain fork mode is not yet \
-             implemented for `sci-fuzz diff`. Use local Foundry project artifacts only."
-        );
+        anyhow::bail!("--rpc-url is not supported in MVP diff mode");
+    }
+    if args.depth == 0 {
+        anyhow::bail!("--depth must be >= 1");
     }
 
     println!("⚡ sci-fuzz diff");
+    println!("  project   : {}", args.project.display());
     println!("  impl-a    : {}", args.impl_a);
     println!("  impl-b    : {}", args.impl_b);
-    println!("  project   : {}", args.project.display());
-    println!("  seed      : {}", args.seed);
+    if let Some(ref pat) = args.match_contract {
+        println!("  match-contract: {pat}");
+    }
+    println!("  timeout   : {}s", args.timeout);
+    println!("  seed      : {}", args.seed.unwrap_or(0xD1FF));
     println!("  max-execs : {}", args.max_execs);
     println!("  depth     : {}", args.depth);
-    println!("  timeout   : {}s", args.timeout);
     println!();
 
-    let config = DiffConfig {
-        project: args.project,
-        impl_a_name: args.impl_a.clone(),
-        impl_b_name: args.impl_b.clone(),
-        seed: args.seed,
-        timeout: std::time::Duration::from_secs(args.timeout),
-        max_execs: args.max_execs,
-        depth: args.depth,
-    };
+    let report = run_project_diff(
+        &args.project,
+        &args.impl_a,
+        &args.impl_b,
+        args.match_contract.as_deref(),
+        DiffConfig {
+            timeout: std::time::Duration::from_secs(args.timeout),
+            seed: args.seed.unwrap_or(0xD1FF),
+            max_execs: args.max_execs,
+            depth: args.depth,
+            shrink: true,
+        },
+    )?;
 
-    let mut runner = DiffRunner::new(config);
-    let divergences = runner.run()?;
+    println!("  shared functions: {}", report.shared_functions.len());
+    if !report.skipped_functions.is_empty() {
+        println!("  skipped shared signatures:");
+        for s in &report.skipped_functions {
+            println!("    - {s}");
+        }
+    }
+    println!("  execs: {}", report.execs);
 
-    println!();
-    if divergences.is_empty() {
-        println!("✅ No divergence found within the execution budget.");
-        println!("   This does not prove equivalence — increase --max-execs or try a different --seed.");
+    if let Some(div) = &report.divergence {
+        println!();
+        println!("⚠️  divergence found:");
+        println!("  type      : {:?}", div.mismatch);
+        if let Some(ref f) = div.function {
+            println!("  function  : {f}");
+        }
+        if let Some(sel) = div.selector {
+            println!("  selector  : 0x{}", hex::encode(sel));
+        }
+        println!("  seq-len   : {}", div.sequence.len());
+        println!("  note      : {}", div.note);
     } else {
-        println!("🔀 Found {} divergence(s):", divergences.len());
-        for (i, d) in divergences.iter().enumerate() {
-            println!();
-            println!("  [{i}] kind        : {}", d.kind);
-            println!(
-                "       calldata    : 0x{}",
-                hex::encode(&d.calldata)
-            );
-            println!(
-                "       impl-a      : success={} output=0x{}",
-                d.outcome_a.success,
-                hex::encode(&d.outcome_a.output)
-            );
-            println!(
-                "       impl-b      : success={} output=0x{}",
-                d.outcome_b.success,
-                hex::encode(&d.outcome_b.output)
-            );
-            if !d.outcome_a.log_sigs.is_empty() || !d.outcome_b.log_sigs.is_empty() {
-                println!(
-                    "       log-sigs-a  : [{}]",
-                    d.outcome_a
-                        .log_sigs
-                        .iter()
-                        .map(|s| format!("0x{}", hex::encode(s)))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-                println!(
-                    "       log-sigs-b  : [{}]",
-                    d.outcome_b
-                        .log_sigs
-                        .iter()
-                        .map(|s| format!("0x{}", hex::encode(s)))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-            }
-            println!(
-                "       minimal-seq : {} tx(s)",
-                d.minimal_sequence.len()
-            );
+        println!("✅ no divergence observed within configured budget");
+    }
+
+    if let Some(out_dir) = args.output {
+        std::fs::create_dir_all(&out_dir)?;
+        let report_path = report.save_to_dir(&out_dir)?;
+        println!("  💾 wrote {}", report_path.display());
+        if let Some(div) = &report.divergence {
+            let finding_path = div.to_finding(Address::ZERO).save_to_dir(&out_dir)?;
+            println!("  💾 wrote {}", finding_path.display());
         }
     }
 
@@ -767,9 +752,30 @@ fn init_logging(verbosity: &sci_fuzz::cli::Verbosity) {
 
 #[cfg(test)]
 mod tests {
+    use sci_fuzz::cli::DiffArgs;
+
     #[test]
     fn version_is_set() {
         let version = env!("CARGO_PKG_VERSION");
         assert!(!version.is_empty());
+    }
+
+    #[test]
+    fn diff_handler_no_longer_stubbed_and_validates_flags() {
+        let args = DiffArgs {
+            impl_a: "A".into(),
+            impl_b: "B".into(),
+            project: ".".into(),
+            match_contract: None,
+            reference: Some("spec".into()),
+            rpc_url: None,
+            timeout: 1,
+            seed: Some(1),
+            max_execs: 1,
+            depth: 1,
+            output: None,
+        };
+        let err = super::handle_diff(args).unwrap_err();
+        assert!(err.to_string().contains("--reference is not implemented"));
     }
 }

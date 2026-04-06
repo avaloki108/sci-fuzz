@@ -113,14 +113,9 @@ findings meet the configured thresholds (distinct from build error exit 1).
         name = "diff",
         about = "Compare two local contract implementations via differential execution",
         long_about = r#"
-Deploy two contracts from a Foundry project and execute identical generated
-call sequences against both, reporting any reproducible divergence in:
-  - success vs revert (one succeeds, the other reverts)
-  - return data (both succeed but output differs)
-  - emitted event signatures (topic[0] set differs)
-
-Unsupported: --reference and --rpc-url. Pass either flag to get a clear error.
-On-chain fork comparison is not implemented.
+Run narrow in-engine differential execution on two local Foundry artifacts.
+This reports reproducible divergences (success/revert, outputs, logs) and
+does not claim semantic equivalence.
 "#
     )]
     Diff(DiffArgs),
@@ -379,43 +374,47 @@ pub struct CiArgs {
 /// Arguments for the `diff` subcommand
 #[derive(Parser, Debug)]
 pub struct DiffArgs {
-    /// Name of the first contract implementation (as it appears in forge artifacts)
+    /// First implementation target (contract name or source.sol:Contract)
     pub impl_a: String,
 
-    /// Name of the second contract implementation
+    /// Second implementation target (contract name or source.sol:Contract)
     pub impl_b: String,
 
-    /// Path to the Foundry project root
+    /// Foundry project root
     #[arg(short, long, default_value = ".")]
     pub project: PathBuf,
+
+    /// Optional contract-name filter applied before resolving impl_a/impl_b
+    #[arg(long)]
+    pub match_contract: Option<String>,
+
+    /// Reference specification path or address (not implemented for MVP)
+    #[arg(long)]
+    pub reference: Option<String>,
+
+    /// RPC URL for on-chain implementations (not implemented for MVP)
+    #[arg(long)]
+    pub rpc_url: Option<String>,
 
     /// Timeout in seconds
     #[arg(long, default_value = "300")]
     pub timeout: u64,
 
-    /// Deterministic seed for the call generator
-    #[arg(long, default_value = "0")]
-    pub seed: u64,
+    /// Deterministic RNG seed
+    #[arg(long)]
+    pub seed: Option<u64>,
 
-    /// Maximum number of individual call executions before stopping
-    #[arg(long, default_value = "50000")]
+    /// Maximum number of differential executions
+    #[arg(long, default_value = "1000")]
     pub max_execs: u64,
 
-    /// Maximum transaction sequence depth per iteration
-    #[arg(long, default_value = "16")]
+    /// Maximum sequence depth before reset
+    #[arg(long, default_value = "8")]
     pub depth: u32,
 
-    /// Filter: only fuzz functions whose name contains this substring (reserved, currently unused)
-    #[arg(long)]
-    pub match_contract: Option<String>,
-
-    /// Not supported — on-chain reference comparison requires --rpc-url which is not yet implemented
-    #[arg(long)]
-    pub reference: Option<String>,
-
-    /// Not supported — on-chain fork mode is not yet implemented for diff
-    #[arg(long)]
-    pub rpc_url: Option<String>,
+    /// Output directory for diff results
+    #[arg(short, long)]
+    pub output: Option<PathBuf>,
 }
 
 /// Snapshot strategy variants
