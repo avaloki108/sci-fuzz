@@ -640,6 +640,346 @@ impl Invariant for ERC20SupplyInvariant {
 }
 
 // ---------------------------------------------------------------------------
+// Built-in: AccessControlOracle
+// ---------------------------------------------------------------------------
+
+/// Privileged function name patterns that non-owners should not be able to call.
+///
+/// All comparisons are performed **lowercase** on the function name only; the
+/// selector is computed from the full `name(...)` signature in the ABI.
+static PRIVILEGED_FN_NAMES: &[&str] = &[
+    "setowner",
+    "transferownership",
+    "renounceownership",
+    "pause",
+    "unpause",
+    "pauseall",
+    "unpauseall",
+    "upgradeto",
+    "upgradetoandcall",
+    "_authorizeupgrade",
+    "setadmin",
+    "setoperator",
+    "setminter",
+    "setfee",
+    "setfees",
+    "setprotocolfee",
+    "settreasury",
+    "setvault",
+    "grantrole",
+    "revokerole",
+    "renouncerole",
+    "emergencywithdraw",
+    "emergencyshutdown",
+    "emergencyexit",
+    "initialize",
+    "reinitialize",
+];
+
+fn is_privileged_fn(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    PRIVILEGED_FN_NAMES.contains(&lower.as_str())
+}
+
+/// Detects when the attacker successfully calls a privileged function.
+///
+/// At campaign setup, supply this oracle with all privilege-gated selectors
+/// from the target ABI.  It then fires whenever the attacker (any address
+/// *other* than `deployer`) succeeds in calling one of them.
+pub struct AccessControlOracle {
+    /// The canonical owner / deployer address that *is* allowed to call
+    /// privileged functions.
+    pub deployer: Address,
+    /// The fuzzer attacker address (or any address that should be rejected).
+    pub attacker: Address,
+    /// `(selector, human-readable function name)` pairs derived from the ABI
+    /// for functions whose names match [`PRIVILEGED_FN_NAMES`].
+    ///
+    /// Build this via [`AccessControlOracle::from_abi`].
+    pub privileged_selectors: Vec<([u8; 4], String)>,
+}
+
+impl AccessControlOracle {
+    /// Build from a JSON ABI array — extracts functions whose lowercase names
+    /// appear in [`PRIVILEGED_FN_NAMES`] and computes their 4-byte selectors.
+    ///
+    /// Returns `None` if no privileged functions are found.
+    pub fn from_abi(
+        deployer: Address,
+        attacker: Address,
+        abi: &serde_json::Value,
+    ) -> Option<Self> {
+        let arr = abi.as_array()?;
+        let mut privileged_selectors = Vec::new();
+
+        for entry in arr {
+            let ty = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if ty != "function" {
+                continue;
+            }
+            let name = match entry.get("name").and_then(|v| v.as_str()) {
+                Some(n) if is_privileged_fn(n) => n,
+                _ => continue,
+            };
+            // Build the ABI signature: `name(type0,type1,...)`.
+            let inputs = entry.get("inputs").and_then(|v| v.as_array());
+            let param_types: String = inputs
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|p| p.get("type").and_then(|v| v.as_str()))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default();
+            let sig = format!("{name}({param_types})");
+            let hash = keccak256(sig.as_bytes());
+            let mut selector = [0u8; 4];
+            selector.copy_from_slice(&hash.as_slice()[..4]);
+            privileged_selectors.push((selector, name.to_string()));
+        }
+
+        if privileged_selectors.is_empty() {
+            None
+        } else {
+            Some(Self {
+                deployer,
+                attacker,
+                privileged_selectors,
+            })
+        }
+    }
+}
+
+impl Invariant for AccessControlOracle {
+    fn name(&self) -> &str {
+        "access-control"
+    }
+
+    fn check(
+        &self,
+        _pre_balances: &HashMap<Address, U256>,
+        result: &ExecutionResult,
+        sequence: &[Transaction],
+    ) -> Option<Finding> {
+        if !result.success {
+            return None;
+        }
+        let last = sequence.last()?;
+        // The deployer (owner) calling privileged functions is expected behaviour.
+        if last.sender == self.deployer {
+            return None;
+        }
+        if last.data.len() < 4 {
+            return None;
+        }
+        let sel: [u8; 4] = last.data[..4].try_into().ok()?;
+        for (priv_sel, fn_name) in &self.privileged_selectors {
+            if sel == *priv_sel {
+                let contract = last.to.unwrap_or(Address::ZERO);
+                return Some(Finding {
+                    severity: Severity::Critical,
+                    title: format!(
+                        "Access control violation: `{fn_name}` called by non-owner succeeded"
+                    ),
+                    description: format!(
+                        "Non-owner {} successfully called privileged function `{fn_name}` on \
+                         contract {contract}. The deployer/owner is {deployer}. \
+                         This indicates a missing or broken access control guard.",
+                        last.sender,
+                        deployer = self.deployer,
+                    ),
+                    contract,
+                    reproducer: sequence.to_vec(),
+                    exploit_profit: None,
+                });
+            }
+        }
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Built-in: ReentrancyOracle
+// ---------------------------------------------------------------------------
+
+/// Detects profitable reentrancy — SSTORE in a nested call frame combined with
+/// attacker ETH profit.
+///
+/// Uses [`ExecutionResult::sstore_in_nested_call`] (set by the EVM inspector)
+/// as the *necessary condition* (state was written while a call was in
+/// progress) and attacker balance gain as the *sufficient condition*.
+///
+/// False-positive rate is kept low because **both** conditions must hold:
+/// most legitimate multi-hop protocols do not result in attacker ETH profit.
+pub struct ReentrancyOracle {
+    /// Address monitored for ETH profit.
+    pub attacker: Address,
+}
+
+impl Invariant for ReentrancyOracle {
+    fn name(&self) -> &str {
+        "reentrancy"
+    }
+
+    fn check(
+        &self,
+        pre_balances: &HashMap<Address, U256>,
+        result: &ExecutionResult,
+        sequence: &[Transaction],
+    ) -> Option<Finding> {
+        if !result.sstore_in_nested_call {
+            return None;
+        }
+        // Only fire when the attacker also shows ETH profit — anti-noise gate.
+        let pre = pre_balances
+            .get(&self.attacker)
+            .copied()
+            .unwrap_or(U256::ZERO);
+        let post = result
+            .state_diff
+            .balance_changes
+            .get(&self.attacker)
+            .map(|&(_, n)| n)
+            .unwrap_or(pre);
+        if post <= pre {
+            return None;
+        }
+        let profit = post - pre;
+        // Skip dust gains that are probably just gas refunds.
+        if profit < U256::from(1_000u64) {
+            return None;
+        }
+        let contract = sequence
+            .last()
+            .and_then(|tx| tx.to)
+            .unwrap_or(Address::ZERO);
+        Some(Finding {
+            severity: Severity::High,
+            title: format!("Reentrancy: SSTORE in nested call with ETH profit ({contract})"),
+            description: format!(
+                "An SSTORE opcode fired while at least one external call frame was on the stack \
+                 (call_depth > 0), combined with attacker {} gaining {profit} wei. \
+                 This pattern is consistent with a cross-function or classic reentrancy \
+                 vulnerability — verify state mutation ordering against checks-effects-interactions.",
+                self.attacker,
+            ),
+            contract,
+            reproducer: sequence.to_vec(),
+            exploit_profit: Some(profit),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Built-in: TokenFlowConservationOracle
+// ---------------------------------------------------------------------------
+
+/// Detects when ERC-20 tokens flow OUT of a target contract more than they flow
+/// IN across a fuzz sequence.
+///
+/// Uses [`ExecutionResult::sequence_cumulative_logs`] so it sees every
+/// `Transfer` event in the full sequence, not just the last transaction.
+///
+/// A non-zero `excess_out` means tokens were drained that were not deposited
+/// by the fuzzer — a strong signal of an unauthorised withdrawal or accounting
+/// bug.
+pub struct TokenFlowConservationOracle {
+    /// Contract address whose token balances to monitor.
+    pub target: Address,
+    /// Minimum excess-out amount (in token base units) below which the finding
+    /// is suppressed.  Filters dust / rounding artefacts.
+    pub min_excess: U256,
+}
+
+impl Default for TokenFlowConservationOracle {
+    fn default() -> Self {
+        Self {
+            target: Address::ZERO,
+            min_excess: U256::from(1_000u64),
+        }
+    }
+}
+
+impl Invariant for TokenFlowConservationOracle {
+    fn name(&self) -> &str {
+        "token-flow-conservation"
+    }
+
+    fn check(
+        &self,
+        _pre_balances: &HashMap<Address, U256>,
+        result: &ExecutionResult,
+        sequence: &[Transaction],
+    ) -> Option<Finding> {
+        if !result.success {
+            return None;
+        }
+        let xfer_t = keccak256(b"Transfer(address,address,uint256)");
+        let target_padded = address_to_b256(self.target);
+
+        // Per-token accumulate: (in_flow, out_flow).
+        let mut flows: std::collections::HashMap<Address, (U256, U256)> =
+            std::collections::HashMap::new();
+
+        let logs = if result.sequence_cumulative_logs.is_empty() {
+            &result.logs
+        } else {
+            &result.sequence_cumulative_logs
+        };
+
+        for log in logs {
+            if log.topics.get(0).copied() != Some(xfer_t) || log.topics.len() < 3 {
+                continue;
+            }
+            if log.data.len() < 32 {
+                continue;
+            }
+            let from = log.topics[1];
+            let to = log.topics[2];
+            let amount = U256::from_be_slice(&log.data[..32]);
+            if amount.is_zero() {
+                continue;
+            }
+            let token = log.address;
+            let entry = flows.entry(token).or_insert((U256::ZERO, U256::ZERO));
+            if to == target_padded {
+                entry.0 = entry.0.saturating_add(amount); // in
+            }
+            if from == target_padded {
+                entry.1 = entry.1.saturating_add(amount); // out
+            }
+        }
+
+        for (token, (in_flow, out_flow)) in &flows {
+            if out_flow <= in_flow {
+                continue;
+            }
+            let excess = out_flow - in_flow;
+            if excess < self.min_excess {
+                continue;
+            }
+            return Some(Finding {
+                severity: Severity::High,
+                title: format!(
+                    "Token flow conservation violated: {token} drained from {}",
+                    self.target
+                ),
+                description: format!(
+                    "Token {token}: {out_flow} units transferred OUT of {} but only {in_flow} \
+                     transferred IN during this fuzz sequence (excess drain: {excess} units). \
+                     Tokens present before the sequence may have been unauthorisedly drained.",
+                    self.target,
+                ),
+                contract: self.target,
+                reproducer: sequence.to_vec(),
+                exploit_profit: None,
+            });
+        }
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
 
@@ -749,6 +1089,8 @@ impl InvariantRegistry {
         reg.add(Box::new(Erc4626FirstDepositorInflationOracle {
             profiles: pmap,
         }));
+        // Phase 3 additions: reentrancy oracle (always on — profit gate reduces noise).
+        reg.add(Box::new(ReentrancyOracle { attacker }));
         reg
     }
 
@@ -809,6 +1151,9 @@ mod tests {
             sequence_cumulative_logs: Vec::new(),
             protocol_probes: Default::default(),
             tx_path_id: crate::types::B256::ZERO,
+            assume_violated: false,
+            revert_was_expected: false,
+            sstore_in_nested_call: false,
         }
     }
 
@@ -955,8 +1300,9 @@ mod tests {
         // Erc20BurnWithoutSupplyWrite, Erc4626WithdrawRateJump, Erc4626SameTransactionDepositRateSpread,
         // UniswapV2StyleSwapReserve, AmmSyncExplained, Erc4626PreviewVsDepositEvent,
         // UniswapV2StyleSyncVsGetReserves, Erc4626RateJumpWithoutTokenFlow,
-        // Erc4626DepositVsUnderlyingTransfer, Erc4626FirstDepositorInflation (19 total)
-        assert_eq!(reg.len(), 19);
+        // Erc4626DepositVsUnderlyingTransfer, Erc4626FirstDepositorInflation,
+        // ReentrancyOracle (20 total)
+        assert_eq!(reg.len(), 20);
         assert!(!reg.is_empty());
     }
 
@@ -1004,6 +1350,9 @@ mod tests {
             sequence_cumulative_logs: Vec::new(),
             protocol_probes: Default::default(),
             tx_path_id: crate::types::B256::ZERO,
+            assume_violated: false,
+            revert_was_expected: false,
+            sstore_in_nested_call: false,
         }
     }
 
@@ -1142,8 +1491,8 @@ mod tests {
         let attacker = Address::repeat_byte(0x99);
         let tokens = vec![Address::repeat_byte(0xA1), Address::repeat_byte(0xA2)];
         let reg = InvariantRegistry::with_erc20(attacker, &tokens);
-        // 19 defaults + 2 ERC20Supply invariants
-        assert_eq!(reg.len(), 21);
+        // 20 defaults + 2 ERC20Supply invariants
+        assert_eq!(reg.len(), 22);
     }
 
     // -- EchidnaPropertyCaller tests ------------------------------------------
@@ -1240,5 +1589,264 @@ mod tests {
         // Verify selector is first 4 bytes of keccak256("echidna_state()")
         let expected_hash = keccak256(b"echidna_state()");
         assert_eq!(selector, &expected_hash.as_slice()[..4]);
+    }
+
+    // -- AccessControlOracle tests --------------------------------------------
+
+    #[test]
+    fn access_control_fires_when_non_owner_calls_privileged_fn() {
+        let deployer = Address::repeat_byte(0x01);
+        let attacker = Address::repeat_byte(0xAA);
+        let contract = Address::repeat_byte(0xCC);
+
+        let abi = json!([{
+            "type": "function",
+            "name": "pause",
+            "inputs": [],
+            "outputs": [],
+            "stateMutability": "nonpayable"
+        }]);
+
+        let oracle = AccessControlOracle::from_abi(deployer, attacker, &abi).unwrap();
+        assert_eq!(oracle.privileged_selectors.len(), 1);
+
+        // Build selector for pause()
+        let expected_hash = keccak256(b"pause()");
+        let sel: [u8; 4] = expected_hash.as_slice()[..4].try_into().unwrap();
+
+        let result = make_result(true, HashMap::new());
+        let seq = vec![Transaction {
+            sender: attacker, // non-owner!
+            to: Some(contract),
+            data: Bytes::from(sel.to_vec()),
+            value: U256::ZERO,
+            gas_limit: 30_000_000,
+        }];
+
+        let finding = oracle.check(&HashMap::new(), &result, &seq);
+        assert!(finding.is_some());
+        let f = finding.unwrap();
+        assert_eq!(f.severity, Severity::Critical);
+        assert!(f.title.contains("pause"));
+    }
+
+    #[test]
+    fn access_control_silent_when_deployer_calls_privileged_fn() {
+        let deployer = Address::repeat_byte(0x01);
+        let attacker = Address::repeat_byte(0xAA);
+
+        let abi = json!([{
+            "type": "function", "name": "pause",
+            "inputs": [], "outputs": [], "stateMutability": "nonpayable"
+        }]);
+        let oracle = AccessControlOracle::from_abi(deployer, attacker, &abi).unwrap();
+
+        let hash = keccak256(b"pause()");
+        let sel: [u8; 4] = hash.as_slice()[..4].try_into().unwrap();
+
+        let result = make_result(true, HashMap::new());
+        let seq = vec![Transaction {
+            sender: deployer, // owner — should be allowed
+            to: Some(Address::repeat_byte(0xCC)),
+            data: Bytes::from(sel.to_vec()),
+            value: U256::ZERO,
+            gas_limit: 30_000_000,
+        }];
+
+        assert!(oracle.check(&HashMap::new(), &result, &seq).is_none());
+    }
+
+    #[test]
+    fn access_control_silent_on_revert() {
+        let deployer = Address::repeat_byte(0x01);
+        let attacker = Address::repeat_byte(0xAA);
+        let abi = json!([{
+            "type": "function", "name": "pause",
+            "inputs": [], "outputs": [], "stateMutability": "nonpayable"
+        }]);
+        let oracle = AccessControlOracle::from_abi(deployer, attacker, &abi).unwrap();
+        let hash = keccak256(b"pause()");
+        let sel: [u8; 4] = hash.as_slice()[..4].try_into().unwrap();
+        // Reverted — access control was enforced
+        let result = make_result(false, HashMap::new());
+        let seq = vec![Transaction {
+            sender: attacker,
+            to: Some(Address::repeat_byte(0xCC)),
+            data: Bytes::from(sel.to_vec()),
+            value: U256::ZERO,
+            gas_limit: 30_000_000,
+        }];
+        assert!(oracle.check(&HashMap::new(), &result, &seq).is_none());
+    }
+
+    #[test]
+    fn access_control_from_abi_returns_none_for_non_privileged_abi() {
+        let abi = json!([{
+            "type": "function", "name": "deposit",
+            "inputs": [{"type": "uint256", "name": "amount"}],
+            "outputs": [],
+            "stateMutability": "nonpayable"
+        }]);
+        assert!(
+            AccessControlOracle::from_abi(Address::ZERO, Address::ZERO, &abi).is_none()
+        );
+    }
+
+    // -- ReentrancyOracle tests -----------------------------------------------
+
+    fn make_result_with_sstore_in_nested_call(
+        balance_changes: HashMap<Address, (U256, U256)>,
+        sstore_in_nested_call: bool,
+    ) -> ExecutionResult {
+        ExecutionResult {
+            success: true,
+            output: Bytes::new(),
+            gas_used: 50_000,
+            logs: Vec::new(),
+            coverage: CoverageMap::new(),
+            dataflow: Default::default(),
+            state_diff: StateDiff {
+                storage_writes: HashMap::new(),
+                balance_changes,
+            },
+            sequence_cumulative_logs: Vec::new(),
+            protocol_probes: Default::default(),
+            tx_path_id: crate::types::B256::ZERO,
+            assume_violated: false,
+            revert_was_expected: false,
+            sstore_in_nested_call,
+        }
+    }
+
+    #[test]
+    fn reentrancy_fires_when_sstore_in_nested_and_profit() {
+        let attacker = Address::repeat_byte(0xBB);
+        let oracle = ReentrancyOracle { attacker };
+
+        let mut pre = HashMap::new();
+        pre.insert(attacker, U256::from(1_000u64));
+
+        let mut bc = HashMap::new();
+        bc.insert(attacker, (U256::from(1_000u64), U256::from(100_000u64)));
+
+        let result = make_result_with_sstore_in_nested_call(bc, true);
+        let seq = dummy_sequence(Address::repeat_byte(0xCC));
+
+        let finding = oracle.check(&pre, &result, &seq);
+        assert!(finding.is_some());
+        let f = finding.unwrap();
+        assert_eq!(f.severity, Severity::High);
+        assert!(f.title.contains("Reentrancy"));
+    }
+
+    #[test]
+    fn reentrancy_silent_without_sstore_flag() {
+        let attacker = Address::repeat_byte(0xBB);
+        let oracle = ReentrancyOracle { attacker };
+
+        let mut pre = HashMap::new();
+        pre.insert(attacker, U256::from(1_000u64));
+
+        let mut bc = HashMap::new();
+        bc.insert(attacker, (U256::from(1_000u64), U256::from(100_000u64)));
+
+        // sstore_in_nested_call = false — no reentrancy signal
+        let result = make_result_with_sstore_in_nested_call(bc, false);
+        let seq = dummy_sequence(Address::repeat_byte(0xCC));
+
+        assert!(oracle.check(&pre, &result, &seq).is_none());
+    }
+
+    #[test]
+    fn reentrancy_silent_without_profit() {
+        let attacker = Address::repeat_byte(0xBB);
+        let oracle = ReentrancyOracle { attacker };
+
+        let pre: HashMap<Address, U256> = HashMap::new();
+        // No balance change for attacker → no profit
+        let result = make_result_with_sstore_in_nested_call(HashMap::new(), true);
+        let seq = dummy_sequence(Address::repeat_byte(0xCC));
+
+        assert!(oracle.check(&pre, &result, &seq).is_none());
+    }
+
+    // -- TokenFlowConservationOracle tests ------------------------------------
+
+    fn make_transfer_log(token: Address, from: Address, to: Address, amount: U256) -> Log {
+        let xfer_t = keccak256(b"Transfer(address,address,uint256)");
+        Log {
+            address: token,
+            topics: vec![xfer_t, address_to_b256(from), address_to_b256(to)],
+            data: Bytes::from(amount.to_be_bytes::<32>().to_vec()),
+        }
+    }
+
+    #[test]
+    fn token_flow_fires_when_out_exceeds_in() {
+        let target = Address::repeat_byte(0xDD);
+        let token = Address::repeat_byte(0x44);
+        let attacker = Address::repeat_byte(0xAA);
+        let oracle = TokenFlowConservationOracle {
+            target,
+            min_excess: U256::from(100u64),
+        };
+
+        // Attacker deposits 500, then withdraws 2000 — excess out = 1500
+        let logs = vec![
+            make_transfer_log(token, attacker, target, U256::from(500u64)),
+            make_transfer_log(token, target, attacker, U256::from(2000u64)),
+        ];
+        let mut result = make_result(true, HashMap::new());
+        result.logs = logs.clone();
+        result.sequence_cumulative_logs = logs;
+        let seq = dummy_sequence(target);
+
+        let finding = oracle.check(&HashMap::new(), &result, &seq);
+        assert!(finding.is_some());
+        let f = finding.unwrap();
+        assert_eq!(f.severity, Severity::High);
+        assert!(f.title.contains("drained"));
+    }
+
+    #[test]
+    fn token_flow_silent_when_out_equals_in() {
+        let target = Address::repeat_byte(0xDD);
+        let token = Address::repeat_byte(0x44);
+        let attacker = Address::repeat_byte(0xAA);
+        let oracle = TokenFlowConservationOracle {
+            target,
+            min_excess: U256::from(100u64),
+        };
+
+        let logs = vec![
+            make_transfer_log(token, attacker, target, U256::from(1000u64)),
+            make_transfer_log(token, target, attacker, U256::from(1000u64)),
+        ];
+        let mut result = make_result(true, HashMap::new());
+        result.sequence_cumulative_logs = logs;
+        let seq = dummy_sequence(target);
+
+        assert!(oracle.check(&HashMap::new(), &result, &seq).is_none());
+    }
+
+    #[test]
+    fn token_flow_silent_below_min_excess() {
+        let target = Address::repeat_byte(0xDD);
+        let token = Address::repeat_byte(0x44);
+        let attacker = Address::repeat_byte(0xAA);
+        let oracle = TokenFlowConservationOracle {
+            target,
+            min_excess: U256::from(10_000u64), // high threshold
+        };
+
+        let logs = vec![
+            make_transfer_log(token, attacker, target, U256::from(1000u64)),
+            make_transfer_log(token, target, attacker, U256::from(1050u64)), // only 50 excess
+        ];
+        let mut result = make_result(true, HashMap::new());
+        result.sequence_cumulative_logs = logs;
+        let seq = dummy_sequence(target);
+
+        assert!(oracle.check(&HashMap::new(), &result, &seq).is_none());
     }
 }

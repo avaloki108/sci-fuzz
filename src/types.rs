@@ -160,6 +160,13 @@ pub struct ExecutionResult {
     /// `true` when the transaction reverted and an `vm.expectRevert()` was
     /// active. The campaign loop should not treat this revert as anomalous.
     pub revert_was_expected: bool,
+    /// `true` when an `SSTORE` opcode fired while at least one external call
+    /// frame was active (call_depth > 0 in the Inspector). Used by the
+    /// reentrancy oracle as a necessary-condition signal: state was written
+    /// back to a contract while that contract (or an ancestor) still had an
+    /// active call frame pending return.
+    #[serde(default)]
+    pub sstore_in_nested_call: bool,
 }
 
 impl Default for ExecutionResult {
@@ -177,6 +184,7 @@ impl Default for ExecutionResult {
             tx_path_id: B256::ZERO,
             assume_violated: false,
             revert_was_expected: false,
+            sstore_in_nested_call: false,
         }
     }
 }

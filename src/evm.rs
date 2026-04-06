@@ -57,6 +57,13 @@ struct CoverageInspector {
     dataflow: crate::types::DataflowWaypoints,
     /// In-flight cheatcode state for the current transaction.
     pub cheatcodes: TxCheatcodeState,
+    /// Number of active (non-short-circuited) external call frames currently
+    /// on the stack.  Incremented in `call()` for every real EVM call that is
+    /// not intercepted as a cheatcode or mock; decremented in `call_end()`.
+    call_depth: u32,
+    /// Set to `true` the first time an `SSTORE` fires while `call_depth > 0`.
+    /// Propagated into [`ExecutionResult::sstore_in_nested_call`] by the executor.
+    pub sstore_in_nested_call: bool,
 }
 
 impl<DB: Database> Inspector<DB> for CoverageInspector {
@@ -118,7 +125,22 @@ impl<DB: Database> Inspector<DB> for CoverageInspector {
             inputs.caller = override_sender;
         }
 
+        // Real non-intercepted call — count it for reentrancy depth tracking.
+        self.call_depth += 1;
         None
+    }
+
+    /// Decrements the call-depth counter when a non-intercepted call frame returns.
+    fn call_end(
+        &mut self,
+        _context: &mut EvmContext<DB>,
+        _inputs: &CallInputs,
+        outcome: CallOutcome,
+    ) -> CallOutcome {
+        if self.call_depth > 0 {
+            self.call_depth -= 1;
+        }
+        outcome
     }
 
     fn step(&mut self, interp: &mut Interpreter, _context: &mut EvmContext<DB>) {
@@ -145,6 +167,10 @@ impl<DB: Database> Inspector<DB> for CoverageInspector {
             if let Ok(top) = interp.stack().peek(0) {
                 self.dataflow.record_access(target_address, top);
             }
+        }
+        // Track SSTORE inside nested calls for the reentrancy oracle.
+        if op == revm::interpreter::opcode::SSTORE && self.call_depth > 0 {
+            self.sstore_in_nested_call = true;
         }
     }
 }
@@ -284,6 +310,7 @@ impl EvmExecutor {
         let pending_etches = ext.cheatcodes.pending_etches.clone();
         let assume_violated = ext.cheatcodes.assume_violation;
         let expected_revert = ext.cheatcodes.expected_revert.take();
+        let sstore_in_nested_call = ext.sstore_in_nested_call;
 
         // Commit state changes into the CacheDB.
         drop(evm); // release mutable borrow on self.db
@@ -321,6 +348,7 @@ impl EvmExecutor {
             tx_path_id,
         )?;
         exec_result.assume_violated = assume_violated;
+        exec_result.sstore_in_nested_call = sstore_in_nested_call;
         // Check if the revert was expected by vm.expectRevert().
         if let Some(ref expected) = expected_revert {
             if !exec_result.success {
@@ -628,6 +656,7 @@ impl EvmExecutor {
             tx_path_id,
             assume_violated: false,
             revert_was_expected: false,
+            sstore_in_nested_call: false,
         })
     }
 
