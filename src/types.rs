@@ -157,6 +157,9 @@ pub struct ExecutionResult {
     /// as if it reverted (precondition guard).
     #[serde(default)]
     pub assume_violated: bool,
+    /// `true` when the transaction reverted and an `vm.expectRevert()` was
+    /// active. The campaign loop should not treat this revert as anomalous.
+    pub revert_was_expected: bool,
 }
 
 impl Default for ExecutionResult {
@@ -173,6 +176,7 @@ impl Default for ExecutionResult {
             protocol_probes: ProtocolProbeReport::default(),
             tx_path_id: B256::ZERO,
             assume_violated: false,
+            revert_was_expected: false,
         }
     }
 }

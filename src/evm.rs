@@ -263,7 +263,7 @@ impl EvmExecutor {
         let ResultAndState { result, state } = evm
             .transact()
             .map_err(|e| anyhow!("EVM transact error: {e:?}"))?;
-        let ext = &evm.context.external;
+        let ext = &mut evm.context.external;
         let tx_path_id = ext.path.finalize();
         let coverage = ext.coverage.clone();
         let dataflow = ext.dataflow.clone();
@@ -283,6 +283,7 @@ impl EvmExecutor {
         let pending_stores = ext.cheatcodes.pending_stores.clone();
         let pending_etches = ext.cheatcodes.pending_etches.clone();
         let assume_violated = ext.cheatcodes.assume_violation;
+        let expected_revert = ext.cheatcodes.expected_revert.take();
 
         // Commit state changes into the CacheDB.
         drop(evm); // release mutable borrow on self.db
@@ -320,6 +321,22 @@ impl EvmExecutor {
             tx_path_id,
         )?;
         exec_result.assume_violated = assume_violated;
+        // Check if the revert was expected by vm.expectRevert().
+        if let Some(ref expected) = expected_revert {
+            if !exec_result.success {
+                let rd = &exec_result.output;
+                let matches = match expected {
+                    None => true,
+                    Some(ref sel) if sel.len() <= 4 => {
+                        rd.len() >= sel.len() && &rd[..sel.len()] == &sel[..]
+                    }
+                    Some(ref full) => {
+                        rd == full.as_ref()
+                    }
+                };
+                exec_result.revert_was_expected = matches;
+            }
+        }
         Ok(exec_result)
     }
 
@@ -610,6 +627,7 @@ impl EvmExecutor {
             protocol_probes: Default::default(),
             tx_path_id,
             assume_violated: false,
+            revert_was_expected: false,
         })
     }
 

@@ -71,6 +71,10 @@ pub struct TxCheatcodeState {
     /// Deferred bytecode installations from `vm.etch()`.  Applied after the
     /// transaction commits.
     pub pending_etches: Vec<(Address, alloy_primitives::Bytes)>,
+    /// Expected revert data from `vm.expectRevert()`.  `None` means no
+    /// expectation is active.  `Some(None)` means any revert is expected.
+    /// `Some(Some(bytes))` means a revert with matching data is expected.
+    pub expected_revert: Option<Option<alloy_primitives::Bytes>>,
     /// Mocked calls registered via `vm.mockCall`.  When a sub-call's target
     /// address matches and its calldata starts with the recorded prefix,
     /// the mock's return data (or revert) is returned instead of executing.
@@ -322,10 +326,40 @@ pub fn dispatch<DB: revm::Database>(
 
     // ── Assertion helpers (accept silently) ───────────────────────────────────
 
-    if sel == selector(b"expectRevert()")
-        || sel == selector(b"expectRevert(bytes4)")
-        || sel == selector(b"expectRevert(bytes)")
-        || sel == selector(b"expectEmit(bool,bool,bool,bool)")
+    // ── vm.expectRevert() ──────────────────────────────────────────────────
+    if sel == selector(b"expectRevert()") {
+        // expectRevert() — any revert is expected.
+        state.expected_revert = Some(None);
+        return (true, bytes::Bytes::new());
+    }
+    if sel == selector(b"expectRevert(bytes4)") {
+        // expectRevert(bytes4) — specific 4-byte selector expected.
+        if calldata.len() >= 4 + 32 {
+            state.expected_revert = Some(Some(alloy_primitives::Bytes::copy_from_slice(&calldata[4..36])));
+        } else {
+            state.expected_revert = Some(None);
+        }
+        return (true, bytes::Bytes::new());
+    }
+    if sel == selector(b"expectRevert(bytes)") {
+        // expectRevert(bytes) — specific revert data expected.
+        if calldata.len() >= 4 + 32 + 32 {
+            let offset = u64::from_be_bytes(calldata[36..44].try_into().unwrap_or([0;8])) as usize;
+            let len = u64::from_be_bytes(calldata[44..52].try_into().unwrap_or([0;8])) as usize;
+            let start = 4 + offset;
+            let end = start + len;
+            if end <= calldata.len() {
+                state.expected_revert = Some(Some(alloy_primitives::Bytes::copy_from_slice(&calldata[start..end])));
+            } else {
+                state.expected_revert = Some(None);
+            }
+        } else {
+            state.expected_revert = Some(None);
+        }
+        return (true, bytes::Bytes::new());
+    }
+
+    if sel == selector(b"expectEmit(bool,bool,bool,bool)")
         || sel == selector(b"expectEmit(bool,bool,bool,bool,address)")
         || sel == selector(b"expectEmit()")
         || sel == selector(b"expectEmit(address)")
