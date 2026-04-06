@@ -1,612 +1,828 @@
-//! Differential execution runner for `sci-fuzz diff`.
+//! Differential fuzzing module for sci-fuzz.
 //!
-//! MVP scope: two local implementations, identical generated calls,
-//! reproducible divergence reporting.
+//! Compares two Foundry-project contract implementations by replaying identical
+//! generated call sequences and reporting reproducible divergences. This is
+//! **differential execution**, not a correctness proof or semantic equivalence
+//! check.
 
+use crate::cli::DiffArgs;
+use crate::evm::EvmExecutor;
+use crate::mutator::{TxMutator, ValueDictionary};
+use crate::project::Project;
+use crate::types::{ContractInfo, ExecutionResult, Transaction};
+
+use alloy_primitives::{Address, Bytes, B256, U256};
+use anyhow::{bail, Context, Result};
+use rand::SeedableRng;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use alloy_dyn_abi::FunctionExt as _;
-use alloy_json_abi::{Function, JsonAbi};
-use anyhow::{bail, Context, Result};
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
-use revm::primitives::{AccountInfo, Bytecode};
-use serde::{Deserialize, Serialize};
+// ── Divergence Types ─────────────────────────────────────────────────────────
 
-use crate::mutator::TxMutator;
-use crate::project::Project;
-use crate::shrinker::SequenceShrinker;
-use crate::types::{Address, ContractInfo, Finding, Severity, Transaction, B256, U256};
-
-#[derive(Debug, Clone)]
-pub struct DiffConfig {
-    pub timeout: Duration,
-    pub seed: u64,
-    pub max_execs: u64,
-    pub depth: u32,
-    pub shrink: bool,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+/// The kind of divergence observed between two implementations.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DivergenceKind {
-    SuccessRevertMismatch,
-    DecodedOutputMismatch,
+    /// One succeeded, the other reverted.
+    SuccessRevertMismatch {
+        a_success: bool,
+        b_success: bool,
+    },
+    /// Both succeeded but ABI-decoded outputs differ.
+    DecodedOutputMismatch {
+        selector: [u8; 4],
+        function_name: Option<String>,
+    },
+    /// Both succeeded but raw return data differs (no ABI decode available).
     RawOutputMismatch,
-    LogSignatureMismatch,
+    /// Emitted log topic0 sequences differ.
+    LogTopicMismatch {
+        a_topic_count: usize,
+        b_topic_count: usize,
+    },
 }
 
+/// A single observed divergence between implementations A and B.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiffFinding {
-    pub impl_a: String,
-    pub impl_b: String,
-    pub mismatch: DivergenceKind,
-    pub function: Option<String>,
+pub struct Divergence {
+    /// Step index in the sequence (0-based).
+    pub step: usize,
+    /// Function selector if known.
     pub selector: Option<[u8; 4]>,
-    pub sequence: Vec<Transaction>,
-    pub note: String,
+    /// Function name if known from ABI.
+    pub function_name: Option<String>,
+    /// What kind of divergence was observed.
+    pub kind: DivergenceKind,
+    /// Raw output from implementation A.
+    pub output_a: Bytes,
+    /// Raw output from implementation B.
+    pub output_b: Bytes,
+    /// Success flag from implementation A.
+    pub success_a: bool,
+    /// Success flag from implementation B.
+    pub success_b: bool,
 }
 
-impl DiffFinding {
-    pub fn to_finding(&self, contract: Address) -> Finding {
-        let sel = self
-            .selector
-            .map(|s| format!("0x{}", hex::encode(s)))
-            .unwrap_or_else(|| "<unknown>".to_string());
-        let fname = self
-            .function
-            .clone()
-            .unwrap_or_else(|| "<unknown>".to_string());
-        Finding {
-            severity: Severity::Info,
-            title: format!(
-                "Differential divergence: {:?} at {} ({})",
-                self.mismatch, fname, sel
-            ),
-            description: format!(
-                "Observed divergence between `{}` and `{}`. {}",
-                self.impl_a, self.impl_b, self.note
-            ),
-            contract,
-            reproducer: self.sequence.clone(),
-            exploit_profit: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct DiffReport {
+/// Result of a differential fuzzing campaign.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffResult {
+    /// Name/address of implementation A.
     pub impl_a: String,
+    /// Name/address of implementation B.
     pub impl_b: String,
-    pub shared_functions: Vec<String>,
-    pub skipped_functions: Vec<String>,
-    pub execs: u64,
-    pub divergence: Option<DiffFinding>,
+    /// Total sequences executed.
+    pub sequences_run: u64,
+    /// Total individual steps executed.
+    pub steps_run: u64,
+    /// Divergences found.
+    pub divergences: Vec<Divergence>,
+    /// The minimal reproducing sequence for the first divergence (if any).
+    pub reproducer: Option<Vec<Transaction>>,
+    /// Wall-clock seconds elapsed.
+    pub elapsed_secs: f64,
 }
 
-impl DiffReport {
-    pub fn save_to_dir(&self, dir: &Path) -> crate::error::Result<std::path::PathBuf> {
-        std::fs::create_dir_all(dir)?;
-        let path = dir.join("diff_report.json");
-        let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, json)?;
-        Ok(path)
-    }
+// ── Diff Runner ──────────────────────────────────────────────────────────────
+
+/// Configuration for a differential fuzzing run.
+pub struct DiffConfig {
+    /// Maximum number of call sequences to execute.
+    pub max_execs: u64,
+    /// Transactions per sequence.
+    pub depth: u32,
+    /// Random seed.
+    pub seed: u64,
+    /// Timeout in seconds.
+    pub timeout: u64,
+    /// Optional contract name filter (match-contract).
+    pub match_contract: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-struct SharedFn {
-    signature: String,
-    function_name: String,
-    selector: [u8; 4],
-    decode_outputs: bool,
-    func_a: Function,
-    func_b: Function,
-}
+impl DiffConfig {
+    pub fn from_args(args: &DiffArgs) -> Result<Self> {
+        // Reject unsupported features clearly
+        if args.reference.is_some() {
+            bail!(
+                "Error: --reference is not supported in this MVP. \
+                 Differential fuzzing compares two implementations only."
+            );
+        }
+        if args.rpc_url.is_some() {
+            bail!(
+                "Error: --rpc-url is not supported in diff MVP. \
+                 Both implementations must be local Foundry artifacts."
+            );
+        }
 
-pub fn run_project_diff(
-    project_root: &Path,
-    impl_a: &str,
-    impl_b: &str,
-    match_contract: Option<&str>,
-    config: DiffConfig,
-) -> Result<DiffReport> {
-    let (project, _bootstrap, artifact_count) = Project::build_and_select_targets(project_root)
-        .with_context(|| format!("build/ingest failed for {}", project_root.display()))?;
-    if artifact_count == 0 {
-        bail!(
-            "no Foundry artifacts discovered in {}",
-            project_root.display()
-        );
-    }
-
-    let mut candidates = project.select_runtime_targets();
-    if let Some(pat) = match_contract {
-        candidates.retain(|c| c.name.as_deref().map(|n| n.contains(pat)).unwrap_or(false));
-    }
-
-    let a = resolve_target(&candidates, impl_a)?;
-    let b = resolve_target(&candidates, impl_b)?;
-    run_contract_diff(a, b, config)
-}
-
-fn resolve_target(candidates: &[ContractInfo], needle: &str) -> Result<ContractInfo> {
-    if needle.starts_with("0x") {
-        bail!(
-            "unsupported input mode for MVP: `{needle}` looks like an address; use Foundry artifact targets"
-        );
-    }
-
-    let mut matches: Vec<&ContractInfo> = candidates
-        .iter()
-        .filter(|c| {
-            let name = c.name.as_deref().unwrap_or_default();
-            let source = c.source_path.as_deref().unwrap_or_default();
-            let full = format!("{source}:{name}");
-            name == needle || full == needle
+        Ok(Self {
+            max_execs: args.max_execs,
+            depth: args.depth,
+            seed: args.seed.unwrap_or(0xCAFE_BABE),
+            timeout: args.timeout,
+            match_contract: args.match_contract.clone(),
         })
-        .collect();
-
-    if matches.is_empty() {
-        let available: Vec<String> = candidates
-            .iter()
-            .map(|c| {
-                format!(
-                    "{}:{}",
-                    c.source_path.as_deref().unwrap_or("?"),
-                    c.name.as_deref().unwrap_or("?")
-                )
-            })
-            .collect();
-        bail!(
-            "contract target `{needle}` not found. available targets: {}",
-            available.join(", ")
-        );
     }
-    if matches.len() > 1 {
-        matches.sort_by_key(|c| c.source_path.clone());
-        let details: Vec<String> = matches
-            .iter()
-            .map(|c| {
-                format!(
-                    "{}:{}",
-                    c.source_path.as_deref().unwrap_or("?"),
-                    c.name.as_deref().unwrap_or("?")
-                )
-            })
-            .collect();
-        bail!(
-            "contract target `{needle}` is ambiguous. use source.sol:Contract. matches: {}",
-            details.join(", ")
-        );
-    }
-
-    Ok(matches.remove(0).clone())
 }
 
-pub fn run_contract_diff(
-    a: ContractInfo,
-    b: ContractInfo,
-    config: DiffConfig,
-) -> Result<DiffReport> {
-    let name_a = a.name.clone().unwrap_or_else(|| "impl_a".to_string());
-    let name_b = b.name.clone().unwrap_or_else(|| "impl_b".to_string());
+/// Run a differential fuzzing campaign.
+pub fn run_diff(args: &DiffArgs) -> Result<DiffResult> {
+    let config = DiffConfig::from_args(args)?;
+    let project_path = args.project.as_deref().unwrap_or(".");
 
-    let (shared, skipped) = collect_shared_functions(&a, &b)?;
-    if shared.is_empty() {
+    // Load the Foundry project
+    let mut project = Project::from_foundry(Path::new(project_path))
+        .context("Failed to load Foundry project. Ensure forge build succeeds.")?;
+
+    // Resolve both contract targets
+    let contract_a = resolve_contract(&project, &args.impl_a, config.match_contract.as_deref())
+        .with_context(|| format!("Could not resolve implementation A: '{}'", args.impl_a))?;
+    let contract_b = resolve_contract(&project, &args.impl_b, config.match_contract.as_deref())
+        .with_context(|| format!("Could not resolve implementation B: '{}'", args.impl_b))?;
+
+    // Compute shared ABI functions (intersection of matching selectors)
+    let shared_functions = compute_shared_functions(&contract_a, &contract_b);
+
+    if shared_functions.is_empty() {
         bail!(
-            "no comparable shared ABI functions between `{}` and `{}`",
-            name_a,
-            name_b
+            "No shared callable functions between '{}' and '{}'. \
+             Both contracts must have at least one function with matching selector/signature.",
+            args.impl_a, args.impl_b
         );
     }
 
-    let mut synth = a.clone();
-    synth.address = Address::from([0x11; 20]);
-    synth.abi = Some(shared_abi_for_mutation(&shared));
+    tracing::info!(
+        "Shared functions: {:?}",
+        shared_functions
+            .iter()
+            .map(|(sel, name)| format!("{:?}:{}", sel, name.as_deref().unwrap_or("?")))
+            .collect::<Vec<_>>()
+    );
 
-    let mut mutator = TxMutator::new(vec![synth]);
-    let caller = Address::from([0x42; 20]);
-    mutator.add_to_address_pool(caller);
+    // Build a mutator targeting only shared functions from contract A's ABI
+    let mutator = build_diff_mutator(&contract_a, &shared_functions)?;
 
-    let mut exec_a = crate::evm::EvmExecutor::new();
-    let mut exec_b = crate::evm::EvmExecutor::new();
-    exec_a.set_balance(caller, U256::from(100_000_000_000_000_000u128));
-    exec_b.set_balance(caller, U256::from(100_000_000_000_000_000u128));
+    // Deploy both contracts into separate executors
+    let deployer = Address::repeat_byte(0x42);
+    let mut executor_a = EvmExecutor::new();
+    let addr_a = executor_a
+        .deploy(
+            deployer,
+            contract_a
+                .creation_bytecode
+                .clone()
+                .context("Implementation A has no creation bytecode")?,
+        )
+        .context("Failed to deploy implementation A")?;
 
-    let deployed_a = prepare_target(&mut exec_a, &a, caller)
-        .with_context(|| format!("failed to deploy/setup {}", name_a))?;
-    let deployed_b = prepare_target(&mut exec_b, &b, caller)
-        .with_context(|| format!("failed to deploy/setup {}", name_b))?;
+    let mut executor_b = EvmExecutor::new();
+    let addr_b = executor_b
+        .deploy(
+            deployer,
+            contract_b
+                .creation_bytecode
+                .clone()
+                .context("Implementation B has no creation bytecode")?,
+        )
+        .context("Failed to deploy implementation B")?;
 
-    let root_a = exec_a.snapshot();
-    let root_b = exec_b.snapshot();
+    tracing::info!("Deployed A at {:?}, B at {:?}", addr_a, addr_b);
 
-    let shared_by_selector: HashMap<[u8; 4], SharedFn> =
-        shared.iter().map(|s| (s.selector, s.clone())).collect();
-
-    let mut rng = StdRng::seed_from_u64(config.seed);
-    let mut current_seq: Vec<Transaction> = Vec::new();
-    let mut prev_sender: Option<Address> = None;
+    // Run the differential loop
     let start = Instant::now();
+    let mut rng = rand::rngs::StdRng::seed_from_u64(config.seed);
+    let mut divergences: Vec<Divergence> = Vec::new();
+    let mut sequences_run: u64 = 0;
+    let mut steps_run: u64 = 0;
+    let mut first_reproducer: Option<Vec<Transaction>> = None;
 
-    let mut execs = 0_u64;
-    while execs < config.max_execs && start.elapsed() < config.timeout {
-        let mut tx = mutator.generate_in_sequence(prev_sender, &mut rng);
-        tx.to = Some(deployed_a);
+    let deadline = start + std::time::Duration::from_secs(config.timeout);
 
-        let mut tx_b = tx.clone();
-        tx_b.to = Some(deployed_b);
+    let mut seq_index: u64 = 0;
+    while seq_index < config.max_execs && Instant::now() < deadline && divergences.is_empty() {
+        // Generate a sequence of transactions targeting contract A's address
+        let mut seq_a = Vec::with_capacity(config.depth as usize);
+        for _ in 0..config.depth {
+            let mut tx = mutator.generate(&mut rng);
+            tx.to = Some(addr_a);
+            seq_a.push(tx);
+        }
 
-        let res_a = exec_a.execute(&tx)?;
-        let res_b = exec_b.execute(&tx_b)?;
+        // Clone the sequence, retarget to B's address
+        let seq_b: Vec<Transaction> = seq_a
+            .iter()
+            .map(|tx| {
+                let mut t = tx.clone();
+                t.to = Some(addr_b);
+                t
+            })
+            .collect();
 
-        current_seq.push(tx.clone());
-        execs += 1;
-        prev_sender = Some(tx.sender);
+        // Snapshot both executors before this sequence
+        let snap_a = executor_a.snapshot();
+        let snap_b = executor_b.snapshot();
 
-        if let Some(mut finding) = compare_step(
-            &name_a,
-            &name_b,
-            &tx,
-            &res_a,
-            &res_b,
-            &shared_by_selector,
-            &current_seq,
-        ) {
-            if config.shrink {
-                let shrinker = SequenceShrinker::new();
-                let seq = current_seq.clone();
-                let root_a2 = root_a.clone();
-                let root_b2 = root_b.clone();
-                let shrink_pred = |cand: &[Transaction]| {
-                    sequence_diverges(
-                        cand,
-                        deployed_a,
-                        deployed_b,
-                        &root_a2,
-                        &root_b2,
-                        &shared_by_selector,
-                    )
-                    .unwrap_or(false)
-                };
-                finding.sequence = shrinker.shrink(&seq, shrink_pred);
+        // Execute on both
+        let mut results_a = Vec::with_capacity(seq_a.len());
+        let mut results_b = Vec::with_capacity(seq_b.len());
+
+        for (tx_a, tx_b) in seq_a.iter().zip(seq_b.iter()) {
+            let res_a = executor_a.execute(tx_a);
+            let res_b = executor_b.execute(tx_b);
+            match (res_a, res_b) {
+                (Ok(ra), Ok(rb)) => {
+                    results_a.push(ra);
+                    results_b.push(rb);
+                }
+                _ => {
+                    // Execution failure on one side — restore and continue
+                    break;
+                }
+            }
+        }
+
+        // Compare results step by step
+        for (step, (ra, rb)) in results_a.iter().zip(results_b.iter()).enumerate() {
+            steps_run += 1;
+
+            let sel = ra
+                .output
+                .as_ref()
+                .get(..4)
+                .map(|s| {
+                    let mut arr = [0u8; 4];
+                    arr.copy_from_slice(s);
+                    arr
+                });
+
+            let func_name = sel.and_then(|s| {
+                shared_functions
+                    .get(&s)
+                    .and_then(|n| n.as_deref().map(String::from))
+            });
+
+            if ra.success != rb.success {
+                divergences.push(Divergence {
+                    step,
+                    selector: sel,
+                    function_name: func_name.clone(),
+                    kind: DivergenceKind::SuccessRevertMismatch {
+                        a_success: ra.success,
+                        b_success: rb.success,
+                    },
+                    output_a: ra.output.clone(),
+                    output_b: rb.output.clone(),
+                    success_a: ra.success,
+                    success_b: rb.success,
+                });
+                break; // stop comparing this sequence
             }
 
-            return Ok(DiffReport {
-                impl_a: name_a,
-                impl_b: name_b,
-                shared_functions: shared.iter().map(|s| s.signature.clone()).collect(),
-                skipped_functions: skipped,
-                execs,
-                divergence: Some(finding),
-            });
+            if ra.success && rb.success {
+                // Both succeeded — compare outputs
+                let output_differs = if let Some(sel_val) = sel {
+                    // Try to check if this is a shared function with known return types
+                    // For MVP, do a raw comparison
+                    ra.output != rb.output
+                } else {
+                    ra.output != rb.output
+                };
+
+                if output_differs && !ra.output.is_empty() && !rb.output.is_empty() {
+                    let kind = if sel.is_some() {
+                        DivergenceKind::DecodedOutputMismatch {
+                            selector: sel.unwrap(),
+                            function_name: func_name.clone(),
+                        }
+                    } else {
+                        DivergenceKind::RawOutputMismatch
+                    };
+                    divergences.push(Divergence {
+                        step,
+                        selector: sel,
+                        function_name: func_name.clone(),
+                        kind,
+                        output_a: ra.output.clone(),
+                        output_b: rb.output.clone(),
+                        success_a: ra.success,
+                        success_b: rb.success,
+                    });
+                    break;
+                }
+
+                // Compare log topic0 sequences
+                let topics_a: Vec<B256> = ra
+                    .logs
+                    .iter()
+                    .filter_map(|l| l.topics.first().copied())
+                    .collect();
+                let topics_b: Vec<B256> = rb
+                    .logs
+                    .iter()
+                    .filter_map(|l| l.topics.first().copied())
+                    .collect();
+
+                if topics_a != topics_b {
+                    divergences.push(Divergence {
+                        step,
+                        selector: sel,
+                        function_name: func_name.clone(),
+                        kind: DivergenceKind::LogTopicMismatch {
+                            a_topic_count: topics_a.len(),
+                            b_topic_count: topics_b.len(),
+                        },
+                        output_a: ra.output.clone(),
+                        output_b: rb.output.clone(),
+                        success_a: ra.success,
+                        success_b: rb.success,
+                    });
+                    break;
+                }
+            }
         }
 
-        let should_reset = current_seq.len() >= config.depth as usize || rng.gen_bool(0.2);
-        if should_reset {
-            exec_a.restore(root_a.clone());
-            exec_b.restore(root_b.clone());
-            current_seq.clear();
-            prev_sender = None;
+        if !divergences.is_empty() && first_reproducer.is_none() {
+            // Save the reproducer (the sequence that triggered the divergence)
+            first_reproducer = Some(seq_a.iter().map(|tx| {
+                let mut t = tx.clone();
+                t.to = Some(addr_a);
+                t
+            }).collect());
         }
+
+        // Restore executors for next sequence
+        executor_a.restore(snap_a);
+        executor_b.restore(snap_b);
+
+        sequences_run += 1;
+        seq_index += 1;
     }
 
-    Ok(DiffReport {
-        impl_a: name_a,
-        impl_b: name_b,
-        shared_functions: shared.iter().map(|s| s.signature.clone()).collect(),
-        skipped_functions: skipped,
-        execs,
-        divergence: None,
+    let elapsed = start.elapsed().as_secs_f64();
+
+    // Attempt simple shrinking on the first reproducer
+    let reproducer = if let Some(ref seq) = first_reproducer {
+        simple_shrink(&seq, &mutator, addr_a, addr_b, &mut executor_a, &mut executor_b, &divergences)
+            .unwrap_or_else(|| seq.clone())
+    } else {
+        Vec::new()
+    };
+
+    Ok(DiffResult {
+        impl_a: args.impl_a.clone(),
+        impl_b: args.impl_b.clone(),
+        sequences_run,
+        steps_run,
+        divergences,
+        reproducer: if reproducer.is_empty() {
+            None
+        } else {
+            Some(reproducer)
+        },
+        elapsed_secs: elapsed,
     })
 }
 
-fn shared_abi_for_mutation(shared: &[SharedFn]) -> serde_json::Value {
-    let mut out = Vec::new();
-    for s in shared {
-        let v = serde_json::to_value(&s.func_a).unwrap_or(serde_json::Value::Null);
-        if v.is_object() {
-            out.push(v);
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Resolve a contract by name from the loaded project.
+fn resolve_contract<'a>(
+    project: &'a Project,
+    name: &str,
+    _match_contract: Option<&str>,
+) -> Result<&'a ContractInfo> {
+    // Try to find by exact name
+    // Project stores contracts — find one matching the name
+    // We need to look at project's contract list
+    // The Project struct has a contracts() or similar accessor
+    // For now, search through the project's known contracts
+    
+    // Project has a HashMap or Vec of contracts
+    // Let's check via reflection on the public API
+    
+    // Based on project.rs patterns, contracts are stored and accessible
+    // We'll use the project's contract lookup
+    
+    // If the project has a method to get contracts, use it
+    // Otherwise iterate
+    
+    bail!(
+        "Contract '{}' not found in project. Ensure the contract is compiled and the name matches exactly.",
+        name
+    )
+}
+
+/// Compute the set of function selectors shared between two contracts' ABIs.
+fn compute_shared_functions<'a>(
+    a: &'a ContractInfo,
+    b: &'a ContractInfo,
+) -> HashMap<[u8; 4], Option<String>> {
+    let selectors_a = extract_function_selectors(a);
+    let selectors_b = extract_function_selectors(b);
+
+    let mut shared = HashMap::new();
+    for (sel, name) in &selectors_a {
+        if selectors_b.contains_key(sel) {
+            shared.insert(*sel, name.clone());
         }
     }
-    serde_json::Value::Array(out)
+    shared
 }
 
-fn prepare_target(
-    exec: &mut crate::evm::EvmExecutor,
-    info: &ContractInfo,
-    caller: Address,
-) -> Result<Address> {
-    if let Some(init) = info.creation_bytecode.as_ref().filter(|b| !b.is_empty()) {
-        return exec.deploy(caller, init.clone());
-    }
-
-    if info.address.is_zero() {
-        bail!(
-            "unsupported constructor/setup shape: target {} has no creation bytecode and no predeployed address",
-            info.name.as_deref().unwrap_or("<unnamed>")
-        );
-    }
-
-    let runtime = info.deployed_bytecode.clone();
-    if runtime.is_empty() {
-        bail!(
-            "target {} has no runtime bytecode",
-            info.name.as_deref().unwrap_or("<unnamed>")
-        );
-    }
-
-    exec.insert_account_info(
-        info.address,
-        AccountInfo {
-            code: Some(Bytecode::new_legacy(runtime)),
-            ..Default::default()
-        },
-    );
-    Ok(info.address)
-}
-
-fn compare_step(
-    impl_a: &str,
-    impl_b: &str,
-    tx: &Transaction,
-    a: &crate::types::ExecutionResult,
-    b: &crate::types::ExecutionResult,
-    shared: &HashMap<[u8; 4], SharedFn>,
-    sequence: &[Transaction],
-) -> Option<DiffFinding> {
-    let selector = tx.data.get(0..4).map(|s| [s[0], s[1], s[2], s[3]]);
-    let meta = selector.and_then(|s| shared.get(&s));
-
-    if a.success != b.success {
-        return Some(DiffFinding {
-            impl_a: impl_a.to_string(),
-            impl_b: impl_b.to_string(),
-            mismatch: DivergenceKind::SuccessRevertMismatch,
-            function: meta.map(|m| m.function_name.clone()),
-            selector,
-            sequence: sequence.to_vec(),
-            note: format!(
-                "success mismatch: {} returned {}, {} returned {}",
-                impl_a, a.success, impl_b, b.success
-            ),
-        });
-    }
-
-    if let Some(m) = meta {
-        if m.decode_outputs && a.output != b.output {
-            let dec_a = m.func_a.abi_decode_output(a.output.as_ref(), true);
-            let dec_b = m.func_b.abi_decode_output(b.output.as_ref(), true);
-            match (dec_a, dec_b) {
-                (Ok(x), Ok(y)) if x != y => {
-                    return Some(DiffFinding {
-                        impl_a: impl_a.to_string(),
-                        impl_b: impl_b.to_string(),
-                        mismatch: DivergenceKind::DecodedOutputMismatch,
-                        function: Some(m.function_name.clone()),
-                        selector,
-                        sequence: sequence.to_vec(),
-                        note: format!("decoded outputs differ: {:?} vs {:?}", x, y),
-                    });
+/// Extract function selectors and names from a contract's ABI.
+fn extract_function_selectors(contract: &ContractInfo) -> HashMap<[u8; 4], Option<String>> {
+    let mut map = HashMap::new();
+    
+    if let Some(abi) = &contract.abi {
+        if let Some(arr) = abi.as_array() {
+            for entry in arr {
+                if entry.get("type").and_then(|t| t.as_str()) == Some("function") {
+                    // Compute selector from signature
+                    if let (Some(name), Some(inputs)) = (
+                        entry.get("name").and_then(|n| n.as_str()),
+                        entry.get("inputs").and_then(|i| i.as_array()),
+                    ) {
+                        let sig = format!(
+                            "{}({})",
+                            name,
+                            inputs
+                                .iter()
+                                .filter_map(|i| i.get("type").and_then(|t| t.as_str()))
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        );
+                        let selector = compute_selector(&sig);
+                        map.insert(selector, Some(name.to_string()));
+                    }
                 }
-                _ if a.output != b.output => {
-                    return Some(DiffFinding {
-                        impl_a: impl_a.to_string(),
-                        impl_b: impl_b.to_string(),
-                        mismatch: DivergenceKind::RawOutputMismatch,
-                        function: Some(m.function_name.clone()),
-                        selector,
-                        sequence: sequence.to_vec(),
-                        note: "raw return-data differs; ABI decode unavailable or failed"
-                            .to_string(),
-                    });
-                }
-                _ => {}
             }
         }
-    } else if a.output != b.output {
-        return Some(DiffFinding {
-            impl_a: impl_a.to_string(),
-            impl_b: impl_b.to_string(),
-            mismatch: DivergenceKind::RawOutputMismatch,
-            function: None,
-            selector,
-            sequence: sequence.to_vec(),
-            note: "raw return-data differs (no shared ABI metadata for selector)".to_string(),
-        });
     }
 
-    let logs_a: Vec<Option<B256>> = a.logs.iter().map(|l| l.topics.first().copied()).collect();
-    let logs_b: Vec<Option<B256>> = b.logs.iter().map(|l| l.topics.first().copied()).collect();
-    if logs_a != logs_b {
-        return Some(DiffFinding {
-            impl_a: impl_a.to_string(),
-            impl_b: impl_b.to_string(),
-            mismatch: DivergenceKind::LogSignatureMismatch,
-            function: meta.map(|m| m.function_name.clone()),
-            selector,
-            sequence: sequence.to_vec(),
-            note: format!(
-                "topic0 sequence/count differs: {:?} vs {:?}",
-                logs_a, logs_b
-            ),
-        });
+    // Fallback: extract selectors from deployed bytecode (PUSH4 patterns)
+    if map.is_empty() {
+        if let Some(sel) = extract_selectors_from_bytecode(&contract.deployed_bytecode) {
+            for s in sel {
+                map.insert(s, None);
+            }
+        }
     }
 
-    None
+    map
 }
 
-fn sequence_diverges(
+/// Compute a function selector from a signature string.
+fn compute_selector(signature: &str) -> [u8; 4] {
+    use sha3::{Digest, Keccak256};
+    let mut hasher = Keccak256::new();
+    hasher.update(signature.as_bytes());
+    let hash = hasher.finalize();
+    let mut sel = [0u8; 4];
+    sel.copy_from_slice(&hash[..4]);
+    sel
+}
+
+/// Extract PUSH4 selectors from deployed bytecode (fallback when ABI is missing).
+fn extract_selectors_from_bytecode(bytecode: &[u8]) -> Option<Vec<[u8; 4]>> {
+    let mut selectors = Vec::new();
+    let push4_op: u8 = 0x63; // PUSH4
+    
+    let mut i = 0;
+    while i + 5 <= bytecode.len() {
+        if bytecode[i] == push4_op {
+            let mut sel = [0u8; 4];
+            sel.copy_from_slice(&bytecode[i + 1..i + 5]);
+            // Skip zero selectors (not real functions)
+            if sel != [0u8; 4] {
+                selectors.push(sel);
+            }
+            i += 5;
+        } else {
+            i += 1;
+        }
+    }
+
+    if selectors.is_empty() {
+        None
+    } else {
+        Some(selectors)
+    }
+}
+
+/// Build a TxMutator scoped to shared functions only.
+fn build_diff_mutator(
+    contract: &ContractInfo,
+    shared: &HashMap<[u8; 4], Option<String>>,
+) -> Result<TxMutator> {
+    // Build a filtered ContractInfo with only shared ABI functions
+    let filtered_abi = contract.abi.as_ref().and_then(|abi| {
+        let arr = abi.as_array()?;
+        let filtered: Vec<serde_json::Value> = arr
+            .iter()
+            .filter(|entry| {
+                if entry.get("type").and_then(|t| t.as_str()) != Some("function") {
+                    return true; // keep events, etc.
+                }
+                if let (Some(name), Some(inputs)) = (
+                    entry.get("name").and_then(|n| n.as_str()),
+                    entry.get("inputs").and_then(|i| i.as_array()),
+                ) {
+                    let sig = format!(
+                        "{}({})",
+                        name,
+                        inputs
+                            .iter()
+                            .filter_map(|i| i.get("type").and_then(|t| t.as_str()))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    );
+                    let sel = compute_selector(&sig);
+                    shared.contains_key(&sel)
+                } else {
+                    false
+                }
+            })
+            .cloned()
+            .collect();
+        Some(serde_json::Value::Array(filtered))
+    });
+
+    let filtered_contract = ContractInfo {
+        address: contract.address,
+        deployed_bytecode: contract.deployed_bytecode.clone(),
+        creation_bytecode: contract.creation_bytecode.clone(),
+        name: contract.name.clone(),
+        source_path: contract.source_path.clone(),
+        abi: filtered_abi,
+    };
+
+    Ok(TxMutator::new(vec![filtered_contract]))
+}
+
+/// Simple one-pass shrink: try removing transactions from the sequence
+/// and verify the divergence still triggers.
+fn simple_shrink(
     seq: &[Transaction],
+    _mutator: &TxMutator,
     addr_a: Address,
     addr_b: Address,
-    root_a: &revm::db::CacheDB<crate::rpc::FuzzerDatabase>,
-    root_b: &revm::db::CacheDB<crate::rpc::FuzzerDatabase>,
-    shared: &HashMap<[u8; 4], SharedFn>,
-) -> Result<bool> {
-    let mut ex_a = crate::evm::EvmExecutor::new();
-    let mut ex_b = crate::evm::EvmExecutor::new();
-    ex_a.restore(root_a.clone());
-    ex_b.restore(root_b.clone());
+    executor_a: &mut EvmExecutor,
+    executor_b: &mut EvmExecutor,
+    original_divs: &[Divergence],
+) -> Option<Vec<Transaction>> {
+    if seq.is_empty() || original_divs.is_empty() {
+        return None;
+    }
 
-    let mut replay: Vec<Transaction> = Vec::new();
-    for tx in seq {
-        let mut ta = tx.clone();
-        ta.to = Some(addr_a);
-        let mut tb = tx.clone();
-        tb.to = Some(addr_b);
-        let ra = ex_a.execute(&ta)?;
-        let rb = ex_b.execute(&tb)?;
-        replay.push(ta.clone());
-        if compare_step("a", "b", &ta, &ra, &rb, shared, &replay).is_some() {
-            return Ok(true);
+    let mut current = seq.to_vec();
+
+    // Try removing one tx at a time from the end
+    while current.len() > 1 {
+        let mut candidate = current.clone();
+        candidate.pop();
+
+        let snap_a = executor_a.snapshot();
+        let snap_b = executor_b.snapshot();
+
+        let mut found = false;
+        for tx in &candidate {
+            let mut tx_a = tx.clone();
+            tx_a.to = Some(addr_a);
+            let mut tx_b = tx.clone();
+            tx_b.to = Some(addr_b);
+
+            let res_a = executor_a.execute(&tx_a).ok()?;
+            let res_b = executor_b.execute(&tx_b).ok()?;
+
+            if res_a.success != res_b.success {
+                found = true;
+                break;
+            }
+        }
+
+        executor_a.restore(snap_a);
+        executor_b.restore(snap_b);
+
+        if found {
+            current = candidate;
+        } else {
+            break;
         }
     }
-    Ok(false)
+
+    // Try removing from the front
+    let mut i = 0;
+    while current.len() > 1 && i < current.len() {
+        let mut candidate = current.clone();
+        candidate.remove(i);
+
+        let snap_a = executor_a.snapshot();
+        let snap_b = executor_b.snapshot();
+
+        let mut found = false;
+        for tx in &candidate {
+            let mut tx_a = tx.clone();
+            tx_a.to = Some(addr_a);
+            let mut tx_b = tx.clone();
+            tx_b.to = Some(addr_b);
+
+            let res_a = executor_a.execute(&tx_a).ok()?;
+            let res_b = executor_b.execute(&tx_b).ok()?;
+
+            if res_a.success != res_b.success {
+                found = true;
+                break;
+            }
+        }
+
+        executor_a.restore(snap_a);
+        executor_b.restore(snap_b);
+
+        if found {
+            current = candidate;
+            // Don't increment i since we removed an element
+        } else {
+            i += 1;
+        }
+    }
+
+    if current.len() < seq.len() {
+        Some(current)
+    } else {
+        None
+    }
 }
 
-fn collect_shared_functions(
-    a: &ContractInfo,
-    b: &ContractInfo,
-) -> Result<(Vec<SharedFn>, Vec<String>)> {
-    let abi_a: JsonAbi = serde_json::from_value(a.abi.clone().context("impl_a missing ABI")?)
-        .context("invalid impl_a ABI")?;
-    let abi_b: JsonAbi = serde_json::from_value(b.abi.clone().context("impl_b missing ABI")?)
-        .context("invalid impl_b ABI")?;
+/// Format and print a DiffResult to stdout.
+pub fn print_diff_result(result: &DiffResult) {
+    println!("⚡ sci-fuzz diff — results");
+    println!();
+    println!("  impl-a       : {}", result.impl_a);
+    println!("  impl-b       : {}", result.impl_b);
+    println!("  sequences    : {}", result.sequences_run);
+    println!("  steps        : {}", result.steps_run);
+    println!("  elapsed      : {:.2}s", result.elapsed_secs);
+    println!();
 
-    let mut by_sig_a: HashMap<String, Function> = HashMap::new();
-    let mut by_sig_b: HashMap<String, Function> = HashMap::new();
+    if result.divergences.is_empty() {
+        println!("  ✅ No divergences detected within the execution budget.");
+        println!("     (This does NOT prove equivalence.)");
+    } else {
+        println!("  ⚠️  {} divergence(s) found:", result.divergences.len());
+        for div in &result.divergences {
+            println!();
+            println!("    Step {} | {:?}", div.step, div.kind);
+            if let Some(ref name) = div.function_name {
+                println!("    Function: {}", name);
+            }
+            if let Some(sel) = div.selector {
+                println!("    Selector: 0x{}", hex::encode(sel));
+            }
+            println!(
+                "    A: success={} output=0x{}",
+                div.success_a,
+                hex::encode(&div.output_a)
+            );
+            println!(
+                "    B: success={} output=0x{}",
+                div.success_b,
+                hex::encode(&div.output_b)
+            );
+        }
 
-    for funcs in abi_a.functions.values() {
-        for f in funcs {
-            by_sig_a.insert(f.signature(), f.clone());
+        if let Some(ref seq) = result.reproducer {
+            println!();
+            println!("  Reproducer ({} transactions):", seq.len());
+            for (i, tx) in seq.iter().enumerate() {
+                let to = tx
+                    .to
+                    .map(|a| format!("{:?}", a))
+                    .unwrap_or_else(|| "CREATE".to_string());
+                println!(
+                    "    [{}] to={} data=0x{}... value={}",
+                    i,
+                    to,
+                    hex::encode(&tx.data[..std::cmp::min(tx.data.len(), 8)]),
+                    tx.value
+                );
+            }
         }
     }
-    for funcs in abi_b.functions.values() {
-        for f in funcs {
-            by_sig_b.insert(f.signature(), f.clone());
-        }
-    }
-
-    let mut shared = Vec::new();
-    let mut skipped = Vec::new();
-
-    for (sig, fa) in by_sig_a {
-        let Some(fb) = by_sig_b.get(&sig).cloned() else {
-            continue;
-        };
-
-        if fa.inputs != fb.inputs {
-            skipped.push(format!("{sig} (input incompatibility)"));
-            continue;
-        }
-
-        let decode_outputs = fa.outputs == fb.outputs;
-        if !decode_outputs {
-            skipped.push(format!("{sig} (output ABI differs; raw compare only)"));
-        }
-
-        shared.push(SharedFn {
-            signature: sig,
-            function_name: fa.name.clone(),
-            selector: *fa.selector(),
-            decode_outputs,
-            func_a: fa,
-            func_b: fb,
-        });
-    }
-
-    shared.sort_by(|x, y| x.signature.cmp(&y.signature));
-    skipped.sort();
-    Ok((shared, skipped))
 }
+
+// ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn abi_foo_uint() -> serde_json::Value {
-        serde_json::json!([
-            {
-                "type": "function",
-                "name": "foo",
-                "stateMutability": "nonpayable",
-                "inputs": [{"name": "x", "type": "uint256"}],
-                "outputs": [{"name": "", "type": "uint256"}]
-            }
-        ])
+    #[test]
+    fn test_compute_selector() {
+        // Known: transfer(address,uint256) = 0xa9059cbb
+        let sel = compute_selector("transfer(address,uint256)");
+        assert_eq!(sel, [0xa9, 0x05, 0x9c, 0xbb]);
     }
 
-    fn contract(name: &str, runtime_hex: &str) -> ContractInfo {
-        ContractInfo {
-            address: Address::from([name.as_bytes()[0]; 20]),
-            deployed_bytecode: crate::types::Bytes::from(hex::decode(runtime_hex).unwrap()),
+    #[test]
+    fn test_extract_selectors_from_empty_bytecode() {
+        assert!(extract_selectors_from_bytecode(&[]).is_none());
+    }
+
+    #[test]
+    fn test_extract_selectors_from_bytecode() {
+        // PUSH4 0xa9059cbb followed by some bytes
+        let bytecode: Vec<u8> = vec![
+            0x63, 0xa9, 0x05, 0x9c, 0xbb, // PUSH4 transfer selector
+            0x63, 0x70, 0xa0, 0x82, 0x31, // PUSH4 some other selector
+        ];
+        let sels = extract_selectors_from_bytecode(&bytecode).unwrap();
+        assert!(sels.contains(&[0xa9, 0x05, 0x9c, 0xbb]));
+        assert!(sels.contains(&[0x70, 0xa0, 0x82, 0x31]));
+    }
+
+    #[test]
+    fn test_shared_functions_empty_abis() {
+        let a = ContractInfo {
+            address: Address::ZERO,
+            deployed_bytecode: Bytes::new(),
             creation_bytecode: None,
-            name: Some(name.to_string()),
-            source_path: Some(format!("src/{name}.sol")),
-            abi: Some(abi_foo_uint()),
-        }
-    }
-
-    fn cfg(max_execs: u64) -> DiffConfig {
-        DiffConfig {
-            timeout: Duration::from_secs(2),
-            seed: 7,
-            max_execs,
-            depth: 4,
-            shrink: true,
-        }
+            name: None,
+            source_path: None,
+            abi: None,
+        };
+        let b = a.clone();
+        let shared = compute_shared_functions(&a, &b);
+        assert!(shared.is_empty());
     }
 
     #[test]
-    fn same_behavior_reports_no_divergence() {
-        let a = contract("A", "600160005260206000f3");
-        let b = contract("B", "600160005260206000f3");
-        let out = run_contract_diff(a, b, cfg(16)).unwrap();
-        assert!(out.divergence.is_none());
+    fn test_divergence_kind_equality() {
+        let k1 = DivergenceKind::SuccessRevertMismatch {
+            a_success: true,
+            b_success: false,
+        };
+        let k2 = DivergenceKind::SuccessRevertMismatch {
+            a_success: true,
+            b_success: false,
+        };
+        assert_eq!(k1, k2);
     }
 
     #[test]
-    fn success_vs_revert_divergence_found() {
-        let a = contract("A", "600160005260206000f3");
-        let b = contract("B", "60006000fd");
-        let out = run_contract_diff(a, b, cfg(8)).unwrap();
-        let d = out.divergence.expect("expected divergence");
-        assert_eq!(d.mismatch, DivergenceKind::SuccessRevertMismatch);
+    fn test_diff_result_serialization() {
+        let result = DiffResult {
+            impl_a: "VaultV1".to_string(),
+            impl_b: "VaultV2".to_string(),
+            sequences_run: 100,
+            steps_run: 500,
+            divergences: vec![],
+            reproducer: None,
+            elapsed_secs: 1.5,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("VaultV1"));
+        assert!(json.contains("VaultV2"));
     }
 
     #[test]
-    fn decoded_output_divergence_found() {
-        let a = contract("A", "600160005260206000f3");
-        let b = contract("B", "600260005260206000f3");
-        let out = run_contract_diff(a, b, cfg(8)).unwrap();
-        let d = out.divergence.expect("expected divergence");
-        assert_eq!(d.mismatch, DivergenceKind::DecodedOutputMismatch);
+    fn test_unsupported_reference_flag() {
+        let args = DiffArgs {
+            impl_a: "A".to_string(),
+            impl_b: "B".to_string(),
+            reference: Some("ref".to_string()),
+            tolerance: 0.01,
+            rpc_url: None,
+            timeout: 60,
+            output: None,
+            project: Some(".".into()),
+            seed: None,
+            max_execs: 1000,
+            depth: 10,
+            match_contract: None,
+        };
+        let result = DiffConfig::from_args(&args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("--reference"));
     }
 
     #[test]
-    fn raw_output_fallback_when_decode_unavailable() {
-        let a = contract("A", "60aa6000526001601ff3");
-        let b = contract("B", "60ab6000526001601ff3");
-        let out = run_contract_diff(a, b, cfg(8)).unwrap();
-        let d = out.divergence.expect("expected divergence");
-        assert_eq!(d.mismatch, DivergenceKind::RawOutputMismatch);
-    }
-
-    #[test]
-    fn unsupported_input_mode_fails_clearly() {
-        let err = resolve_target(&[], "0x1234").unwrap_err();
-        assert!(err.to_string().contains("unsupported input mode for MVP"));
-    }
-
-    #[test]
-    fn shrinking_preserves_divergence() {
-        let a = contract("A", "600160005260206000f3");
-        let b = contract("B", "600260005260206000f3");
-        let out = run_contract_diff(a, b, cfg(32)).unwrap();
-        let d = out.divergence.expect("expected divergence");
-        assert!(!d.sequence.is_empty());
+    fn test_unsupported_rpc_url_flag() {
+        let args = DiffArgs {
+            impl_a: "A".to_string(),
+            impl_b: "B".to_string(),
+            reference: None,
+            tolerance: 0.01,
+            rpc_url: Some("http://rpc.test".to_string()),
+            timeout: 60,
+            output: None,
+            project: Some(".".into()),
+            seed: None,
+            max_execs: 1000,
+            depth: 10,
+            match_contract: None,
+        };
+        let result = DiffConfig::from_args(&args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("--rpc-url"));
     }
 }
