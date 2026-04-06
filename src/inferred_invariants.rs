@@ -1,4 +1,4 @@
-//! ABI-inferred invariants — automatically generated from contract metadata.
+//! ABI-inferred invariants - automatically generated from contract metadata.
 //!
 //! Unlike hand-written invariants, these are synthesized at campaign start by
 //! inspecting ABIs, protocol profiles, and storage patterns.  They use only
@@ -7,13 +7,13 @@
 //!
 //! ## Synthesized invariants
 //!
-//! 1. **AccessControlSlotOracle** — flags when owner/admin slots change to
+//! 1. **AccessControlSlotOracle** - flags when owner/admin slots change to
 //!    the attacker via non-governance selectors.
-//! 2. **PauseStateOracle** — flags when pause/guard slots toggle under
+//! 2. **PauseStateOracle** - flags when pause/guard slots toggle under
 //!    non-privileged calls.
-//! 3. **GetterStabilityOracle** — flags when a view/pure getter's probed
+//! 3. **GetterStabilityOracle** - flags when a view/pure getter's probed
 //!    value changes unexpectedly between two checks on the same contract.
-//! 4. **SupplyIntegrityOracle** — flags when `totalSupply` probe diverges
+//! 4. **SupplyIntegrityOracle** - flags when `totalSupply` probe diverges
 //!    from the cumulative mint/burn delta observed in token flow probes.
 
 use std::collections::{HashMap, HashSet};
@@ -225,7 +225,7 @@ impl Invariant for PauseStateOracle {
             return None;
         }
 
-        // Check if the tx was sent to a DIFFERENT contract — pause flag on
+        // Check if the tx was sent to a DIFFERENT contract - pause flag on
         // the target shouldn't change from a cross-contract call unless the
         // caller explicitly called a pause function.
         let last_tx = sequence.last()?;
@@ -256,7 +256,7 @@ impl Invariant for PauseStateOracle {
             return None;
         }
 
-        // Storage write without governance — medium severity signal.
+        // Storage write without governance - medium severity signal.
         // This catches patterns like: arbitrary caller toggles pause by calling
         // a non-governance function that has an internal pause check.
         None // Intentionally conservative: need more signal before flagging.
@@ -515,7 +515,7 @@ impl SynthesizedInvariants {
                     invariants.push(Box::new(oracle));
                 }
 
-                // --- PauseStateOracle ---
+                // --- PauseStateOracle --- 
                 let has_pause = abi_val.functions.keys().any(|k| {
                     k.to_lowercase().contains("pause")
                 });
@@ -523,6 +523,27 @@ impl SynthesizedInvariants {
                     let oracle = PauseStateOracle::new(attacker, contract.address, gov.clone());
                     descriptions.push(format!(
                         "PauseStateOracle for {} ({:#x})",
+                        contract.name.as_deref().unwrap_or("?"),
+                        contract.address
+                    ));
+                    invariants.push(Box::new(oracle));
+                }
+
+                // --- TimelockStateMachineOracle ---
+                // Synthesize only when ABI shows believable delayed-action lifecycle
+                // (queue/schedule/add family + execute/notify family)
+                let has_queue_family = abi_val.functions.keys().any(|k| {
+                    let kl = k.to_lowercase();
+                    kl.contains("queue") || kl.contains("schedule") || kl.contains("addreward")
+                });
+                let has_execute_family = abi_val.functions.keys().any(|k| {
+                    let kl = k.to_lowercase();
+                    kl.contains("execute") || kl.contains("notify") || kl.contains("finalize")
+                });
+                if has_queue_family && has_execute_family {
+                    let oracle = TimelockStateMachineOracle::new();
+                    descriptions.push(format!(
+                        "TimelockStateMachineOracle for {} ({:#x})",
                         contract.name.as_deref().unwrap_or("?"),
                         contract.address
                     ));
@@ -579,7 +600,7 @@ impl SynthesizedInvariants {
                             burn_sels,
                         );
                         descriptions.push(format!(
-                            "SupplyIntegrityOracle for {} ({:#x}) — {} mint, {} burn selectors",
+                            "SupplyIntegrityOracle for {} ({:#x}) - {} mint, {} burn selectors",
                             contract.name.as_deref().unwrap_or("?"),
                             contract.address,
                             oracle.mint_selectors.len(),
@@ -628,7 +649,7 @@ impl SynthesizedInvariants {
         if !target_selectors.is_empty() {
             let oracle = GetterStabilityOracle::new(attacker, target_selectors);
             descriptions.push(format!(
-                "GetterStabilityOracle — monitoring {} contracts for indirect state mutations",
+                "GetterStabilityOracle - monitoring {} contracts for indirect state mutations",
                 oracle.target_selectors.len()
             ));
             invariants.push(Box::new(oracle));
@@ -870,5 +891,113 @@ mod timelock_oracle_tests {
     fn selector_matching_is_deterministic() {
         let selector = keccak4(b"notifyRewards()");
         assert_eq!(selector, [0x2e, 0x1a, 0x7d, 0x4d]); // example deterministic value for documentation
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Synthesis tests for TimelockStateMachineOracle
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod timelock_synthesis_tests {
+    use super::*;
+    use serde_json::json;
+    use crate::types::ContractInfo;
+
+    fn dummy_contract_with_abi(name: &str, functions: Vec<&str>) -> ContractInfo {
+        let funcs: Vec<serde_json::Value> = functions.iter().map(|f| {
+            json!({
+                "type": "function",
+                "name": *f,
+                "inputs": [],
+                "outputs": [],
+                "stateMutability": "nonpayable"
+            })
+        }).collect();
+
+        ContractInfo {
+            name: Some(name.to_string()),
+            address: Address::repeat_byte(0xAA),
+            abi: Some(json!({ "functions": funcs })),
+            bytecode: None,
+            deployed_bytecode: None,
+        }
+    }
+
+    #[test]
+    fn synthesizes_timelock_when_both_families_present() {
+        let contracts = vec![dummy_contract_with_abi("RewardDistributor", vec![
+            "addRewards(uint256,uint256)",
+            "notifyRewards()",
+            "queue()"
+        ])];
+
+        let synth = SynthesizedInvariants::synthesize(&contracts, Address::ZERO, Address::ZERO);
+        let desc = synth.descriptions.join(" ");
+        assert!(desc.contains("TimelockStateMachineOracle"), "Should synthesize when queue + execute families present");
+    }
+
+    #[test]
+    fn does_not_synthesize_on_execute_only() {
+        let contracts = vec![dummy_contract_with_abi("SimpleExecutor", vec!["execute()"])];
+
+        let synth = SynthesizedInvariants::synthesize(&contracts, Address::ZERO, Address::ZERO);
+        let desc = synth.descriptions.join(" ");
+        assert!(!desc.contains("TimelockStateMachineOracle"), "Should not synthesize on execute-only");
+    }
+
+    #[test]
+    fn synthesizes_on_reward_delay_lifecycle() {
+        let contracts = vec![dummy_contract_with_abi("RewardModule", vec![
+            "addRewards(uint256,uint256)",
+            "notifyRewards()"
+        ])];
+
+        let synth = SynthesizedInvariants::synthesize(&contracts, Address::ZERO, Address::ZERO);
+        let desc = synth.descriptions.join(" ");
+        assert!(desc.contains("TimelockStateMachineOracle"), "Should synthesize on reward-delay pattern");
+    }
+
+    #[test]
+    fn does_not_synthesize_on_unrelated_governance() {
+        let contracts = vec![dummy_contract_with_abi("Governor", vec!["propose()", "execute()"])];
+
+        let synth = SynthesizedInvariants::synthesize(&contracts, Address::ZERO, Address::ZERO);
+        let desc = synth.descriptions.join(" ");
+        assert!(!desc.contains("TimelockStateMachineOracle"), "Should not synthesize on governance without clear queue family");
+    }
+
+    #[test]
+    fn integration_test_oracle_fires_on_minimal_premature_sequence() {
+        let oracle = TimelockStateMachineOracle::new();
+        let target = Address::repeat_byte(0x11);
+
+        let sequence = vec![
+            Transaction {
+                sender: Address::ZERO,
+                to: Some(target),
+                data: crate::types::Bytes::from(keccak4(b"addRewards(uint256,uint256)").to_vec()),
+                value: U256::ZERO,
+                gas_limit: 1_000_000,
+            },
+            Transaction {
+                sender: Address::ZERO,
+                to: Some(target),
+                data: crate::types::Bytes::from(keccak4(b"notifyRewards()").to_vec()),
+                value: U256::ZERO,
+                gas_limit: 1_000_000,
+            },
+        ];
+
+        let result = ExecutionResult {
+            success: true,
+            ..Default::default()
+        };
+
+        let finding = oracle.check(&HashMap::new(), &ProtocolProbeReport::default(), &result, &sequence);
+        assert!(finding.is_some(), "Oracle should fire on minimal premature execute sequence");
+        let f = finding.unwrap();
+        assert_eq!(f.severity, Severity::High);
+        assert!(f.title.contains("Timelock bypass"));
     }
 }
