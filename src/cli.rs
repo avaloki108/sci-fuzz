@@ -85,8 +85,10 @@ This is sci-fuzz’s own revm campaign — not `forge test` and not a cheatcode 
         name = "test",
         about = "Run Foundry tests with enhanced fuzzing",
         long_about = r#"
-**Not implemented yet** — this subcommand is a stub. Sci-Fuzz does not run `forge test`
-or replace the Foundry test runner. Use `sci-fuzz forge` for in-engine fuzzing.
+Thin project-mode wrapper for in-engine sci-fuzz campaigns.
+Builds the Foundry project in the current directory, selects fuzz targets,
+optionally filters by `--match-contract` / `--match-test`, and runs a campaign
+with test-oriented defaults.
 "#
     )]
     Test(TestArgs),
@@ -111,7 +113,7 @@ findings meet the configured thresholds (distinct from build error exit 1).
         name = "diff",
         about = "Compare two implementations via differential fuzzing",
         long_about = r#"
-**Not implemented yet** — stub only.
+Not implemented yet.
 "#
     )]
     Diff(DiffArgs),

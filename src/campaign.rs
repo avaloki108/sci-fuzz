@@ -70,6 +70,7 @@ struct SharedCampaignInner {
     finding_count: usize,
     first_hit_execs: Option<u64>,
     first_hit_time_ms: Option<u64>,
+    seq_corpus: Vec<CorpusEntry>,
 }
 
 // ---------------------------------------------------------------------------
@@ -529,6 +530,14 @@ impl Campaign {
             "calibration complete",
         );
 
+        // Corpus of interesting sequences for splice-based crossover.
+        // Load persisted entries before choosing sequential vs parallel path.
+        let mut seq_corpus: Vec<CorpusEntry> = Vec::with_capacity(SEQ_CORPUS_CAP);
+        if let Some(ref dir) = self.config.corpus_dir {
+            let prior = load_corpus_from_dir(dir);
+            seq_corpus.extend(prior.into_iter().take(SEQ_CORPUS_CAP));
+        }
+
         if effective_workers > 1 {
             let inner = SharedCampaignInner {
                 feedback,
@@ -541,6 +550,7 @@ impl Campaign {
                 finding_count: 0,
                 first_hit_execs: None,
                 first_hit_time_ms: None,
+                seq_corpus,
             };
             return run_parallel_campaign(
                 self.config.clone(),
@@ -564,13 +574,6 @@ impl Campaign {
         let mut first_hit_time_ms: Option<u64> = None;
         let mut successful_state_changes: u64 = 0;
         let mut snapshots_saved: u64 = 0;
-        // Corpus of interesting sequences for splice-based crossover (capped at 64).
-        let mut seq_corpus: Vec<CorpusEntry> = Vec::with_capacity(64);
-        // Load persisted corpus entries from a prior run, if a corpus_dir is set.
-        if let Some(ref dir) = self.config.corpus_dir {
-            let prior = load_corpus_from_dir(dir);
-            seq_corpus.extend(prior.into_iter().take(64));
-        }
         // Diagnostic counters for stateful property debugging.
         let mut diag_funded_deposits: u64 = 0;
         let mut diag_withdraws_ok: u64 = 0;
@@ -628,7 +631,11 @@ impl Campaign {
                 // Coverage-weighted parent selection: bias toward
                 // entries with fewer edges (rarer paths more valuable to mix).
                 let (a_idx, b_idx) = coverage_weighted_pair(&seq_corpus, &mut rng);
-                TxMutator::splice(&seq_corpus[a_idx].sequence, &seq_corpus[b_idx].sequence, &mut rng)
+                TxMutator::splice(
+                    &seq_corpus[a_idx].sequence,
+                    &seq_corpus[b_idx].sequence,
+                    &mut rng,
+                )
             } else {
                 let mut seq: Vec<Transaction> = Vec::with_capacity(seq_len as usize);
                 for _ in 0..seq_len {
@@ -680,13 +687,12 @@ impl Campaign {
                 // vm.assume(false) → treat as precondition rejection, skip
                 // invariant checks and snapshot saving for this sequence.
 
-
                 // Diagnostic: track deposit/withdraw patterns.
                 if result.success && tx.data.len() >= 4 {
-                // Skip invariant checks on expected reverts — they are intentional.
-                if result.revert_was_expected {
-                    continue;
-                }
+                    // Skip invariant checks on expected reverts — they are intentional.
+                    if result.revert_was_expected {
+                        continue;
+                    }
 
                     let sel: [u8; 4] = [tx.data[0], tx.data[1], tx.data[2], tx.data[3]];
                     if sel == DEPOSIT_SEL && tx.value > U256::ZERO {
@@ -834,12 +840,7 @@ impl Campaign {
                             sequence: sequence.clone(),
                             novel_edge_count: feedback.global_coverage().len(),
                         };
-                        if seq_corpus.len() >= 64 {
-                            let evict = rng.gen_range(0..seq_corpus.len());
-                            seq_corpus[evict] = entry;
-                        } else {
-                            seq_corpus.push(entry);
-                        }
+                        insert_seq_corpus_entry(&mut seq_corpus, entry, &mut rng);
                     }
                 }
 
@@ -1061,6 +1062,10 @@ fn run_parallel_campaign(
         .into_inner()
         .map_err(|e| anyhow::anyhow!("parallel campaign mutex poisoned: {e}"))?;
 
+    if let Some(ref dir) = config.corpus_dir {
+        save_corpus_to_dir(&inner.seq_corpus, dir);
+    }
+
     Ok(CampaignReport {
         deduped_finding_count: inner.findings.len(),
         elapsed_ms: elapsed.as_millis() as u64,
@@ -1129,17 +1134,28 @@ fn parallel_worker_loop(
 
         let final_sequence: Vec<Transaction> = {
             let g = shared.lock().expect("shared mutex poisoned");
+            let do_splice = !g.seq_corpus.is_empty() && rng.gen_bool(0.10);
             let seq_len: u32 = rng.gen_range(1..=config.max_depth);
-            let mut raw_sequence: Vec<Transaction> = Vec::with_capacity(seq_len as usize);
-            for _ in 0..seq_len {
-                let tx = if raw_sequence.is_empty() || rng.gen_bool(0.3) {
-                    let prev_sender = raw_sequence.last().map(|t: &Transaction| t.sender);
-                    g.mutator.generate_in_sequence(prev_sender, &mut rng)
-                } else {
-                    g.mutator.mutate(raw_sequence.last().unwrap(), &mut rng)
-                };
-                raw_sequence.push(tx);
-            }
+            let raw_sequence: Vec<Transaction> = if do_splice {
+                let (a_idx, b_idx) = coverage_weighted_pair(&g.seq_corpus, &mut rng);
+                TxMutator::splice(
+                    &g.seq_corpus[a_idx].sequence,
+                    &g.seq_corpus[b_idx].sequence,
+                    &mut rng,
+                )
+            } else {
+                let mut seq: Vec<Transaction> = Vec::with_capacity(seq_len as usize);
+                for _ in 0..seq_len {
+                    let tx = if seq.is_empty() || rng.gen_bool(0.3) {
+                        let prev_sender = seq.last().map(|t: &Transaction| t.sender);
+                        g.mutator.generate_in_sequence(prev_sender, &mut rng)
+                    } else {
+                        g.mutator.mutate(seq.last().unwrap(), &mut rng)
+                    };
+                    seq.push(tx);
+                }
+                seq
+            };
             let wrap_flashloan = rng.gen_bool(0.05);
             if wrap_flashloan {
                 let flashloan_mutator =
@@ -1279,6 +1295,13 @@ fn parallel_worker_loop(
                         && g.saved_dbs.len() < 64
                     {
                         g.saved_dbs.insert(snap_id, executor.snapshot());
+                    }
+                    if !sequence.is_empty() && (novel_cov || novel_df) {
+                        let entry = CorpusEntry {
+                            sequence: sequence.clone(),
+                            novel_edge_count: g.feedback.global_coverage().len(),
+                        };
+                        insert_seq_corpus_entry(&mut g.seq_corpus, entry, &mut rng);
                     }
                 }
             }
@@ -1445,7 +1468,10 @@ fn reproduces_failure(
 /// between runs is graceful degradation, not a fatal error.
 fn save_corpus_to_dir(corpus: &[CorpusEntry], dir: &std::path::Path) {
     if let Err(e) = std::fs::create_dir_all(dir) {
-        tracing::warn!("[corpus] could not create corpus dir {}: {e}", dir.display());
+        tracing::warn!(
+            "[corpus] could not create corpus dir {}: {e}",
+            dir.display()
+        );
         return;
     }
     let path = dir.join("seq_corpus.json");
@@ -1511,6 +1537,16 @@ struct CorpusEntry {
     novel_edge_count: usize,
 }
 
+const SEQ_CORPUS_CAP: usize = 64;
+
+fn insert_seq_corpus_entry(corpus: &mut Vec<CorpusEntry>, entry: CorpusEntry, rng: &mut impl Rng) {
+    if corpus.len() >= SEQ_CORPUS_CAP {
+        let evict = rng.gen_range(0..corpus.len());
+        corpus[evict] = entry;
+    } else {
+        corpus.push(entry);
+    }
+}
 
 /// Select two corpus indices weighted inversely by novel_edge_count.
 fn coverage_weighted_pair(corpus: &[CorpusEntry], rng: &mut impl Rng) -> (usize, usize) {
@@ -1534,7 +1570,10 @@ fn coverage_weighted_pair(corpus: &[CorpusEntry], rng: &mut impl Rng) -> (usize,
         corpus.len() - 1
     };
 
-    (pick(rng.gen::<f64>() * total), pick(rng.gen::<f64>() * total))
+    (
+        pick(rng.gen::<f64>() * total),
+        pick(rng.gen::<f64>() * total),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1712,15 +1751,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let entries = vec![
             CorpusEntry {
-                sequence: vec![
-                    Transaction {
-                        sender: Address::repeat_byte(0x01),
-                        to: Some(Address::repeat_byte(0x42)),
-                        data: Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]),
-                        value: crate::types::U256::ZERO,
-                        gas_limit: 1_000_000,
-                    },
-                ],
+                sequence: vec![Transaction {
+                    sender: Address::repeat_byte(0x01),
+                    to: Some(Address::repeat_byte(0x42)),
+                    data: Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]),
+                    value: crate::types::U256::ZERO,
+                    gas_limit: 1_000_000,
+                }],
                 novel_edge_count: 7,
             },
             CorpusEntry {
@@ -1798,5 +1835,93 @@ mod tests {
             parsed.is_array(),
             "corpus JSON must be an array, got: {parsed}"
         );
+    }
+
+    #[test]
+    fn parallel_campaign_persists_corpus_when_corpus_dir_set() {
+        let corpus_dir = tempfile::tempdir().expect("tempdir");
+        let config = CampaignConfig {
+            timeout: Duration::from_millis(300),
+            max_execs: Some(250),
+            max_depth: 4,
+            max_snapshots: 32,
+            workers: 4,
+            seed: 777,
+            targets: Vec::new(),
+            harness: None,
+            mode: ExecutorMode::Fast,
+            rpc_url: None,
+            rpc_block_number: None,
+            attacker_address: None,
+            corpus_dir: Some(corpus_dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        Campaign::new(config)
+            .run()
+            .expect("parallel campaign should complete");
+        assert!(corpus_dir.path().join("seq_corpus.json").exists());
+    }
+
+    #[test]
+    fn parallel_campaign_loads_prior_corpus_file() {
+        let corpus_dir = tempfile::tempdir().expect("tempdir");
+        let entries = vec![CorpusEntry {
+            sequence: vec![Transaction {
+                sender: Address::repeat_byte(0x01),
+                to: Some(Address::repeat_byte(0x42)),
+                data: Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]),
+                value: crate::types::U256::ZERO,
+                gas_limit: 1_000_000,
+            }],
+            novel_edge_count: 1,
+        }];
+        save_corpus_to_dir(&entries, corpus_dir.path());
+
+        let config = CampaignConfig {
+            timeout: Duration::from_millis(200),
+            max_execs: Some(120),
+            max_depth: 4,
+            max_snapshots: 16,
+            workers: 2,
+            seed: 42,
+            targets: Vec::new(),
+            harness: None,
+            mode: ExecutorMode::Fast,
+            rpc_url: None,
+            rpc_block_number: None,
+            attacker_address: None,
+            corpus_dir: Some(corpus_dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        Campaign::new(config)
+            .run()
+            .expect("parallel campaign should tolerate loading existing corpus");
+    }
+
+    #[test]
+    fn parallel_campaign_tolerates_corrupt_corpus_file() {
+        let corpus_dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(corpus_dir.path().join("seq_corpus.json"), b"{not-json")
+            .expect("write corrupt corpus");
+
+        let config = CampaignConfig {
+            timeout: Duration::from_millis(200),
+            max_execs: Some(120),
+            max_depth: 4,
+            max_snapshots: 16,
+            workers: 2,
+            seed: 101,
+            targets: Vec::new(),
+            harness: None,
+            mode: ExecutorMode::Fast,
+            rpc_url: None,
+            rpc_block_number: None,
+            attacker_address: None,
+            corpus_dir: Some(corpus_dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        Campaign::new(config)
+            .run()
+            .expect("parallel campaign should tolerate corrupt corpus");
     }
 }
