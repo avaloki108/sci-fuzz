@@ -111,9 +111,16 @@ findings meet the configured thresholds (distinct from build error exit 1).
     /// Differential fuzzing between implementations
     #[command(
         name = "diff",
-        about = "Compare two implementations via differential fuzzing",
+        about = "Compare two local contract implementations via differential execution",
         long_about = r#"
-Not implemented yet.
+Deploy two contracts from a Foundry project and execute identical generated
+call sequences against both, reporting any reproducible divergence in:
+  - success vs revert (one succeeds, the other reverts)
+  - return data (both succeed but output differs)
+  - emitted event signatures (topic[0] set differs)
+
+Unsupported: --reference and --rpc-url. Pass either flag to get a clear error.
+On-chain fork comparison is not implemented.
 "#
     )]
     Diff(DiffArgs),
@@ -372,31 +379,43 @@ pub struct CiArgs {
 /// Arguments for the `diff` subcommand
 #[derive(Parser, Debug)]
 pub struct DiffArgs {
-    /// First implementation path or address
+    /// Name of the first contract implementation (as it appears in forge artifacts)
     pub impl_a: String,
 
-    /// Second implementation path or address
+    /// Name of the second contract implementation
     pub impl_b: String,
 
-    /// Reference specification path or address
-    #[arg(long)]
-    pub reference: Option<String>,
-
-    /// Tolerance for numerical differences
-    #[arg(long, default_value = "0.01")]
-    pub tolerance: f64,
-
-    /// RPC URL for on-chain implementations
-    #[arg(long)]
-    pub rpc_url: Option<String>,
+    /// Path to the Foundry project root
+    #[arg(short, long, default_value = ".")]
+    pub project: PathBuf,
 
     /// Timeout in seconds
     #[arg(long, default_value = "300")]
     pub timeout: u64,
 
-    /// Output directory for diff results
-    #[arg(short, long)]
-    pub output: Option<PathBuf>,
+    /// Deterministic seed for the call generator
+    #[arg(long, default_value = "0")]
+    pub seed: u64,
+
+    /// Maximum number of individual call executions before stopping
+    #[arg(long, default_value = "50000")]
+    pub max_execs: u64,
+
+    /// Maximum transaction sequence depth per iteration
+    #[arg(long, default_value = "16")]
+    pub depth: u32,
+
+    /// Filter: only fuzz functions whose name contains this substring (reserved, currently unused)
+    #[arg(long)]
+    pub match_contract: Option<String>,
+
+    /// Not supported — on-chain reference comparison requires --rpc-url which is not yet implemented
+    #[arg(long)]
+    pub reference: Option<String>,
+
+    /// Not supported — on-chain fork mode is not yet implemented for diff
+    #[arg(long)]
+    pub rpc_url: Option<String>,
 }
 
 /// Snapshot strategy variants

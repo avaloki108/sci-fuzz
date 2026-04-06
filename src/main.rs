@@ -633,12 +633,95 @@ fn handle_ci(args: sci_fuzz::cli::CiArgs) -> Result<()> {
 
 #[cfg(feature = "cli")]
 fn handle_diff(args: sci_fuzz::cli::DiffArgs) -> Result<()> {
+    use sci_fuzz::diff::{DiffConfig, DiffRunner};
+
+    // Reject unsupported flags with a clear message rather than silently ignoring.
+    if args.reference.is_some() {
+        anyhow::bail!(
+            "--reference is not supported: on-chain reference comparison \
+             requires --rpc-url which is not yet implemented for `sci-fuzz diff`"
+        );
+    }
+    if args.rpc_url.is_some() {
+        anyhow::bail!(
+            "--rpc-url is not supported: on-chain fork mode is not yet \
+             implemented for `sci-fuzz diff`. Use local Foundry project artifacts only."
+        );
+    }
+
     println!("⚡ sci-fuzz diff");
     println!("  impl-a    : {}", args.impl_a);
     println!("  impl-b    : {}", args.impl_b);
-    println!("  tolerance : {}", args.tolerance);
+    println!("  project   : {}", args.project.display());
+    println!("  seed      : {}", args.seed);
+    println!("  max-execs : {}", args.max_execs);
+    println!("  depth     : {}", args.depth);
+    println!("  timeout   : {}s", args.timeout);
     println!();
-    println!("  (differential fuzzing not yet implemented — coming soon)");
+
+    let config = DiffConfig {
+        project: args.project,
+        impl_a_name: args.impl_a.clone(),
+        impl_b_name: args.impl_b.clone(),
+        seed: args.seed,
+        timeout: std::time::Duration::from_secs(args.timeout),
+        max_execs: args.max_execs,
+        depth: args.depth,
+    };
+
+    let mut runner = DiffRunner::new(config);
+    let divergences = runner.run()?;
+
+    println!();
+    if divergences.is_empty() {
+        println!("✅ No divergence found within the execution budget.");
+        println!("   This does not prove equivalence — increase --max-execs or try a different --seed.");
+    } else {
+        println!("🔀 Found {} divergence(s):", divergences.len());
+        for (i, d) in divergences.iter().enumerate() {
+            println!();
+            println!("  [{i}] kind        : {}", d.kind);
+            println!(
+                "       calldata    : 0x{}",
+                hex::encode(&d.calldata)
+            );
+            println!(
+                "       impl-a      : success={} output=0x{}",
+                d.outcome_a.success,
+                hex::encode(&d.outcome_a.output)
+            );
+            println!(
+                "       impl-b      : success={} output=0x{}",
+                d.outcome_b.success,
+                hex::encode(&d.outcome_b.output)
+            );
+            if !d.outcome_a.log_sigs.is_empty() || !d.outcome_b.log_sigs.is_empty() {
+                println!(
+                    "       log-sigs-a  : [{}]",
+                    d.outcome_a
+                        .log_sigs
+                        .iter()
+                        .map(|s| format!("0x{}", hex::encode(s)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                println!(
+                    "       log-sigs-b  : [{}]",
+                    d.outcome_b
+                        .log_sigs
+                        .iter()
+                        .map(|s| format!("0x{}", hex::encode(s)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            println!(
+                "       minimal-seq : {} tx(s)",
+                d.minimal_sequence.len()
+            );
+        }
+    }
+
     Ok(())
 }
 

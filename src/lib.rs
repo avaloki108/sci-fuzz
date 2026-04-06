@@ -101,6 +101,10 @@ pub mod harness;
 
 pub mod output;
 
+// ── Differential execution ──────────────────────────────────────────────
+
+pub mod diff;
+
 // ── CLI (feature-gated) ─────────────────────────────────────────────────
 
 #[cfg(feature = "cli")]
