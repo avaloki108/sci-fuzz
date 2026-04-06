@@ -565,7 +565,7 @@ impl Campaign {
         let mut successful_state_changes: u64 = 0;
         let mut snapshots_saved: u64 = 0;
         // Corpus of interesting sequences for splice-based crossover (capped at 64).
-        let mut seq_corpus: Vec<Vec<Transaction>> = Vec::with_capacity(64);
+        let mut seq_corpus: Vec<CorpusEntry> = Vec::with_capacity(64);
         // Diagnostic counters for stateful property debugging.
         let mut diag_funded_deposits: u64 = 0;
         let mut diag_withdraws_ok: u64 = 0;
@@ -620,9 +620,10 @@ impl Campaign {
             let do_splice = !seq_corpus.is_empty() && rng.gen_bool(0.10);
             let seq_len: u32 = rng.gen_range(1..=self.config.max_depth);
             let raw_sequence: Vec<Transaction> = if do_splice {
-                let a_idx = rng.gen_range(0..seq_corpus.len());
-                let b_idx = rng.gen_range(0..seq_corpus.len());
-                TxMutator::splice(&seq_corpus[a_idx], &seq_corpus[b_idx], &mut rng)
+                // Coverage-weighted parent selection: bias toward
+                // entries with fewer edges (rarer paths more valuable to mix).
+                let (a_idx, b_idx) = coverage_weighted_pair(&seq_corpus, &mut rng);
+                TxMutator::splice(&seq_corpus[a_idx].sequence, &seq_corpus[b_idx].sequence, &mut rng)
             } else {
                 let mut seq: Vec<Transaction> = Vec::with_capacity(seq_len as usize);
                 for _ in 0..seq_len {
@@ -824,11 +825,15 @@ impl Campaign {
                     // Add this sequence to the splice corpus so future
                     // iterations can crossover from this coverage path.
                     if !sequence.is_empty() && (novel_cov || novel_df) {
+                        let entry = CorpusEntry {
+                            sequence: sequence.clone(),
+                            novel_edge_count: feedback.global_coverage().len(),
+                        };
                         if seq_corpus.len() >= 64 {
                             let evict = rng.gen_range(0..seq_corpus.len());
-                            seq_corpus[evict] = sequence.clone();
+                            seq_corpus[evict] = entry;
                         } else {
-                            seq_corpus.push(sequence.clone());
+                            seq_corpus.push(entry);
                         }
                     }
                 }
@@ -1418,6 +1423,43 @@ fn reproduces_failure(
             .iter()
             .any(|candidate| candidate.failure_id() == target_failure)
     })
+}
+
+// ---------------------------------------------------------------------------
+// Corpus entry for splice crossover
+// ---------------------------------------------------------------------------
+
+/// A corpus entry tracking a sequence and its coverage contribution.
+struct CorpusEntry {
+    sequence: Vec<Transaction>,
+    /// Number of unique coverage edges at time of insertion.
+    novel_edge_count: usize,
+}
+
+
+/// Select two corpus indices weighted inversely by novel_edge_count.
+fn coverage_weighted_pair(corpus: &[CorpusEntry], rng: &mut impl Rng) -> (usize, usize) {
+    if corpus.len() == 1 {
+        return (0, 0);
+    }
+    let weights: Vec<f64> = corpus
+        .iter()
+        .map(|e| 1.0 / (e.novel_edge_count.max(1) as f64))
+        .collect();
+    let total: f64 = weights.iter().sum();
+
+    let pick = |r: f64| -> usize {
+        let mut r = r;
+        for (i, w) in weights.iter().enumerate() {
+            r -= w;
+            if r <= 0.0 {
+                return i;
+            }
+        }
+        corpus.len() - 1
+    };
+
+    (pick(rng.gen::<f64>() * total), pick(rng.gen::<f64>() * total))
 }
 
 // ---------------------------------------------------------------------------
