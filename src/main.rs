@@ -633,7 +633,7 @@ fn handle_ci(args: sci_fuzz::cli::CiArgs) -> Result<()> {
 
 #[cfg(feature = "cli")]
 fn handle_diff(args: sci_fuzz::cli::DiffArgs) -> Result<()> {
-    use sci_fuzz::diff::{run_project_diff, DiffConfig};
+    use sci_fuzz::diff::{print_diff_result, run_diff};
 
     if args.reference.is_some() {
         anyhow::bail!("--reference is not implemented in MVP diff mode");
@@ -645,66 +645,18 @@ fn handle_diff(args: sci_fuzz::cli::DiffArgs) -> Result<()> {
         anyhow::bail!("--depth must be >= 1");
     }
 
-    println!("⚡ sci-fuzz diff");
-    println!("  project   : {}", args.project.display());
-    println!("  impl-a    : {}", args.impl_a);
-    println!("  impl-b    : {}", args.impl_b);
-    if let Some(ref pat) = args.match_contract {
-        println!("  match-contract: {pat}");
-    }
-    println!("  timeout   : {}s", args.timeout);
-    println!("  seed      : {}", args.seed.unwrap_or(0xD1FF));
-    println!("  max-execs : {}", args.max_execs);
-    println!("  depth     : {}", args.depth);
-    println!();
+    // CLI prints introductory info via print_diff_result later or beforehand
+    let result = run_diff(&args)?;
 
-    let report = run_project_diff(
-        &args.project,
-        &args.impl_a,
-        &args.impl_b,
-        args.match_contract.as_deref(),
-        DiffConfig {
-            timeout: std::time::Duration::from_secs(args.timeout),
-            seed: args.seed.unwrap_or(0xD1FF),
-            max_execs: args.max_execs,
-            depth: args.depth,
-            shrink: true,
-        },
-    )?;
-
-    println!("  shared functions: {}", report.shared_functions.len());
-    if !report.skipped_functions.is_empty() {
-        println!("  skipped shared signatures:");
-        for s in &report.skipped_functions {
-            println!("    - {s}");
-        }
-    }
-    println!("  execs: {}", report.execs);
-
-    if let Some(div) = &report.divergence {
-        println!();
-        println!("⚠️  divergence found:");
-        println!("  type      : {:?}", div.mismatch);
-        if let Some(ref f) = div.function {
-            println!("  function  : {f}");
-        }
-        if let Some(sel) = div.selector {
-            println!("  selector  : 0x{}", hex::encode(sel));
-        }
-        println!("  seq-len   : {}", div.sequence.len());
-        println!("  note      : {}", div.note);
-    } else {
-        println!("✅ no divergence observed within configured budget");
-    }
+    print_diff_result(&result);
 
     if let Some(out_dir) = args.output {
         std::fs::create_dir_all(&out_dir)?;
-        let report_path = report.save_to_dir(&out_dir)?;
+        let report_path = out_dir.join("diff_result.json");
+        let result_json =
+            serde_json::to_string_pretty(&result).context("Failed to serialize diff result")?;
+        std::fs::write(&report_path, result_json)?;
         println!("  💾 wrote {}", report_path.display());
-        if let Some(div) = &report.divergence {
-            let finding_path = div.to_finding(Address::ZERO).save_to_dir(&out_dir)?;
-            println!("  💾 wrote {}", finding_path.display());
-        }
     }
 
     Ok(())

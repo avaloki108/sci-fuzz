@@ -329,17 +329,24 @@ fn generate_typed_arg_named(
         "uint256" => {
             // Time-aware: if param name hints at a time value, bias toward
             // block.timestamp ± a reasonable window (seconds).
-            let is_time_hint = name.map(|n| {
-                let n = n.to_ascii_lowercase();
-                n.contains("time") || n.contains("deadline") || n.contains("expiry")
-                    || n.contains("start") || n.contains("end") || n.contains("expire")
-                    || n.contains("duration") || n.contains("cliff") || n.contains("until")
-            }).unwrap_or(false);
+            let is_time_hint = name
+                .map(|n| {
+                    let n = n.to_ascii_lowercase();
+                    n.contains("time")
+                        || n.contains("deadline")
+                        || n.contains("expiry")
+                        || n.contains("start")
+                        || n.contains("end")
+                        || n.contains("expire")
+                        || n.contains("duration")
+                        || n.contains("cliff")
+                        || n.contains("until")
+                })
+                .unwrap_or(false);
 
             if is_time_hint && dict.block_timestamp_hint > 0 && rng.gen_bool(0.70) {
                 const DELTAS: &[i64] = &[
-                    0, 1, -1, 60, 300, 3600, 86400, 604800,
-                    2_592_000, 31_536_000, -3600, -86400,
+                    0, 1, -1, 60, 300, 3600, 86400, 604800, 2_592_000, 31_536_000, -3600, -86400,
                 ];
                 let delta = DELTAS[rng.gen_range(0..DELTAS.len())];
                 let ts = dict.block_timestamp_hint as i64 + delta;
@@ -452,7 +459,10 @@ fn generate_typed_arg_from_input(
     dict: &ValueDictionary,
     rng: &mut impl Rng,
 ) -> Vec<u8> {
-    let typ = input.get("type").and_then(|t| t.as_str()).unwrap_or("bytes32");
+    let typ = input
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("bytes32");
     let name = input.get("name").and_then(|n| n.as_str());
 
     if typ == "tuple" {
@@ -864,9 +874,7 @@ impl TxMutator {
             if let Some(full_inputs) = self.selector_full_params.get(&sel) {
                 // Use full ABI objects for tuple/name-aware encoding.
                 for input in full_inputs {
-                    buf.extend_from_slice(&generate_typed_arg_from_input(
-                        input, &self.dict, rng,
-                    ));
+                    buf.extend_from_slice(&generate_typed_arg_from_input(input, &self.dict, rng));
                 }
             } else if let Some(params) = self.selector_params.get(&sel) {
                 // ABI-aware: generate correctly typed arguments.
@@ -951,12 +959,10 @@ impl TxMutator {
         let target_info = self.targets.iter().find(|t| t.address == target);
         let target_selectors: Vec<[u8; 4]> = target_info
             .and_then(|t| {
-                t.abi.as_ref().and_then(|abi| abi.as_array()).map(|entries| {
-                    entries
-                        .iter()
-                        .filter_map(selector_from_abi_entry)
-                        .collect()
-                })
+                t.abi
+                    .as_ref()
+                    .and_then(|abi| abi.as_array())
+                    .map(|entries| entries.iter().filter_map(selector_from_abi_entry).collect())
             })
             .unwrap_or_default();
 
@@ -1025,7 +1031,9 @@ impl TxMutator {
                     for input in full_inputs {
                         let typ = input.get("type").and_then(|t| t.as_str()).unwrap_or("");
                         if typ.starts_with("uint") {
-                            buf.extend_from_slice(&biased_token_amount(&self.dict, rng).to_be_bytes::<32>());
+                            buf.extend_from_slice(
+                                &biased_token_amount(&self.dict, rng).to_be_bytes::<32>(),
+                            );
                         } else {
                             buf.extend_from_slice(&generate_typed_arg_from_input(
                                 input, &self.dict, rng,
@@ -1036,7 +1044,9 @@ impl TxMutator {
                     for param_type in params {
                         if param_type.starts_with("uint") {
                             // Bias toward token-like amounts (not just random U256).
-                            buf.extend_from_slice(&biased_token_amount(&self.dict, rng).to_be_bytes::<32>());
+                            buf.extend_from_slice(
+                                &biased_token_amount(&self.dict, rng).to_be_bytes::<32>(),
+                            );
                         } else {
                             buf.extend_from_slice(&generate_typed_arg(param_type, &self.dict, rng));
                         }
@@ -1045,7 +1055,9 @@ impl TxMutator {
                     // No ABI params — append 1-2 token amounts as guesses.
                     let n: usize = rng.gen_range(0..=2);
                     for _ in 0..n {
-                        buf.extend_from_slice(&biased_token_amount(&self.dict, rng).to_be_bytes::<32>());
+                        buf.extend_from_slice(
+                            &biased_token_amount(&self.dict, rng).to_be_bytes::<32>(),
+                        );
                     }
                 }
 

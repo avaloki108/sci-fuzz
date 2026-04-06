@@ -385,7 +385,10 @@ impl SequenceShrinker {
                     out.push(DynSolValue::Int(-I256::from_raw(U256::from(1u64)), *bits));
                     // Try the max positive value (overflow boundary)
                     let max_pos = U256::from(1u64) << (bits - 1);
-                    out.push(DynSolValue::Int(I256::from_raw(max_pos - U256::from(1u64)), *bits));
+                    out.push(DynSolValue::Int(
+                        I256::from_raw(max_pos - U256::from(1u64)),
+                        *bits,
+                    ));
                     // Try the min negative value
                     let min_neg = U256::from(1u64) << (bits - 1);
                     out.push(DynSolValue::Int(I256::from_raw(min_neg), *bits));
@@ -409,11 +412,12 @@ impl SequenceShrinker {
                 // Try removing each element individually
                 if items.len() > 1 {
                     for skip in 0..items.len() {
-                        let reduced: Vec<DynSolValue> =
-                            items.iter().enumerate()
-                                .filter(|(i, _)| *i != skip)
-                                .map(|(_, v)| v.clone())
-                                .collect();
+                        let reduced: Vec<DynSolValue> = items
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, _)| *i != skip)
+                            .map(|(_, v)| v.clone())
+                            .collect();
                         if reduced.len() < items.len() {
                             out.push(DynSolValue::Array(reduced));
                         }
@@ -442,7 +446,10 @@ impl SequenceShrinker {
                     }
                 }
                 // Try truncating
-                for trim_len in [1, b.len() / 2].into_iter().filter(|&l| l > 0 && l < b.len()) {
+                for trim_len in [1, b.len() / 2]
+                    .into_iter()
+                    .filter(|&l| l > 0 && l < b.len())
+                {
                     out.push(DynSolValue::Bytes(b[..trim_len].to_vec()));
                 }
             }
@@ -611,20 +618,20 @@ fn shrink_u256_candidates(value: U256) -> Vec<U256> {
 
     // ETH / token boundary amounts — common in DeFi bugs (flash loans, inflation, rounding).
     const BOUNDARIES: &[u128] = &[
-        1,                            // 1 wei
-        1_000,                        // 1 kwei
-        1_000_000,                    // 1 mwei
-        1_000_000_000,                // 1 gwei
-        1_000_000_000_000,            // 1 microether
-        1_000_000_000_000_000,        // 0.001 ether / 1 finney
-        10_000_000_000_000_000,       // 0.01 ether
-        100_000_000_000_000_000,      // 0.1 ether
-        1_000_000_000_000_000_000,    // 1 ether
-        10_000_000_000_000_000_000,   // 10 ether
-        100_000_000_000_000_000_000,  // 100 ether
+        1,                           // 1 wei
+        1_000,                       // 1 kwei
+        1_000_000,                   // 1 mwei
+        1_000_000_000,               // 1 gwei
+        1_000_000_000_000,           // 1 microether
+        1_000_000_000_000_000,       // 0.001 ether / 1 finney
+        10_000_000_000_000_000,      // 0.01 ether
+        100_000_000_000_000_000,     // 0.1 ether
+        1_000_000_000_000_000_000,   // 1 ether
+        10_000_000_000_000_000_000,  // 10 ether
+        100_000_000_000_000_000_000, // 100 ether
         // Common ERC20 base-unit amounts (18 decimals)
-        1_000_000_000_000_000_000_000,         // 1000 tokens
-        1_000_000_000_000_000_000_000_000,     // 1e6 tokens
+        1_000_000_000_000_000_000_000,     // 1000 tokens
+        1_000_000_000_000_000_000_000_000, // 1e6 tokens
     ];
     for &b in BOUNDARIES {
         let v = U256::from(b);
@@ -767,9 +774,7 @@ mod tests {
             tx(0x04, 0xDD, sel, 0, 0),
         ];
 
-        let shrunk = shrinker.shrink(&initial, |seq| {
-            seq.iter().any(|t| t.to == Some(bad_target))
-        });
+        let shrunk = shrinker.shrink(&initial, |seq| seq.iter().any(|t| t.to == Some(bad_target)));
 
         assert_eq!(shrunk.len(), 1, "should isolate to 1 tx");
         assert_eq!(shrunk[0].to, Some(bad_target));
@@ -782,17 +787,17 @@ mod tests {
         // Bug fires whenever both txs have same target and sequence length = 2.
         // It doesn't care about senders, so they should be unified.
         let target = Address::with_last_byte(0xAA);
-        let initial = vec![
-            tx(0x11, 0xAA, sel, 0, 0),
-            tx(0x22, 0xAA, sel, 0, 0),
-        ];
+        let initial = vec![tx(0x11, 0xAA, sel, 0, 0), tx(0x22, 0xAA, sel, 0, 0)];
 
         let shrunk = shrinker.shrink(&initial, |seq| {
             seq.len() == 2 && seq.iter().all(|t| t.to == Some(target))
         });
 
         assert_eq!(shrunk.len(), 2);
-        assert_eq!(shrunk[0].sender, shrunk[1].sender, "senders should be unified");
+        assert_eq!(
+            shrunk[0].sender, shrunk[1].sender,
+            "senders should be unified"
+        );
     }
 
     #[test]
@@ -850,6 +855,10 @@ mod tests {
         });
 
         assert_eq!(shrunk.len(), 1);
-        assert_eq!(shrunk[0].value, U256::from(one_ether), "should shrink to 1 ether boundary");
+        assert_eq!(
+            shrunk[0].value,
+            U256::from(one_ether),
+            "should shrink to 1 ether boundary"
+        );
     }
 }

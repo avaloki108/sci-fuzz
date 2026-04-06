@@ -7,16 +7,13 @@
 
 use crate::cli::DiffArgs;
 use crate::evm::EvmExecutor;
-use crate::mutator::{TxMutator, ValueDictionary};
-use crate::project::Project;
-use crate::types::{ContractInfo, ExecutionResult, Transaction};
+use crate::types::{ContractInfo, Transaction};
 
-use alloy_primitives::{Address, Bytes, B256, U256};
+use alloy_primitives::{Address, Bytes, B256};
 use anyhow::{bail, Context, Result};
 use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
 use std::time::Instant;
 
 // ── Divergence Types ─────────────────────────────────────────────────────────
@@ -25,10 +22,7 @@ use std::time::Instant;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DivergenceKind {
     /// One succeeded, the other reverted.
-    SuccessRevertMismatch {
-        a_success: bool,
-        b_success: bool,
-    },
+    SuccessRevertMismatch { a_success: bool, b_success: bool },
     /// Both succeeded but ABI-decoded outputs differ.
     DecodedOutputMismatch {
         selector: [u8; 4],
@@ -86,6 +80,7 @@ pub struct DiffResult {
 // ── Diff Runner ──────────────────────────────────────────────────────────────
 
 /// Configuration for a differential fuzzing run.
+#[derive(Debug)]
 pub struct DiffConfig {
     /// Maximum number of call sequences to execute.
     pub max_execs: u64,
@@ -125,13 +120,16 @@ impl DiffConfig {
     }
 }
 
+use crate::mutator::TxMutator;
+use crate::project::Project;
+
 /// Run a differential fuzzing campaign.
 pub fn run_diff(args: &DiffArgs) -> Result<DiffResult> {
     let config = DiffConfig::from_args(args)?;
-    let project_path = args.project.as_deref().unwrap_or(".");
+    let project_path = &args.project;
 
     // Load the Foundry project
-    let mut project = Project::from_foundry(Path::new(project_path))
+    let project = Project::load(project_path)
         .context("Failed to load Foundry project. Ensure forge build succeeds.")?;
 
     // Resolve both contract targets
@@ -147,7 +145,8 @@ pub fn run_diff(args: &DiffArgs) -> Result<DiffResult> {
         bail!(
             "No shared callable functions between '{}' and '{}'. \
              Both contracts must have at least one function with matching selector/signature.",
-            args.impl_a, args.impl_b
+            args.impl_a,
+            args.impl_b
         );
     }
 
@@ -245,15 +244,11 @@ pub fn run_diff(args: &DiffArgs) -> Result<DiffResult> {
         for (step, (ra, rb)) in results_a.iter().zip(results_b.iter()).enumerate() {
             steps_run += 1;
 
-            let sel = ra
-                .output
-                .as_ref()
-                .get(..4)
-                .map(|s| {
-                    let mut arr = [0u8; 4];
-                    arr.copy_from_slice(s);
-                    arr
-                });
+            let sel = ra.output.as_ref().get(..4).map(|s| {
+                let mut arr = [0u8; 4];
+                arr.copy_from_slice(s);
+                arr
+            });
 
             let func_name = sel.and_then(|s| {
                 shared_functions
@@ -343,11 +338,16 @@ pub fn run_diff(args: &DiffArgs) -> Result<DiffResult> {
 
         if !divergences.is_empty() && first_reproducer.is_none() {
             // Save the reproducer (the sequence that triggered the divergence)
-            first_reproducer = Some(seq_a.iter().map(|tx| {
-                let mut t = tx.clone();
-                t.to = Some(addr_a);
-                t
-            }).collect());
+            first_reproducer = Some(
+                seq_a
+                    .iter()
+                    .map(|tx| {
+                        let mut t = tx.clone();
+                        t.to = Some(addr_a);
+                        t
+                    })
+                    .collect(),
+            );
         }
 
         // Restore executors for next sequence
@@ -362,8 +362,16 @@ pub fn run_diff(args: &DiffArgs) -> Result<DiffResult> {
 
     // Attempt simple shrinking on the first reproducer
     let reproducer = if let Some(ref seq) = first_reproducer {
-        simple_shrink(&seq, &mutator, addr_a, addr_b, &mut executor_a, &mut executor_b, &divergences)
-            .unwrap_or_else(|| seq.clone())
+        simple_shrink(
+            &seq,
+            &mutator,
+            addr_a,
+            addr_b,
+            &mut executor_a,
+            &mut executor_b,
+            &divergences,
+        )
+        .unwrap_or_else(|| seq.clone())
     } else {
         Vec::new()
     };
@@ -387,7 +395,7 @@ pub fn run_diff(args: &DiffArgs) -> Result<DiffResult> {
 
 /// Resolve a contract by name from the loaded project.
 fn resolve_contract<'a>(
-    project: &'a Project,
+    _project: &'a Project,
     name: &str,
     _match_contract: Option<&str>,
 ) -> Result<&'a ContractInfo> {
@@ -396,16 +404,16 @@ fn resolve_contract<'a>(
     // We need to look at project's contract list
     // The Project struct has a contracts() or similar accessor
     // For now, search through the project's known contracts
-    
+
     // Project has a HashMap or Vec of contracts
     // Let's check via reflection on the public API
-    
+
     // Based on project.rs patterns, contracts are stored and accessible
     // We'll use the project's contract lookup
-    
+
     // If the project has a method to get contracts, use it
     // Otherwise iterate
-    
+
     bail!(
         "Contract '{}' not found in project. Ensure the contract is compiled and the name matches exactly.",
         name
@@ -432,7 +440,7 @@ fn compute_shared_functions<'a>(
 /// Extract function selectors and names from a contract's ABI.
 fn extract_function_selectors(contract: &ContractInfo) -> HashMap<[u8; 4], Option<String>> {
     let mut map = HashMap::new();
-    
+
     if let Some(abi) = &contract.abi {
         if let Some(arr) = abi.as_array() {
             for entry in arr {
@@ -473,10 +481,11 @@ fn extract_function_selectors(contract: &ContractInfo) -> HashMap<[u8; 4], Optio
 
 /// Compute a function selector from a signature string.
 fn compute_selector(signature: &str) -> [u8; 4] {
-    use sha3::{Digest, Keccak256};
-    let mut hasher = Keccak256::new();
+    use tiny_keccak::{Hasher, Keccak};
+    let mut hasher = Keccak::v256();
     hasher.update(signature.as_bytes());
-    let hash = hasher.finalize();
+    let mut hash = [0u8; 32];
+    hasher.finalize(&mut hash);
     let mut sel = [0u8; 4];
     sel.copy_from_slice(&hash[..4]);
     sel
@@ -486,7 +495,7 @@ fn compute_selector(signature: &str) -> [u8; 4] {
 fn extract_selectors_from_bytecode(bytecode: &[u8]) -> Option<Vec<[u8; 4]>> {
     let mut selectors = Vec::new();
     let push4_op: u8 = 0x63; // PUSH4
-    
+
     let mut i = 0;
     while i + 5 <= bytecode.len() {
         if bytecode[i] == push4_op {
@@ -790,11 +799,10 @@ mod tests {
             impl_a: "A".to_string(),
             impl_b: "B".to_string(),
             reference: Some("ref".to_string()),
-            tolerance: 0.01,
             rpc_url: None,
             timeout: 60,
             output: None,
-            project: Some(".".into()),
+            project: ".".into(),
             seed: None,
             max_execs: 1000,
             depth: 10,
@@ -811,11 +819,10 @@ mod tests {
             impl_a: "A".to_string(),
             impl_b: "B".to_string(),
             reference: None,
-            tolerance: 0.01,
             rpc_url: Some("http://rpc.test".to_string()),
             timeout: 60,
             output: None,
-            project: Some(".".into()),
+            project: ".".into(),
             seed: None,
             max_execs: 1000,
             depth: 10,

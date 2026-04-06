@@ -116,11 +116,7 @@ fn sanitize_sarif_name(title: &str) -> String {
 ///
 /// Each finding becomes a failing `<testcase>`. A clean run produces a single
 /// passing test case so that CI report parsers always see at least one result.
-pub fn junit_from_findings(
-    findings: &[Finding],
-    tool_name: &str,
-    elapsed_secs: f64,
-) -> String {
+pub fn junit_from_findings(findings: &[Finding], tool_name: &str, elapsed_secs: f64) -> String {
     let failures = findings.len();
     let tests = if findings.is_empty() { 1 } else { failures };
 
@@ -315,7 +311,10 @@ mod tests {
     fn sarif_schema_field_present() {
         let s = sarif_from_findings(&[], "0.1.0-test");
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert!(v["$schema"].as_str().unwrap().contains("sarif-schema-2.1.0"));
+        assert!(v["$schema"]
+            .as_str()
+            .unwrap()
+            .contains("sarif-schema-2.1.0"));
     }
 
     #[test]

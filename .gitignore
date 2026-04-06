@@ -11,6 +11,7 @@ benchmark-results.txt
 .cursor/
 .kilocode/
 .serena/
+CLAUDE.md
 
 # Rust build output
 target/

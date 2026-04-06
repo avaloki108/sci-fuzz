@@ -197,7 +197,9 @@ impl Invariant for Erc4626FirstDepositorInflationOracle {
             );
             return Some(Finding {
                 severity: Severity::Critical,
-                title: format!("Economic: ERC4626 first-depositor inflation — victim gets 0 shares ({vault})"),
+                title: format!(
+                    "Economic: ERC4626 first-depositor inflation — victim gets 0 shares ({vault})"
+                ),
                 description: desc,
                 contract: vault,
                 reproducer: sequence.to_vec(),
@@ -222,7 +224,9 @@ impl Invariant for Erc4626FirstDepositorInflationOracle {
             );
             return Some(Finding {
                 severity: Severity::High,
-                title: format!("Economic: ERC4626 first-depositor inflation setup detected ({vault})"),
+                title: format!(
+                    "Economic: ERC4626 first-depositor inflation setup detected ({vault})"
+                ),
                 description: desc,
                 contract: vault,
                 reproducer: sequence.to_vec(),

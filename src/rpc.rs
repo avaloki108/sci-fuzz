@@ -223,9 +223,9 @@ impl RpcCacheDB {
         };
 
         let code_hash = code
-                .as_ref()
-                .map(|c| c.hash_slow())
-                .unwrap_or(revm::primitives::KECCAK_EMPTY);
+            .as_ref()
+            .map(|c| c.hash_slow())
+            .unwrap_or(revm::primitives::KECCAK_EMPTY);
 
         // Cache code by hash for code_by_hash_ref lookups.
         if let Some(ref bytecode) = code {
@@ -543,9 +543,7 @@ pub fn preflight_deployed_target_enriched(
     if let Some(impl_addr) = resolve_eip1967_impl(url, block, address) {
         proxy_hint = ProxyBytecodeHint::Eip1967Proxy;
         let impl_str = format!("0x{}", hex::encode(impl_addr.as_slice()));
-        eprintln!(
-            "[preflight] EIP-1967 proxy detected at {addr_str} → impl {impl_str}"
-        );
+        eprintln!("[preflight] EIP-1967 proxy detected at {addr_str} → impl {impl_str}");
         // Fetch implementation bytecode for ABI-aware mutation.
         if let Ok(impl_hex_val) = rpc_post(
             url,
@@ -568,7 +566,10 @@ pub fn preflight_deployed_target_enriched(
         }
     }
 
-    Ok(DeployedPreflightResult { code: proxy_code, proxy_hint })
+    Ok(DeployedPreflightResult {
+        code: proxy_code,
+        proxy_hint,
+    })
 }
 
 fn rpc_post(url: &str, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {

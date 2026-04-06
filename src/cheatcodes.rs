@@ -34,8 +34,8 @@ use crate::types::{Address, U256};
 ///
 /// `address(bytes20(uint160(uint256(keccak256("hevm cheat code")))))`
 pub const FORGE_VM_ADDRESS: Address = Address::new([
-    0x71, 0x09, 0x70, 0x9e, 0xcf, 0xa9, 0x1a, 0x80, 0x62, 0x6f,
-    0xf3, 0x98, 0x9d, 0x68, 0xf6, 0x7f, 0x5b, 0x1d, 0xd1, 0x2d,
+    0x71, 0x09, 0x70, 0x9e, 0xcf, 0xa9, 0x1a, 0x80, 0x62, 0x6f, 0xf3, 0x98, 0x9d, 0x68, 0xf6, 0x7f,
+    0x5b, 0x1d, 0xd1, 0x2d,
 ]);
 
 // ── Cheatcode state ───────────────────────────────────────────────────────────
@@ -178,7 +178,11 @@ pub fn dispatch<DB: revm::Database>(
     }
 
     let sel = [calldata[0], calldata[1], calldata[2], calldata[3]];
-    let args = if calldata.len() > 4 { &calldata[4..] } else { &[] };
+    let args = if calldata.len() > 4 {
+        &calldata[4..]
+    } else {
+        &[]
+    };
 
     // ── Identity cheatcodes ───────────────────────────────────────────────────
 
@@ -263,8 +267,8 @@ pub fn dispatch<DB: revm::Database>(
     // ── Precondition guards ───────────────────────────────────────────────────
 
     if sel == selector(b"assume(bool)") {
-        let cond = args.first().copied().unwrap_or(1) != 0
-            || args.get(31).copied().unwrap_or(0) != 0;
+        let cond =
+            args.first().copied().unwrap_or(1) != 0 || args.get(31).copied().unwrap_or(0) != 0;
         if !cond {
             state.assume_violation = true;
             // Return a revert so the campaign loop sees a failed tx.
@@ -318,9 +322,7 @@ pub fn dispatch<DB: revm::Database>(
 
     // ── Logging / labelling (no-ops) ──────────────────────────────────────────
 
-    if sel == selector(b"label(address,string)")
-        || sel == selector(b"setLabel(address,string)")
-    {
+    if sel == selector(b"label(address,string)") || sel == selector(b"setLabel(address,string)") {
         return (true, bytes::Bytes::new());
     }
 
@@ -335,7 +337,9 @@ pub fn dispatch<DB: revm::Database>(
     if sel == selector(b"expectRevert(bytes4)") {
         // expectRevert(bytes4) — specific 4-byte selector expected.
         if calldata.len() >= 4 + 32 {
-            state.expected_revert = Some(Some(alloy_primitives::Bytes::copy_from_slice(&calldata[4..36])));
+            state.expected_revert = Some(Some(alloy_primitives::Bytes::copy_from_slice(
+                &calldata[4..36],
+            )));
         } else {
             state.expected_revert = Some(None);
         }
@@ -344,12 +348,14 @@ pub fn dispatch<DB: revm::Database>(
     if sel == selector(b"expectRevert(bytes)") {
         // expectRevert(bytes) — specific revert data expected.
         if calldata.len() >= 4 + 32 + 32 {
-            let offset = u64::from_be_bytes(calldata[36..44].try_into().unwrap_or([0;8])) as usize;
-            let len = u64::from_be_bytes(calldata[44..52].try_into().unwrap_or([0;8])) as usize;
+            let offset = u64::from_be_bytes(calldata[36..44].try_into().unwrap_or([0; 8])) as usize;
+            let len = u64::from_be_bytes(calldata[44..52].try_into().unwrap_or([0; 8])) as usize;
             let start = 4 + offset;
             let end = start + len;
             if end <= calldata.len() {
-                state.expected_revert = Some(Some(alloy_primitives::Bytes::copy_from_slice(&calldata[start..end])));
+                state.expected_revert = Some(Some(alloy_primitives::Bytes::copy_from_slice(
+                    &calldata[start..end],
+                )));
             } else {
                 state.expected_revert = Some(None);
             }
@@ -609,7 +615,8 @@ pub fn try_match_mock(
         if mock.target != target {
             continue;
         }
-        if !mock.calldata_prefix.is_empty() && !calldata.starts_with(mock.calldata_prefix.as_ref()) {
+        if !mock.calldata_prefix.is_empty() && !calldata.starts_with(mock.calldata_prefix.as_ref())
+        {
             continue;
         }
         return Some((mock.ret_data.clone(), mock.revert));

@@ -704,11 +704,7 @@ impl AccessControlOracle {
     /// appear in [`PRIVILEGED_FN_NAMES`] and computes their 4-byte selectors.
     ///
     /// Returns `None` if no privileged functions are found.
-    pub fn from_abi(
-        deployer: Address,
-        attacker: Address,
-        abi: &serde_json::Value,
-    ) -> Option<Self> {
+    pub fn from_abi(deployer: Address, attacker: Address, abi: &serde_json::Value) -> Option<Self> {
         let arr = abi.as_array()?;
         let mut privileged_selectors = Vec::new();
 
@@ -1827,9 +1823,7 @@ mod tests {
             "outputs": [],
             "stateMutability": "nonpayable"
         }]);
-        assert!(
-            AccessControlOracle::from_abi(Address::ZERO, Address::ZERO, &abi).is_none()
-        );
+        assert!(AccessControlOracle::from_abi(Address::ZERO, Address::ZERO, &abi).is_none());
     }
 
     // -- ReentrancyOracle tests -----------------------------------------------

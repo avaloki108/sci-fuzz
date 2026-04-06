@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, Context as _, Result};
 
+use revm::interpreter::Gas;
 use revm::{
     db::{CacheDB, EmptyDB},
     inspector_handle_register,
@@ -19,7 +20,6 @@ use revm::{
     },
     Database, DatabaseCommit, DatabaseRef, Evm, EvmContext, Inspector,
 };
-use revm::interpreter::Gas;
 
 use crate::cheatcodes::{self, TxCheatcodeState};
 use crate::path_id::{native_flashloan_path_id, PathStreamHasher};
@@ -80,8 +80,7 @@ impl<DB: Database> Inspector<DB> for CoverageInspector {
         // ── Cheatcode interception ────────────────────────────────────────────
         if inputs.target_address == cheatcodes::FORGE_VM_ADDRESS {
             let calldata = inputs.input.as_ref();
-            let (success, output) =
-                cheatcodes::dispatch(&mut self.cheatcodes, context, calldata);
+            let (success, output) = cheatcodes::dispatch(&mut self.cheatcodes, context, calldata);
 
             let instruction_result = if success {
                 InstructionResult::Return
@@ -245,10 +244,7 @@ impl EvmExecutor {
 
         // If a persistent prank is active (e.g. from vm.startPrank in a prior
         // setUp() call), apply it to this transaction's top-level sender.
-        let effective_sender = self
-            .cheatcode_state
-            .persistent_prank
-            .unwrap_or(tx.sender);
+        let effective_sender = self.cheatcode_state.persistent_prank.unwrap_or(tx.sender);
 
         // Seed the per-transaction inspector with current persistent prank so
         // that sub-calls inside this transaction also see it before stopPrank.
@@ -358,9 +354,7 @@ impl EvmExecutor {
                     Some(ref sel) if sel.len() <= 4 => {
                         rd.len() >= sel.len() && &rd[..sel.len()] == &sel[..]
                     }
-                    Some(ref full) => {
-                        rd == full.as_ref()
-                    }
+                    Some(ref full) => rd == full.as_ref(),
                 };
                 exec_result.revert_was_expected = matches;
             }
