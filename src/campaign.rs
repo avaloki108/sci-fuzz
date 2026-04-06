@@ -641,8 +641,8 @@ impl Campaign {
         let mut successful_state_changes: u64 = 0;
         let mut snapshots_saved: u64 = 0;
         // Diagnostic counters for stateful property debugging.
-        let mut diag_funded_deposits: u64 = 0;
-        let mut diag_withdraws_ok: u64 = 0;
+        let mut _diag_funded_deposits: u64 = 0;
+        let mut _diag_withdraws_ok: u64 = 0;
         let mut diag_deposit_then_withdraw: u64 = 0;
         // Time-based progress tracking (every 5 seconds to stderr).
         let progress_interval = std::time::Duration::from_secs(5);
@@ -796,10 +796,10 @@ impl Campaign {
 
                     let sel: [u8; 4] = [tx.data[0], tx.data[1], tx.data[2], tx.data[3]];
                     if sel == DEPOSIT_SEL && tx.value > U256::ZERO {
-                        diag_funded_deposits += 1;
+                        _diag_funded_deposits += 1;
                     }
                     if sel == WITHDRAW_SEL {
-                        diag_withdraws_ok += 1;
+                        _diag_withdraws_ok += 1;
                         // Check if this sequence already has a funded deposit.
                         let has_prior_deposit = sequence.iter().any(|prev| {
                             prev.data.len() >= 4

@@ -263,12 +263,14 @@ impl EvmExecutor {
                     cfg.disable_block_gas_limit = true;
                     cfg.disable_eip3607 = true;
                     cfg.disable_base_fee = true;
+                    cfg.limit_contract_code_size = Some(usize::MAX);
                 }
                 ExecutorMode::Realistic => {
                     cfg.disable_balance_check = false;
                     cfg.disable_block_gas_limit = true;
                     cfg.disable_eip3607 = true;
                     cfg.disable_base_fee = true;
+                    cfg.limit_contract_code_size = Some(usize::MAX);
                 }
             })
             .modify_tx_env(|tx_env| {
