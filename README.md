@@ -2,7 +2,7 @@
 
 A coverage-guided, snapshot-based EVM fuzzer that discovers invariant violations with minimal manual specification.
 
-**Status: production-capable prototype.** Five improvement phases complete. The fuzzing loop, EVM executor, oracle stack, CI output pipeline, and corpus persistence all run. What remains is measured validation against real targets, a semantic shrinker, and differential fuzzing.
+**Status: production-capable prototype.** Six improvement phases complete. The fuzzing loop, EVM executor, oracle stack (including lending health detection), CI output pipeline, and corpus persistence all run. What remains is measured validation against real targets, a semantic shrinker, and differential fuzzing.
 
 ## What This Is
 
@@ -66,6 +66,7 @@ The name stands for **S**mart **C**ontract **I**nvariant **Fuzz**er. The thesis 
   - `forge_reproducer()` — compilable Solidity `.t.sol` skeleton with `vm.prank()` + `call{value:}` for each transaction in the reproducer sequence.
 - **`sci-fuzz ci` command** **[Phase 4]** — fully implemented (`handle_ci()` in `main.rs`). Runs a real campaign (50k execs, seed `0xcafebabe`, 2 workers, configurable timeout). Emits GitHub Actions `::error/warning/notice` annotations when `--github-actions` is passed. Writes Forge `.t.sol` reproducers to `test/repros/`. Exits with code `2` when critical/high findings meet configured thresholds (distinct from build error exit `1`).
 - **Corpus persistence** **[Phase 5]** — `CampaignConfig::corpus_dir` (optional `PathBuf`) enables JSON-based corpus save/load across campaign runs. Load injects up to 64 prior entries at campaign start; save runs at campaign end after the main loop. All I/O failures are `tracing::warn!` only — corpus loss never terminates a run. CLI flags: `--corpus-dir` on both `forge` and `ci` subcommands.
+- **Lending health oracle** **[Phase 6]** — `LendingHealthOracle` detects net-unbacked borrow debt by scanning sequence-cumulative logs for standard `Borrow` event signatures. Handles both a generic `Borrow(address,address,uint256)` shape and the Compound-v2 `Borrow(address,uint256,uint256,uint256)` shape (amount always decoded from `data[0..32]`). Paired `Repay` and `RepayBorrow` events are subtracted; only net open debt above `min_net_borrow` fires. Profile-gated via `is_lending_like()` (ABI lending score ≥ 3 from `protocol_semantics.rs`) when profiles are attached — silent on non-lending targets. Severity escalates from Medium to High when the attacker also gains ETH in the same sequence.
 
 ## What Does Not Work Yet
 
@@ -77,10 +78,9 @@ Honesty matters more than marketing. These are real gaps:
 - **Parallel campaign corpus persistence not wired.** `corpus_dir` is loaded and saved only via the single-worker path in `run_with_report()`. The parallel `run_parallel_campaign()` path does not read from or write to the corpus directory.
 - **Foundry integration gaps beyond basic cheatcodes.** Script-based deploy flows, library-specific bootstrapping, `StdInvariant` / `targetContract` wiring, and multi-contract setup scripts are not implemented. Phase 1 covered the common cheatcodes (`vm.warp`, `vm.roll`, `vm.prank`, `vm.deal`, `vm.expectRevert`, `vm.assume`, `vm.store`, `vm.load`), but full equivalence with Foundry's invariant runner is not the goal.
 - **CLI stubs remaining: `sci-fuzz test` and `sci-fuzz diff`** print placeholder messages. `sci-fuzz ci` is now fully implemented. `sci-fuzz test` and `sci-fuzz diff` are not.
-- **LendingHealthOracle not implemented.** `Borrow`-event based lending health / solvency checking is planned but not yet written. The `PairwiseStorageDriftOracle` for lending-style debt-vs-collateral raw slot comparison is available but not in the default registry.
 - **External comparison execution is still partial.** `sci-fuzz benchmark` has a real measured path for sci-fuzz and a stable comparison schema for Echidna / Forge, but it does not yet orchestrate those tools end-to-end on shared targets. Their rows are reported as `unavailable` or `skipped`, never faked.
 - **Partial Echidna compatibility.** `EchidnaPropertyCaller` implements the core workflow (discover `echidna_*` functions, call them, check bool return). `EchidnaProperty` detects assertion events in logs. Neither handles revert/assert distinction with full Echidna fidelity, and the property-harness workflow (`targetContract`, configurable test limits, shrinking) is not implemented.
-- **Economic and conservation oracles remain heuristic despite ABI hints and probes.** Storage slot layouts (ERC-20 `totalSupply` at slot 2, balances at mapping slot 0) still match common OpenZeppelin layouts and break on proxies, diamonds, and custom storage. Classification and gating reduce some noise but do not guarantee soundness. Rate-jump, same-tx spread, and “no Transfer to vault” checks can still false-positive on extreme rounding, first-liquidity edges, donation economics, or non-standard vaults. Probe-vs-event checks can false-positive on fee-on-transfer assets, donation-style reserve moves, or non-standard vaults/pairs. **Conservation** checks (Sync window explanation, Deposit vs underlying `Transfer`) improve triage for pools and vaults but are **not** sound accounting proofs; bridges and generic **lending health/solvency** are still not modeled.
+- **Economic and conservation oracles remain heuristic despite ABI hints and probes.** Storage slot layouts (ERC-20 `totalSupply` at slot 2, balances at mapping slot 0) still match common OpenZeppelin layouts and break on proxies, diamonds, and custom storage. Classification and gating reduce some noise but do not guarantee soundness. Rate-jump, same-tx spread, and “no Transfer to vault” checks can still false-positive on extreme rounding, first-liquidity edges, donation economics, or non-standard vaults. Probe-vs-event checks can false-positive on fee-on-transfer assets, donation-style reserve moves, or non-standard vaults/pairs. **Conservation** checks (Sync window explanation, Deposit vs underlying `Transfer`) improve triage for pools and vaults but are **not** sound accounting proofs; bridges are still not modeled. `LendingHealthOracle` covers common `Borrow`-event patterns but is not a full collateral-ratio proof — multi-asset positions, health-factor math, and liquidation thresholds are not modeled.
 - **The 207k execs/sec number is a smoke test.** It measures empty-target throughput. Real contracts with storage and complex logic will run at 1–5k execs/sec. The number demonstrates low framework overhead, not security-testing strength.
 
 ## Architecture
@@ -103,6 +103,7 @@ protocol_probes.rs   post-tx static_call probes (ERC-4626 / ERC-20 / AMM) into E
 protocol_semantics.rs  best-effort ABI/event protocol classification and triage helpers for economic oracles
 invariant.rs         Invariant trait + default registry + EchidnaPropertyCaller
                      AccessControlOracle, ReentrancyOracle, TokenFlowConservationOracle [Phase 3]
+                     LendingHealthOracle [Phase 6]
 oracle.rs            routes execution results through invariant registry; balance baselines supplied per check
 types.rs             core types built on alloy-primitives (Address, U256, B256)
                      ExecutionResult: tx_path_id, sequence_cumulative_logs, protocol_probes, sstore_in_nested_call [Phase 3]
@@ -286,7 +287,7 @@ Until the shared-target comparison rows become measured rather than scaffolded, 
 | Phase 3 | `AccessControlOracle`, `ReentrancyOracle`, `TokenFlowConservationOracle`; `sstore_in_nested_call` in executor | ✅ Complete |
 | Phase 4 | CI output: SARIF 2.1, JUnit XML, Forge `.t.sol` reproducers; functional `sci-fuzz ci` command | ✅ Complete |
 | Phase 5 | Corpus persistence: JSON save/load across runs, `--corpus-dir` flag | ✅ Complete |
-| Phase 6 | `LendingHealthOracle`: borrow-event collateral ratio enforcement | ⬜ Not started |
+| Phase 6 | `LendingHealthOracle`: borrow-event net-debt detection, profile-gated, severity escalation | ✅ Complete |
 | Phase 7 | Semantic shrinker: ABI-type-aware reduction, storage-dependency ordering | ⬜ Not started |
 | Phase 8 | `sci-fuzz diff`: differential fuzzing between two implementations | ⬜ Not started |
 | Phase 9 | Parallel corpus persistence: wire `corpus_dir` into `run_parallel_campaign()` | ⬜ Not started |
@@ -296,8 +297,8 @@ Until the shared-target comparison rows become measured rather than scaffolded, 
 
 | Metric | Value |
 |--------|-------|
-| Rust source | ~13,500 lines in `src/` (21 modules) |
-| Unit tests | 183+ passing (`cargo test --lib`) |
+| Rust source | ~13,800 lines in `src/` (21 modules) |
+| Unit tests | 218+ passing (`cargo test --lib`) |
 | New tests added across Phases 1–5 | 26+ (10 oracle, 12 output, 4 corpus) |
 | Benchmark contracts | 133 (from EF/CF) |
 | Benchmark matrix entries | 81 with expected bug types |
