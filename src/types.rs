@@ -22,13 +22,11 @@ pub enum TestMode {
     /// Check assertion/panic failures only (`EchidnaProperty` events + property
     /// callers). Economic and balance oracles are not registered.
     Assertion,
-    /// Like `Property` but also discovers `invariant_*` functions (Foundry
-    /// convention). All oracles are registered; both `echidna_*` and
-    /// `invariant_*` prefixes are matched by the property caller.
-    FoundryInvariant,
-    /// Track a numeric optimization objective (scaffold — Phase 2 adds full
-    /// objective tracking). Oracle registration matches `Property` for now.
-    Optimization,
+    /// Economic, conservation, and oracle-heavy checks (balance increase, reentrancy,
+    /// token flow, ERC4626 anomalies, lending health, etc.).
+    Economic,
+    /// ABI-inferred invariants (access control, pause, timelock, supply, getters, etc.).
+    Inferred,
     /// Pure coverage-guided exploration. No oracles or property callers are
     /// registered. Useful for building a corpus before switching modes.
     Exploration,

@@ -77,6 +77,28 @@ fn tx_selector(tx: &Transaction) -> Option<[u8; 4]> {
     }
 }
 
+/// Four-byte selectors for standard ERC-20 operations that write to storage
+/// (balances, allowances) but **never** affect `totalSupply`.
+/// Used by `SupplyIntegrityOracle` to suppress false positives.
+fn supply_inert_selectors() -> HashSet<[u8; 4]> {
+    [
+        keccak4(b"approve(address,uint256)"),
+        keccak4(b"transfer(address,uint256)"),
+        keccak4(b"transferFrom(address,address,uint256)"),
+        keccak4(b"increaseAllowance(address,uint256)"),
+        keccak4(b"decreaseAllowance(address,uint256)"),
+        // ERC-2612 permit
+        keccak4(b"permit(address,address,uint256,uint256,uint8,bytes32,bytes32)"),
+        // Ownership / admin changes (write to storage but not supply)
+        keccak4(b"transferOwnership(address)"),
+        keccak4(b"renounceOwnership()"),
+        keccak4(b"acceptOwnership()"),
+        keccak4(b"setAdmin(address)"),
+    ]
+    .into_iter()
+    .collect()
+}
+
 /// Check whether any transaction in the sequence calls a governance selector.
 fn sequence_has_governance_call(
     sequence: &[Transaction],
@@ -384,33 +406,87 @@ impl Invariant for SupplyIntegrityOracle {
     fn check(
         &self,
         _pre_balances: &HashMap<Address, U256>,
-        _pre_probes: &ProtocolProbeReport,
+        pre_probes: &ProtocolProbeReport,
         result: &ExecutionResult,
         sequence: &[Transaction],
     ) -> Option<Finding> {
-        // Check if totalSupply could have changed via storage write.
+        // Bail early if there are no storage writes to this token at all.
         let writes = result.state_diff.storage_writes.get(&self.target)?;
+        if writes.is_empty() {
+            return None;
+        }
 
-        // Check if any tx in sequence called a mint/burn on this target.
+        // ── Primary guard: probe-based totalSupply delta ──────────────────
+        // If both pre- and post-probes are available and agree, the supply
+        // did not change — only allowances / balances were written.
+        let pre_supply = pre_probes
+            .per_contract
+            .get(&self.target)
+            .and_then(|c| c.erc20.as_ref())
+            .and_then(|e| e.total_supply.as_ref());
+        let post_supply = result
+            .protocol_probes
+            .per_contract
+            .get(&self.target)
+            .and_then(|c| c.erc20.as_ref())
+            .and_then(|e| e.total_supply.as_ref());
+
+        if let (Some(pre), Some(post)) = (pre_supply, post_supply) {
+            if pre == post {
+                // Supply unchanged — write was to balances/allowances only.
+                return None;
+            }
+            // Supply changed; only flag if no known mint/burn explains it.
+            let has_supply_tx = sequence.iter().any(|tx| {
+                tx.to == Some(self.target)
+                    && tx_selector(tx).is_some_and(|sel| {
+                        self.mint_selectors.contains(&sel) || self.burn_selectors.contains(&sel)
+                    })
+            });
+            if has_supply_tx {
+                return None;
+            }
+            return Some(Finding {
+                severity: Severity::High,
+                title: format!("Unexpected supply change on {:#x}", self.target),
+                description: format!(
+                    "Token {:#x} totalSupply changed without a known mint or burn \
+                     selector being called. The total supply may have been \
+                     manipulated through an unconventional path.",
+                    self.target
+                ),
+                contract: self.target,
+                reproducer: sequence.to_vec(),
+                exploit_profit: None,
+            });
+        }
+
+        // ── Fallback: whitelist-based guard (probes not available) ────────
+        // If every call to this token in the sequence is a known non-supply
+        // selector (approve, transfer, transferFrom, permit, …), suppress.
+        let inert = supply_inert_selectors();
+        let all_inert = sequence.iter().all(|tx| {
+            tx.to != Some(self.target)
+                || tx_selector(tx).is_some_and(|sel| inert.contains(&sel))
+        });
+        if all_inert {
+            return None;
+        }
+
+        // Check for explicit mint/burn call.
         let has_supply_tx = sequence.iter().any(|tx| {
             tx.to == Some(self.target)
                 && tx_selector(tx).is_some_and(|sel| {
                     self.mint_selectors.contains(&sel) || self.burn_selectors.contains(&sel)
                 })
         });
-
-        // If there's a storage write to this token contract but no explicit
-        // mint/burn call, flag it.  This catches:
-        // - Direct storage manipulation of totalSupply slot
-        // - Mint functions not in the known set
-        // - Reentrant supply manipulation
-        if !writes.is_empty() && !has_supply_tx {
+        if !has_supply_tx {
             return Some(Finding {
                 severity: Severity::High,
                 title: format!("Unexpected supply change on {:#x}", self.target),
                 description: format!(
                     "Token {:#x} had storage writes without a known mint or burn \
-                     selector being called.  The total supply may have been \
+                     selector being called. The total supply may have been \
                      manipulated through an unconventional path.",
                     self.target
                 ),
