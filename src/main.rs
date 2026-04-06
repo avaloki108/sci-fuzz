@@ -307,7 +307,52 @@ fn handle_audit(args: sci_fuzz::cli::AuditArgs) -> Result<()> {
     let _ = dotenvy_load();
 
     println!("⚡ sci-fuzz audit");
-    println!("  addresses : {}", args.addresses.join(", "));
+
+    use std::path::Path;
+    let mut manifest_chain_id: Option<u64> = None;
+    let mut named_targets: Vec<(String, Address)> = Vec::new();
+    if args.addresses.len() == 1 {
+        let p = &args.addresses[0];
+        if Path::new(p).is_file() {
+            let m = sci_fuzz::bootstrap::AddressManifest::load_path_or_inline(p)
+                .with_context(|| format!("failed to load address manifest from {p}"))?;
+            manifest_chain_id = m.chain_id;
+            if let Some(ref label) = m.rpc_label {
+                println!("  manifest  : rpc_label={label}");
+            }
+            named_targets = m.contracts;
+            println!(
+                "  manifest  : {} named target(s) from {}",
+                named_targets.len(),
+                p
+            );
+        } else {
+            let addr: Address = p
+                .parse()
+                .with_context(|| format!("Invalid address format: {p}"))?;
+            let short = p
+                .strip_prefix("0x")
+                .unwrap_or(p)
+                .chars()
+                .take(6)
+                .collect::<String>();
+            named_targets.push((format!("AuditTarget_{short}"), addr));
+        }
+    } else {
+        for p in &args.addresses {
+            let addr: Address = p
+                .parse()
+                .with_context(|| format!("Invalid address format: {p}"))?;
+            let short = p
+                .strip_prefix("0x")
+                .unwrap_or(p)
+                .chars()
+                .take(6)
+                .collect::<String>();
+            named_targets.push((format!("AuditTarget_{short}"), addr));
+        }
+        println!("  addresses : {}", args.addresses.join(", "));
+    }
     println!("  chain     : {}", args.chain);
     println!("  timeout   : {}s", args.timeout);
     println!("  flashloan : {}", args.flashloan);
@@ -352,10 +397,8 @@ fn handle_audit(args: sci_fuzz::cli::AuditArgs) -> Result<()> {
         .unwrap_or_default();
 
     let mut targets: Vec<ContractInfo> = Vec::new();
-    for addr_str in &args.addresses {
-        let target_address: Address = addr_str
-            .parse()
-            .with_context(|| format!("Invalid address format: {addr_str}"))?;
+    for (label, target_address) in &named_targets {
+        let addr_str = format!("{target_address:#x}");
 
         let mut abi_val = None;
         if !api_key.is_empty() {
@@ -364,7 +407,7 @@ fn handle_audit(args: sci_fuzz::cli::AuditArgs) -> Result<()> {
                 "  🔍 Fetching ABI from Etherscan for {} ({})…",
                 addr_str, args.chain
             );
-            match sci_fuzz::rpc::fetch_etherscan_abi(addr_str, &args.chain, &api_key) {
+            match sci_fuzz::rpc::fetch_etherscan_abi(&addr_str, &args.chain, &api_key) {
                 Ok(abi) => {
                     println!("  ✅ ABI retrieved successfully!");
                     abi_val = Some(abi);
@@ -380,17 +423,11 @@ fn handle_audit(args: sci_fuzz::cli::AuditArgs) -> Result<()> {
             );
         }
 
-        let short = addr_str
-            .strip_prefix("0x")
-            .unwrap_or(addr_str)
-            .chars()
-            .take(6)
-            .collect::<String>();
         targets.push(ContractInfo {
-            address: target_address,
+            address: *target_address,
             deployed_bytecode: Bytes::new(),
             creation_bytecode: None,
-            name: Some(format!("AuditTarget_{short}")),
+            name: Some(label.clone()),
             source_path: None,
             deployed_source_map: None,
             source_file_list: vec![],
@@ -419,11 +456,17 @@ fn handle_audit(args: sci_fuzz::cli::AuditArgs) -> Result<()> {
         rpc_url: Some(rpc_url.clone()),
         rpc_block_number: block,
         attacker_address,
+        fork_expected_chain_id: manifest_chain_id.or_else(|| {
+            std::env::var("FORK_CHAIN_ID")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        }),
         // Audit mode: use pre-deployed on-chain addresses directly.
         // Do NOT re-deploy — the contracts already exist on the forked chain.
         // Setting this to false ensures the campaign sees empty deployed_bytecode
         // and falls through to the "use address as-is" path in the deploy loop.
         fork_hydrate_deployed_bytecode: false,
+        fork_allow_local_deploy: false,
         ..Default::default()
     };
 

@@ -771,6 +771,115 @@ impl Finding {
     }
 }
 
+// ── Bootstrap & execution modes ─────────────────────────────────────────────
+
+/// How the campaign attaches to contracts: local deployment vs fork predeploys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum BootstrapMode {
+    /// Deploy from artifacts (empty RPC) or full local bootstrap.
+    #[default]
+    LocalDeploy,
+    /// Fork RPC: only predeployed addresses (no CREATE from config bytecode).
+    ForkAttach,
+    /// Fork RPC plus deploying local bytecode onto fork state (advanced).
+    ForkHybrid,
+}
+
+impl BootstrapMode {
+    /// Infer mode from [`CampaignConfig`].
+    pub fn infer(config: &CampaignConfig) -> Self {
+        if config.rpc_url.is_none() {
+            return BootstrapMode::LocalDeploy;
+        }
+        let any_bytecode = config.targets.iter().any(deployment_bytecode_non_empty);
+        if any_bytecode && config.fork_allow_local_deploy {
+            BootstrapMode::ForkHybrid
+        } else {
+            BootstrapMode::ForkAttach
+        }
+    }
+}
+
+fn deployment_bytecode_non_empty(t: &ContractInfo) -> bool {
+    let deployment_bytecode = t
+        .creation_bytecode
+        .clone()
+        .filter(|code| !code.is_empty())
+        .unwrap_or_else(|| t.deployed_bytecode.clone());
+    !deployment_bytecode.is_empty()
+}
+
+/// One failed deploy during bootstrap.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeployFailureReport {
+    pub target_name: Option<String>,
+    pub address: Address,
+    pub error: String,
+}
+
+/// Harness / `setUp()` outcome for diagnostics.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SetupReport {
+    pub harness_name: Option<String>,
+    pub harness_address: Option<Address>,
+    pub set_up_called: bool,
+    pub set_up_success: bool,
+    pub set_up_error: Option<String>,
+    pub deploy_failures: Vec<DeployFailureReport>,
+}
+
+/// Result of target preflight + deploy + optional harness.
+#[derive(Debug, Clone)]
+pub struct BootstrapOutcome {
+    pub deployed_targets: Vec<ContractInfo>,
+    pub setup_report: Option<SetupReport>,
+    pub mode: BootstrapMode,
+}
+
+/// Per-selector execution stats (telemetry).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SelectorTelemetry {
+    pub calls: u64,
+    pub successes: u64,
+    pub reverts: u64,
+}
+
+/// Rich post-run telemetry when no (or few) findings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CampaignTelemetry {
+    /// Selector hex string (0x...) + stats.
+    #[serde(default)]
+    pub selector_stats: std::collections::HashMap<String, SelectorTelemetry>,
+    /// Revert bucket → count (first 4 bytes of revert data as hex, or "empty").
+    #[serde(default)]
+    pub revert_buckets: std::collections::HashMap<String, u64>,
+    /// Invariant name → how many times it ran.
+    #[serde(default)]
+    pub invariant_runs: std::collections::HashMap<String, u64>,
+    /// Invariant name → how many times it flagged a finding.
+    #[serde(default)]
+    pub invariant_findings: std::collections::HashMap<String, u64>,
+    /// Transactions that emitted ERC-20 Transfer or moved ETH (heuristic).
+    pub value_moving_txs: u64,
+    /// Sequences where more than one distinct sender appeared.
+    pub multi_sender_sequences: u64,
+    /// (exec_count at sample, cumulative coverage edge count).
+    #[serde(default)]
+    pub coverage_samples: Vec<(u64, usize)>,
+    /// Ranked targets with scores (JSON-friendly).
+    #[serde(default)]
+    pub target_rankings: Vec<TargetRankEntry>,
+}
+
+/// One target score for ranking output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TargetRankEntry {
+    pub address: Address,
+    pub name: Option<String>,
+    pub score: u32,
+    pub signals: Vec<String>,
+}
+
 // ── Campaign Config ──────────────────────────────────────────────────────────
 
 /// Top-level configuration for a fuzzing campaign.
@@ -865,6 +974,31 @@ pub struct CampaignConfig {
     /// Balance to fund each address in `extra_senders` (default 10 ETH).
     #[serde(default = "default_sender_balance_wei")]
     pub sender_balance_wei: U256,
+    /// When forking: allow deploying bytecode from artifacts onto the fork (`CREATE`).
+    /// `audit` sets this to `false` so only predeployed addresses are used.
+    #[serde(default = "default_true")]
+    pub fork_allow_local_deploy: bool,
+    /// Abort the campaign if the Foundry harness is present and `setUp()` fails.
+    #[serde(default)]
+    pub require_successful_setup: bool,
+    /// Skip loading persisted sequence corpus from `corpus_dir` (fresh exploratory run).
+    #[serde(default)]
+    pub fork_skip_corpus_load: bool,
+    /// Additional addresses to fund on the fork overlay (ETH balance), e.g. actors.
+    #[serde(default)]
+    pub fork_fund_addresses: Vec<(Address, U256)>,
+    /// Weight per named exploit template (`deposit_withdraw`, …). Empty = defaults.
+    #[serde(default)]
+    pub sequence_template_weights: std::collections::HashMap<String, f64>,
+    /// Probability (0..1) to start a sequence from a template vs random generation.
+    #[serde(default = "default_template_mix")]
+    pub sequence_template_mix: f64,
+    /// Use [`crate::target_rank`] scores to fill `target_weights` when non-empty ranking.
+    #[serde(default)]
+    pub auto_rank_targets: bool,
+    /// Register extended protocol-semantics oracles (rewards, governance hints, …).
+    #[serde(default = "default_true")]
+    pub protocol_semantic_oracles: bool,
 }
 
 fn default_true() -> bool {
@@ -877,6 +1011,10 @@ fn default_fork_attacker_balance_wei() -> U256 {
 
 fn default_sender_balance_wei() -> U256 {
     U256::from(10_000_000_000_000_000_000_u128) // 10 ETH
+}
+
+fn default_template_mix() -> f64 {
+    0.15
 }
 
 impl CampaignConfig {
@@ -917,6 +1055,14 @@ impl Default for CampaignConfig {
             selector_weights: std::collections::HashMap::new(),
             extra_senders: Vec::new(),
             sender_balance_wei: default_sender_balance_wei(),
+            fork_allow_local_deploy: true,
+            require_successful_setup: false,
+            fork_skip_corpus_load: false,
+            fork_fund_addresses: Vec::new(),
+            sequence_template_weights: std::collections::HashMap::new(),
+            sequence_template_mix: default_template_mix(),
+            auto_rank_targets: false,
+            protocol_semantic_oracles: true,
         }
     }
 }

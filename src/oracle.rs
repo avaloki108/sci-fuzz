@@ -109,6 +109,26 @@ impl OracleEngine {
             .check_all(pre_sequence_balances, pre_sequence_probes, result, sequence)
     }
 
+    /// Like [`Self::check`] with per-invariant telemetry for campaign reports.
+    pub fn check_tracked(
+        &self,
+        pre_sequence_balances: &HashMap<Address, U256>,
+        pre_sequence_probes: &crate::types::ProtocolProbeReport,
+        result: &ExecutionResult,
+        sequence: &[Transaction],
+    ) -> (
+        Vec<Finding>,
+        std::collections::HashMap<String, u64>,
+        std::collections::HashMap<String, u64>,
+    ) {
+        self.registry.check_all_tracked(
+            pre_sequence_balances,
+            pre_sequence_probes,
+            result,
+            sequence,
+        )
+    }
+
     /// The attacker address this engine was configured with.
     pub fn attacker(&self) -> Address {
         self.attacker

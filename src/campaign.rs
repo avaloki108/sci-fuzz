@@ -26,7 +26,7 @@ use crate::oracle::{capture_eth_baseline, OracleEngine};
 use crate::shrinker::SequenceShrinker;
 use crate::snapshot::SnapshotCorpus;
 use crate::types::{
-    contract_info_for_mutator, Address, Bytes, CampaignConfig, ContractInfo, CoverageMap, Finding,
+    contract_info_for_mutator, Address, CampaignConfig, ContractInfo, CoverageMap, Finding,
     StateSnapshot, TestMode, Transaction, B256, U256,
 };
 
@@ -121,6 +121,9 @@ pub struct CampaignReport {
     pub finding_count: usize,
     /// Total number of unique findings retained after deduplication.
     pub deduped_finding_count: usize,
+    /// Post-run telemetry (selectors, reverts, invariants, coverage samples).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<crate::types::CampaignTelemetry>,
 }
 
 impl CampaignReport {
@@ -338,164 +341,33 @@ impl Campaign {
             // 100 ETH local
         }
 
-        // --- Validate / enrich deployed-only targets (RPC preflight) -------
-        let mut work_targets = self.config.targets.clone();
-        for target in &mut work_targets {
-            let has_init = target
-                .creation_bytecode
-                .as_ref()
-                .map(|c| !c.is_empty())
-                .unwrap_or(false);
-            let deploy_bytecode = if has_init {
-                target.creation_bytecode.clone().unwrap()
-            } else {
-                target.deployed_bytecode.clone()
-            };
-            if deploy_bytecode.is_empty() {
-                if target.address.is_zero() {
-                    anyhow::bail!(
-                        "target has no deployment bytecode and address is zero — set a deployed contract address"
-                    );
-                }
-                if let Some(ref url) = self.config.rpc_url {
-                    let u = url.trim();
-                    if !u.is_empty() {
-                        let pre = crate::rpc::preflight_deployed_target_enriched(
-                            u,
-                            self.config.rpc_block_number,
-                            target.address,
-                        )
-                        .map_err(|e| {
-                            anyhow::anyhow!("preflight failed for target {}: {e:#}", target.address)
-                        })?;
-                        eprintln!(
-                            "[campaign] preflight: {} code_size={} bytes proxy_hint={:?}",
-                            target.address,
-                            pre.code.len(),
-                            pre.proxy_hint
-                        );
-                        if self.config.fork_hydrate_deployed_bytecode {
-                            target.deployed_bytecode = Bytes::from(pre.code);
-                        }
-                    }
-                }
-            }
-        }
+        crate::bootstrap::fund_fork_addresses(&mut executor, &self.config);
 
-        if self.config.rpc_url.is_some() {
-            let any_local_deploy = work_targets.iter().any(|t| {
-                let deployment_bytecode = t
-                    .creation_bytecode
-                    .clone()
-                    .filter(|code| !code.is_empty())
-                    .unwrap_or_else(|| t.deployed_bytecode.clone());
-                !deployment_bytecode.is_empty()
-            });
-            if any_local_deploy {
+        let bootstrap = crate::bootstrap::bootstrap_targets(&mut executor, &self.config, attacker)?;
+        eprintln!(
+            "[campaign] bootstrap mode: {:?} ({} target(s) after deploy/attach)",
+            bootstrap.mode,
+            bootstrap.deployed_targets.len()
+        );
+        if let Some(ref setup) = bootstrap.setup_report {
+            if !setup.deploy_failures.is_empty() {
                 eprintln!(
-                    "[campaign] fork: deploying local bytecode onto forked state (not Forge script replay); chain predeploys use code at the pinned block"
+                    "[campaign] setup: {} deploy failure(s) recorded (see logs)",
+                    setup.deploy_failures.len()
                 );
             }
-        }
-
-        // --- Deploy target contracts ---------------------------------------
-        // We must track the ACTUAL deployed addresses (returned by CREATE)
-        // because they differ from the config addresses.  The mutator and
-        // property callers need to target the real on-chain addresses.
-        let mut deployed_targets: Vec<ContractInfo> = Vec::new();
-        for target in &work_targets {
-            let deployment_bytecode = target
-                .creation_bytecode
-                .clone()
-                .filter(|code| !code.is_empty())
-                .unwrap_or_else(|| target.deployed_bytecode.clone());
-
-            if !deployment_bytecode.is_empty() {
-                // Graceful: a failed deploy (e.g. constructor args, vm.* cheatcodes)
-                // should not abort the whole campaign. Warn and skip the target.
-                match executor.deploy(attacker, deployment_bytecode) {
-                    Ok(deployed_addr) => {
-                        deployed_targets.push(ContractInfo {
-                            address: deployed_addr,
-                            deployed_bytecode: target.deployed_bytecode.clone(),
-                            creation_bytecode: target.creation_bytecode.clone(),
-                            name: target.name.clone(),
-                            source_path: target.source_path.clone(),
-                            deployed_source_map: target.deployed_source_map.clone(),
-                            source_file_list: target.source_file_list.clone(),
-                            abi: target.abi.clone(),
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "[campaign] skipping target {} — deploy failed (constructor args or vm.* cheatcodes): {}",
-                            target.name.as_deref().unwrap_or("?"),
-                            e
-                        );
-                    }
+            if setup.set_up_called && !setup.set_up_success {
+                if let Some(ref err) = setup.set_up_error {
+                    eprintln!("[campaign] setUp() did not complete: {err}");
                 }
-            } else {
-                // No bytecode — use the config address as-is (pre-deployed).
-                deployed_targets.push(target.clone());
             }
         }
-
-        // --- Optional Foundry harness: deploy, then setUp() -----------------
-        if let Some(ref harness) = self.config.harness {
-            let deployment_bytecode = harness
-                .creation_bytecode
-                .clone()
-                .filter(|code| !code.is_empty())
-                .unwrap_or_else(|| harness.deployed_bytecode.clone());
-
-            if deployment_bytecode.is_empty() {
-                anyhow::bail!("harness contract has no bytecode to deploy");
-            }
-
-            let deployed_addr = executor.deploy(attacker, deployment_bytecode)?;
-            deployed_targets.push(ContractInfo {
-                address: deployed_addr,
-                deployed_bytecode: harness.deployed_bytecode.clone(),
-                creation_bytecode: harness.creation_bytecode.clone(),
-                name: harness.name.clone(),
-                source_path: harness.source_path.clone(),
-                deployed_source_map: harness.deployed_source_map.clone(),
-                source_file_list: harness.source_file_list.clone(),
-                abi: harness.abi.clone(),
-            });
-
-            // Only call setUp() if the ABI declares it (Echidna-style harnesses don't).
-            let has_setup = harness
-                .abi
-                .as_ref()
-                .is_some_and(|abi| crate::project::abi_has_set_up(abi));
-            if has_setup {
-                match crate::harness::run_setup(&mut executor, attacker, deployed_addr) {
-                    Ok(()) => {
-                        eprintln!(
-                            "[campaign] ran setUp() on harness {} ({})",
-                            harness.name.as_deref().unwrap_or("?"),
-                            deployed_addr
-                        );
-                    }
-                    Err(e) => {
-                        // setUp() reverts are usually vm.* cheatcodes. Warn and continue —
-                        // the constructor already set up base state so fuzzing can proceed.
-                        tracing::warn!(
-                            "[campaign] setUp() failed on harness {} — continuing without it \
-                             (vm.* cheatcodes not supported): {}",
-                            harness.name.as_deref().unwrap_or("?"),
-                            e
-                        );
-                    }
-                }
-            } else {
-                eprintln!(
-                    "[campaign] harness {} ({}) uses constructor-only setup (no setUp())",
-                    harness.name.as_deref().unwrap_or("?"),
-                    deployed_addr
-                );
-            }
+        let deployed_targets = bootstrap.deployed_targets;
+        if deployed_targets.is_empty() && !self.config.targets.is_empty() {
+            anyhow::bail!(
+                "bootstrap produced zero targets — all deploys failed or attach-only misconfigured. \
+                 For fork audits use predeployed addresses without bytecode in config; for local Foundry, check constructor args / cheatcodes."
+            );
         }
 
         // --- JSON ABIs at deployed addresses (shrinker / oracles) ------------
@@ -517,13 +389,28 @@ impl Campaign {
             .iter()
             .map(|c| contract_info_for_mutator(c, STRIP_HARNESS_LIFECYCLE))
             .collect();
-        let mut mutator = if self.config.system_mode
-            || !self.config.target_weights.is_empty()
+        let mut merged_target_weights = self.config.target_weights.clone();
+        if self.config.auto_rank_targets {
+            let ranked = crate::target_rank::rank_targets(&deployed_targets);
+            eprintln!("[campaign] target ranking (auto, top 8 by score):");
+            for e in ranked.iter().take(8) {
+                eprintln!(
+                    "  {:?} {:?} score={} signals={:?}",
+                    e.name, e.address, e.score, e.signals
+                );
+            }
+            for (addr, w) in crate::target_rank::weights_from_rankings(&ranked, 1, 10) {
+                merged_target_weights.entry(addr).or_insert(w);
+            }
+        }
+        let use_weights = self.config.system_mode
+            || !merged_target_weights.is_empty()
             || !self.config.selector_weights.is_empty()
-        {
+            || self.config.auto_rank_targets;
+        let mut mutator = if use_weights {
             TxMutator::new_with_weights(
                 mutator_targets,
-                &self.config.target_weights,
+                &merged_target_weights,
                 &self.config.selector_weights,
             )
         } else {
@@ -706,8 +593,12 @@ impl Campaign {
         // Load persisted entries before choosing sequential vs parallel path.
         let mut seq_corpus: Vec<CorpusEntry> = Vec::with_capacity(SEQ_CORPUS_CAP);
         if let Some(ref dir) = self.config.corpus_dir {
-            let prior = load_corpus_from_dir(dir);
-            seq_corpus.extend(prior.into_iter().take(SEQ_CORPUS_CAP));
+            if !self.config.fork_skip_corpus_load {
+                let prior = load_corpus_from_dir(dir);
+                seq_corpus.extend(prior.into_iter().take(SEQ_CORPUS_CAP));
+            } else {
+                eprintln!("[campaign] fork_skip_corpus_load: starting without persisted seq corpus");
+            }
         }
 
         if effective_workers > 1 {
@@ -807,6 +698,17 @@ impl Campaign {
                 TxMutator::splice(
                     &seq_corpus[a_idx].sequence,
                     &seq_corpus[b_idx].sequence,
+                    &mut rng,
+                )
+            } else if rng.gen_bool(self.config.sequence_template_mix) {
+                let tmpl = crate::sequence_templates::pick_template(
+                    &mut rng,
+                    &self.config.sequence_template_weights,
+                );
+                crate::sequence_templates::build_sequence(
+                    tmpl,
+                    &mutator,
+                    self.config.max_depth,
                     &mut rng,
                 )
             } else {
@@ -1177,6 +1079,7 @@ impl Campaign {
             first_hit_time_ms,
             total_execs,
             aggregate_coverage: aggregate_coverage.clone(),
+            telemetry: None,
         };
 
         // Persist campaign report and source coverage.
@@ -1273,6 +1176,7 @@ fn run_parallel_campaign(
         first_hit_time_ms: inner.first_hit_time_ms,
         total_execs: total_execs_u64,
         aggregate_coverage: aggregate_coverage.clone(),
+        telemetry: None,
     };
 
     if let Some(ref dir) = config.corpus_dir {

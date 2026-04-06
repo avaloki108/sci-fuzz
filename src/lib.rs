@@ -82,9 +82,18 @@ pub mod oracle;
 
 pub mod campaign;
 
+/// Fork/local bootstrap: deploy vs attach, preflight, address manifests.
+pub mod bootstrap;
+
 // ── On-chain forking & Etherscan integration ────────────────────────────
 
 pub mod rpc;
+
+/// Exploit-oriented sequence templates (deposit/withdraw, borrow/repay, …).
+pub mod sequence_templates;
+
+/// Target scoring for fuzz priority.
+pub mod target_rank;
 
 // ── Benchmark scoreboard ────────────────────────────────────────────────
 
@@ -134,7 +143,8 @@ pub use scoreboard::{
 };
 pub use shrinker::SequenceShrinker;
 pub use types::{
-    contract_info_for_mutator, strip_abi_functions_named, Address, Bytes, CampaignConfig,
-    ContractInfo, CoverageMap, ExecutionResult, Finding, Log, Severity, StateDiff, StateSnapshot,
-    Transaction, B256, U256,
+    contract_info_for_mutator, strip_abi_functions_named, Address, BootstrapMode, Bytes,
+    CampaignConfig, CampaignTelemetry, ContractInfo, CoverageMap, ExecutionResult, Finding, Log,
+    SelectorTelemetry, Severity, StateDiff, StateSnapshot, Transaction, B256, U256,
 };
+pub use bootstrap::AddressManifest;

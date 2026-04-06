@@ -570,6 +570,8 @@ pub struct TxMutator {
     /// Full ABI input objects for each selector (preserves `name`, `components`
     /// for tuple/struct encoding and time-aware generation).
     selector_full_params: HashMap<[u8; 4], Vec<serde_json::Value>>,
+    /// Solidity function name per selector (first ABI occurrence wins).
+    selector_function_names: HashMap<[u8; 4], String>,
     /// Selectors whose ABI entry has `stateMutability: "payable"`.
     payable_selectors: HashSet<[u8; 4]>,
     /// Pool of known addresses (senders, contracts, constants).
@@ -588,6 +590,7 @@ impl TxMutator {
         let mut selectors = Vec::new();
         let mut selector_params: HashMap<[u8; 4], Vec<String>> = HashMap::new();
         let mut selector_full_params: HashMap<[u8; 4], Vec<serde_json::Value>> = HashMap::new();
+        let mut selector_function_names: HashMap<[u8; 4], String> = HashMap::new();
         let mut payable_selectors: HashSet<[u8; 4]> = HashSet::new();
         let mut address_pool = Vec::new();
         let mut dict = ValueDictionary::new();
@@ -609,6 +612,11 @@ impl TxMutator {
                         if entry.get("type").and_then(|t| t.as_str()) == Some("function") {
                             if let Some(sel) = selector_from_abi_entry(entry) {
                                 selectors.push(sel);
+                                if let Some(fname) = entry.get("name").and_then(|n| n.as_str()) {
+                                    selector_function_names
+                                        .entry(sel)
+                                        .or_insert_with(|| fname.to_string());
+                                }
 
                                 // Track payable functions.
                                 if entry.get("stateMutability").and_then(|s| s.as_str())
@@ -653,9 +661,95 @@ impl TxMutator {
             selector_weights: vec![1u32; sel_len],
             selector_params,
             selector_full_params,
+            selector_function_names,
             payable_selectors,
             address_pool,
             dict,
+        }
+    }
+
+    /// Selectors whose ABI function name contains `substr` (case-insensitive).
+    pub fn selectors_matching_name(&self, substr: &str) -> Vec<[u8; 4]> {
+        let sub = substr.to_ascii_lowercase();
+        self.selector_function_names
+            .iter()
+            .filter(|(_, n)| n.to_ascii_lowercase().contains(&sub))
+            .map(|(s, _)| *s)
+            .collect()
+    }
+
+    /// Pick a contract address that declares `sel` in its ABI, if any.
+    pub fn pick_target_for_selector(&self, sel: [u8; 4], rng: &mut impl Rng) -> Address {
+        let mut addrs: Vec<Address> = Vec::new();
+        for t in &self.targets {
+            if let Some(abi) = &t.abi {
+                if let Some(entries) = abi.as_array() {
+                    for entry in entries {
+                        if entry.get("type").and_then(|x| x.as_str()) == Some("function") {
+                            if selector_from_abi_entry(entry) == Some(sel) {
+                                addrs.push(t.address);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if addrs.is_empty() {
+            self.random_target(rng)
+        } else {
+            addrs[rng.gen_range(0..addrs.len())]
+        }
+    }
+
+    /// ABI-encoded calldata starting with `sel` (for template sequences).
+    pub fn encode_calldata_for_selector(&self, sel: [u8; 4], rng: &mut impl Rng) -> Bytes {
+        let mut buf = sel.to_vec();
+        if let Some(full_inputs) = self.selector_full_params.get(&sel) {
+            for input in full_inputs {
+                let typ = input.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                if typ.starts_with("uint") {
+                    buf.extend_from_slice(&biased_token_amount(&self.dict, rng).to_be_bytes::<32>());
+                } else {
+                    buf.extend_from_slice(&generate_typed_arg_from_input(input, &self.dict, rng));
+                }
+            }
+        } else if let Some(params) = self.selector_params.get(&sel) {
+            for param_type in params {
+                if param_type.starts_with("uint") {
+                    buf.extend_from_slice(
+                        &biased_token_amount(&self.dict, rng).to_be_bytes::<32>(),
+                    );
+                } else {
+                    buf.extend_from_slice(&generate_typed_arg(param_type, &self.dict, rng));
+                }
+            }
+        } else {
+            let n: usize = rng.gen_range(0..=2);
+            for _ in 0..n {
+                buf.extend_from_slice(&biased_token_amount(&self.dict, rng).to_be_bytes::<32>());
+            }
+        }
+        Bytes::from(buf)
+    }
+
+    /// Sequence step: fixed selector, plausible calldata, sticky sender.
+    pub fn generate_in_sequence_with_selector(
+        &self,
+        sel: [u8; 4],
+        prev_sender: Option<Address>,
+        rng: &mut impl Rng,
+    ) -> Transaction {
+        let to = self.pick_target_for_selector(sel, rng);
+        let sender = self.pick_sender(prev_sender, rng);
+        let data = self.encode_calldata_for_selector(sel, rng);
+        let value = self.random_value(&data, rng);
+        Transaction {
+            sender,
+            to: Some(to),
+            data,
+            value,
+            gas_limit: 30_000_000,
         }
     }
 

@@ -1156,6 +1156,32 @@ impl InvariantRegistry {
             .collect()
     }
 
+    /// Like [`Self::check_all`] but returns per-invariant run and hit counts for telemetry.
+    pub fn check_all_tracked(
+        &self,
+        pre_balances: &HashMap<Address, U256>,
+        pre_probes: &crate::types::ProtocolProbeReport,
+        result: &ExecutionResult,
+        sequence: &[Transaction],
+    ) -> (
+        Vec<Finding>,
+        HashMap<String, u64>,
+        HashMap<String, u64>,
+    ) {
+        let mut findings = Vec::new();
+        let mut runs: HashMap<String, u64> = HashMap::new();
+        let mut hits: HashMap<String, u64> = HashMap::new();
+        for inv in &self.invariants {
+            let name = inv.name().to_string();
+            *runs.entry(name.clone()).or_insert(0) += 1;
+            if let Some(f) = inv.check(pre_balances, pre_probes, result, sequence) {
+                *hits.entry(name).or_insert(0) += 1;
+                findings.push(f);
+            }
+        }
+        (findings, runs, hits)
+    }
+
     /// Convenience constructor that registers the built-in invariants.
     pub fn with_defaults(attacker: Address) -> Self {
         Self::with_defaults_and_profiles(attacker, None)

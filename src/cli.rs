@@ -165,11 +165,11 @@ pub struct ForgeArgs {
     pub max_snapshots: usize,
 
     /// RPC URL for forked execution
-    #[arg(long)]
+    #[arg(long, visible_alias = "fork-url")]
     pub fork_url: Option<String>,
 
     /// Block number for forked execution
-    #[arg(long)]
+    #[arg(long, visible_alias = "fork-block-number")]
     pub fork_block: Option<u64>,
 
     /// Funder / primary `msg.sender` for fuzz transactions (default: 0x4242…4242)
@@ -304,16 +304,16 @@ pub struct BenchmarkArgs {
 /// Arguments for the `audit` subcommand
 #[derive(Parser, Debug)]
 pub struct AuditArgs {
-    /// On-chain contract address(es) to fuzz against the fork (one or more)
-    #[arg(required = true)]
+    /// `0x` contract address(es), or a single path to a JSON manifest (`chain_id` + `targets`)
+    #[arg(required = true, num_args = 1..)]
     pub addresses: Vec<String>,
 
     /// RPC URL for on-chain access
-    #[arg(long)]
+    #[arg(long, visible_alias = "fork-url")]
     pub rpc_url: Option<String>,
 
     /// Block number to fork from
-    #[arg(long)]
+    #[arg(long, visible_alias = "fork-block-number")]
     pub block_number: Option<u64>,
 
     /// Funder / primary `msg.sender` for fuzz transactions (default: 0x4242…4242)
@@ -377,11 +377,11 @@ pub struct TestArgs {
     pub snapshots: bool,
 
     /// RPC URL for forked execution
-    #[arg(long)]
+    #[arg(long, visible_alias = "fork-url")]
     pub fork_url: Option<String>,
 
     /// Block number for forked execution
-    #[arg(long)]
+    #[arg(long, visible_alias = "fork-block-number")]
     pub fork_block: Option<u64>,
 
     /// Output format for test results
