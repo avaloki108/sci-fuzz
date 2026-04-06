@@ -71,6 +71,23 @@ pub struct TxCheatcodeState {
     /// Deferred bytecode installations from `vm.etch()`.  Applied after the
     /// transaction commits.
     pub pending_etches: Vec<(Address, alloy_primitives::Bytes)>,
+    /// Mocked calls registered via `vm.mockCall`.  When a sub-call's target
+    /// address matches and its calldata starts with the recorded prefix,
+    /// the mock's return data (or revert) is returned instead of executing.
+    pub mocked_calls: Vec<MockCall>,
+}
+
+/// A single mocked call record.
+#[derive(Debug, Clone)]
+pub struct MockCall {
+    /// Target address to intercept.
+    pub target: Address,
+    /// Calldata prefix to match (empty = match any calldata to this address).
+    pub calldata_prefix: alloy_primitives::Bytes,
+    /// Return data to inject on match.
+    pub ret_data: alloy_primitives::Bytes,
+    /// If true, the mocked call should revert instead of returning.
+    pub revert: bool,
 }
 
 impl TxCheatcodeState {
@@ -318,13 +335,61 @@ pub fn dispatch<DB: revm::Database>(
         return (true, bytes::Bytes::new());
     }
 
-    // ── Mock calls (accept silently / no mock storage yet) ───────────────────
+    // ── Mock calls ──────────────────────────────────────────────────────────
 
-    if sel == selector(b"mockCall(address,bytes,bytes)")
-        || sel == selector(b"mockCall(address,uint256,bytes,bytes)")
-        || sel == selector(b"clearMockedCalls()")
-        || sel == selector(b"mockCallRevert(address,bytes,bytes)")
-    {
+    if sel == selector(b"mockCall(address,bytes,bytes)") {
+        // mockCall(address target, bytes calldata, bytes retData)
+        // target at 0..32, calldata offset/length at 32..64, retData offset/length at 64..96
+        if args.len() >= 96 {
+            let target = decode_address_word(args);
+            let calldata = decode_abi_bytes(args, 32);
+            let ret_data = decode_abi_bytes(args, 64);
+            state.mocked_calls.push(MockCall {
+                target,
+                calldata_prefix: calldata,
+                ret_data,
+                revert: false,
+            });
+        }
+        return (true, bytes::Bytes::new());
+    }
+
+    if sel == selector(b"mockCall(address,uint256,bytes,bytes)") {
+        // mockCall(address target, uint256 msgValue, bytes calldata, bytes retData)
+        // Same as above but with an explicit msg.value — value is ignored in
+        // the mock matching (we match on address + calldata prefix only).
+        if args.len() >= 128 {
+            let target = decode_address_word(args);
+            let calldata = decode_abi_bytes(args, 64);
+            let ret_data = decode_abi_bytes(args, 96);
+            state.mocked_calls.push(MockCall {
+                target,
+                calldata_prefix: calldata,
+                ret_data,
+                revert: false,
+            });
+        }
+        return (true, bytes::Bytes::new());
+    }
+
+    if sel == selector(b"mockCallRevert(address,bytes,bytes)") {
+        // mockCallRevert(address target, bytes calldata, bytes revertData)
+        if args.len() >= 96 {
+            let target = decode_address_word(args);
+            let calldata = decode_abi_bytes(args, 32);
+            let revert_data = decode_abi_bytes(args, 64);
+            state.mocked_calls.push(MockCall {
+                target,
+                calldata_prefix: calldata,
+                ret_data: revert_data,
+                revert: true,
+            });
+        }
+        return (true, bytes::Bytes::new());
+    }
+
+    if sel == selector(b"clearMockedCalls()") {
+        state.mocked_calls.clear();
         return (true, bytes::Bytes::new());
     }
 
@@ -471,6 +536,53 @@ pub fn dispatch<DB: revm::Database>(
 // journaled_state via sload.
 // The executor applies them after the transaction commits.
 
+/// Decode an ABI `bytes` argument starting at the given word offset.
+/// ABI `bytes` is encoded as (offset, length, data...).
+/// This reads the length from offset+32, then extracts that many bytes
+/// starting at the dynamic data location (offset + length_word).
+fn decode_abi_bytes(args: &[u8], word_offset: usize) -> alloy_primitives::Bytes {
+    if args.len() < word_offset + 32 {
+        return alloy_primitives::Bytes::new();
+    }
+    // The word at word_offset is either the data pointer (if offset >= 64)
+    // or the length (for the simpler encoding).  Forge encodes `bytes` as:
+    //   [32-byte offset into args][32-byte length][length bytes of data]
+    // The offset word points to where length + data starts.
+    let ptr = decode_u256_word(&args[word_offset..]).saturating_to::<usize>();
+    if ptr + 32 > args.len() {
+        return alloy_primitives::Bytes::new();
+    }
+    let len = decode_u256_word(&args[ptr..]).saturating_to::<usize>();
+    let data_start = ptr + 32;
+    if len == 0 || data_start + len > args.len() {
+        return alloy_primitives::Bytes::new();
+    }
+    alloy_primitives::Bytes::copy_from_slice(&args[data_start..data_start + len])
+}
+
+/// Try to match a sub-call against registered mocked calls.
+/// Returns `Some((ret_data, revert))` if a mock matches, `None` otherwise.
+///
+/// Matching logic: target address must match AND calldata must start with
+/// the recorded prefix (or prefix is empty = match all).
+pub fn try_match_mock(
+    mocked_calls: &[MockCall],
+    target: Address,
+    calldata: &[u8],
+) -> Option<(alloy_primitives::Bytes, bool)> {
+    for mock in mocked_calls.iter().rev() {
+        // Most-recently-added mock takes priority (LIFO)
+        if mock.target != target {
+            continue;
+        }
+        if !mock.calldata_prefix.is_empty() && !calldata.starts_with(mock.calldata_prefix.as_ref()) {
+            continue;
+        }
+        return Some((mock.ret_data.clone(), mock.revert));
+    }
+    None
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -529,5 +641,87 @@ mod tests {
         let addr = FORGE_VM_ADDRESS;
         assert_eq!(addr.0[0], 0x71);
         assert_eq!(addr.0[19], 0x2d);
+    }
+
+    #[test]
+    fn test_try_match_mock() {
+        let target = Address::from([0xAA; 20]);
+        let selector = [0xDE, 0xAD, 0xBE, 0xEF];
+        let ret_data = alloy_primitives::Bytes::from_static(b"mocked");
+
+        let mocks = vec![MockCall {
+            target,
+            calldata_prefix: alloy_primitives::Bytes::copy_from_slice(&selector),
+            ret_data: ret_data.clone(),
+            revert: false,
+        }];
+
+        // Exact match
+        let calldata = [selector.as_ref(), &[0x01, 0x02]].concat();
+        let result = try_match_mock(&mocks, target, &calldata);
+        assert!(result.is_some());
+        let (data, rev) = result.unwrap();
+        assert_eq!(data.as_ref(), b"mocked");
+        assert!(!rev);
+
+        // Wrong address → no match
+        let result = try_match_mock(&mocks, Address::from([0xBB; 20]), &calldata);
+        assert!(result.is_none());
+
+        // Wrong calldata prefix → no match
+        let wrong_calldata = [0xFF, 0xFF, 0xFF, 0xFF, 0x01];
+        let result = try_match_mock(&mocks, target, &wrong_calldata);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_try_match_mock_empty_prefix() {
+        let target = Address::from([0xAA; 20]);
+        let ret_data = alloy_primitives::Bytes::from_static(b"any");
+        let mocks = vec![MockCall {
+            target,
+            calldata_prefix: alloy_primitives::Bytes::new(),
+            ret_data: ret_data.clone(),
+            revert: false,
+        }];
+
+        let result = try_match_mock(&mocks, target, &[0x01, 0x02, 0x03]);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_try_match_mock_revert() {
+        let target = Address::from([0xAA; 20]);
+        let mocks = vec![MockCall {
+            target,
+            calldata_prefix: alloy_primitives::Bytes::new(),
+            ret_data: alloy_primitives::Bytes::from_static(b"error"),
+            revert: true,
+        }];
+
+        let (_, rev) = try_match_mock(&mocks, target, &[]).unwrap();
+        assert!(rev);
+    }
+
+    #[test]
+    fn test_try_match_mock_lifo_priority() {
+        let target = Address::from([0xAA; 20]);
+        let mocks = vec![
+            MockCall {
+                target,
+                calldata_prefix: alloy_primitives::Bytes::new(),
+                ret_data: alloy_primitives::Bytes::from_static(b"first"),
+                revert: false,
+            },
+            MockCall {
+                target,
+                calldata_prefix: alloy_primitives::Bytes::new(),
+                ret_data: alloy_primitives::Bytes::from_static(b"second"),
+                revert: false,
+            },
+        ];
+
+        let (data, _) = try_match_mock(&mocks, target, &[]).unwrap();
+        assert_eq!(data.as_ref(), b"second");
     }
 }

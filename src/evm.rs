@@ -92,6 +92,27 @@ impl<DB: Database> Inspector<DB> for CoverageInspector {
             });
         }
 
+        // ── Mock call interception ────────────────────────────────────────────
+        if let Some((ret_data, revert)) = cheatcodes::try_match_mock(
+            &self.cheatcodes.mocked_calls,
+            inputs.target_address,
+            inputs.input.as_ref(),
+        ) {
+            let instruction_result = if revert {
+                InstructionResult::Revert
+            } else {
+                InstructionResult::Return
+            };
+            return Some(CallOutcome {
+                result: InterpreterResult {
+                    result: instruction_result,
+                    output: ret_data.into(),
+                    gas: Gas::new(inputs.gas_limit),
+                },
+                memory_offset: inputs.return_memory_offset.clone(),
+            });
+        }
+
         // ── Prank: override msg.sender for non-Vm calls ───────────────────────
         if let Some(override_sender) = self.cheatcodes.take_caller_override() {
             inputs.caller = override_sender;
