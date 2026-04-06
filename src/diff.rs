@@ -275,7 +275,7 @@ pub fn run_diff(args: &DiffArgs) -> Result<DiffResult> {
 
             if ra.success && rb.success {
                 // Both succeeded — compare outputs
-                let output_differs = if let Some(sel_val) = sel {
+                let output_differs = if let Some(_sel_val) = sel {
                     // Try to check if this is a shared function with known return types
                     // For MVP, do a raw comparison
                     ra.output != rb.output

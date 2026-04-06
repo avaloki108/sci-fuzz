@@ -189,10 +189,16 @@ impl Project {
         let config = if config_path.exists() {
             let config_str = std::fs::read_to_string(&config_path)
                 .map_err(|e| Error::Project(format!("Failed to read foundry.toml: {}", e)))?;
-            Some(
-                toml::from_str(&config_str)
-                    .map_err(|e| Error::Project(format!("Failed to parse foundry.toml: {}", e)))?,
-            )
+            match toml::from_str(&config_str) {
+                Ok(parsed) => Some(parsed),
+                Err(e) => {
+                    tracing::warn!(
+                        "[project] foundry.toml parse error (ignoring, will use pre-built artifacts): {}",
+                        e
+                    );
+                    None
+                }
+            }
         } else {
             None
         };
@@ -864,16 +870,49 @@ fn decode_hex_bytes(raw: &str, artifact_path: &Path) -> Result<Option<Bytes>> {
         return Ok(None);
     }
 
-    // Forge emits __LibraryName__ placeholders in bytecode when a library hasn't
-    // been linked yet. These artifacts can't be deployed — treat as empty bytecode
-    // so they get filtered out downstream rather than crashing the campaign.
-    if trimmed.contains('_') {
+    // Forge emits __$hash$__ placeholders (40 hex chars = 20 bytes) in unlinked
+    // bytecode.  Replace them with zero-bytes so we can decode and store the
+    // creation bytecode; the real library addresses are patched in later by the
+    // bootstrap library-linking pre-pass.
+    let hex_str: std::borrow::Cow<str> = if trimmed.contains('_') {
+        let replaced = {
+            // Each placeholder is exactly 40 chars: __$<34-char hash>$__
+            let mut out = String::with_capacity(trimmed.len());
+            let bytes = trimmed.as_bytes();
+            let mut i = 0usize;
+            while i < bytes.len() {
+                if bytes[i] == b'_' && i + 3 < bytes.len() && bytes[i + 1] == b'_' && bytes[i + 2] == b'$' {
+                    // Find closing $__
+                    if let Some(rel) = bytes[i + 3..].windows(3).position(|w| w == b"$__") {
+                        // placeholder spans from i to i+3+rel+3 = i + rel + 6
+                        // it should be 40 chars total
+                        let end = i + 3 + rel + 3;
+                        let placeholder_len = end - i;
+                        // emit that many zero hex chars (must be even; placeholder is 40)
+                        for _ in 0..(placeholder_len / 2) {
+                            out.push_str("00");
+                        }
+                        if placeholder_len % 2 != 0 {
+                            out.push('0');
+                        }
+                        i = end;
+                        continue;
+                    }
+                }
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+            out
+        };
         tracing::debug!(
-            "[project] skipping unlinked-library artifact (contains placeholders): {}",
+            "[project] replaced link placeholders with zeros in artifact: {}",
             artifact_path.display()
         );
-        return Ok(None);
-    }
+        std::borrow::Cow::Owned(replaced)
+    } else {
+        std::borrow::Cow::Borrowed(trimmed)
+    };
+    let trimmed = hex_str.as_ref();
 
     let bytes = hex::decode(trimmed).map_err(|err| {
         Error::Project(format!(

@@ -255,7 +255,7 @@ impl ResolvedCampaignSettings {
             .unwrap_or_default();
 
         // Output format: CLI wins over config file
-        let output_format = if let Some(ref fmt) = config.output.format {
+        let _output_format = if let Some(ref fmt) = config.output.format {
             fmt.parse::<OutputFormat>().unwrap_or(OutputFormat::Text)
         } else {
             OutputFormat::Text

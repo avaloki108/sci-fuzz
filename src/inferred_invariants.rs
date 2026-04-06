@@ -26,7 +26,7 @@ use crate::types::{
 use crate::invariant::Invariant;
 
 use alloy_json_abi::JsonAbi;
-use tiny_keccak::{Hasher, Keccak};
+use tiny_keccak::Hasher;
 
 // ---------------------------------------------------------------------------
 // Helper: selectors associated with governance / privileged operations

@@ -1189,7 +1189,7 @@ impl InvariantRegistry {
 
     /// Assertion-mode registry: only registers EchidnaProperty and UnexpectedRevert.
     /// Used when `TestMode::Assertion` is active to suppress economic oracle noise.
-    pub fn with_assertion_mode(attacker: Address) -> Self {
+    pub fn with_assertion_mode(_attacker: Address) -> Self {
         let mut reg = Self::new();
         reg.add(Box::new(UnexpectedRevert::default()));
         reg.add(Box::new(EchidnaProperty));

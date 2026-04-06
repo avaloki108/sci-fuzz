@@ -1747,7 +1747,7 @@ fn save_source_coverage_to_dir(
     deployed_targets: &[ContractInfo],
     dir: &std::path::Path,
 ) {
-    use crate::source_map::{BytecodeSourceMap, SourceCoverageReport};
+    use crate::source_map::SourceCoverageReport;
     use std::collections::HashMap;
 
     // Build per-contract source-map metadata.
