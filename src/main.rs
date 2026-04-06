@@ -242,6 +242,7 @@ fn handle_forge(args: sci_fuzz::cli::ForgeArgs) -> Result<()> {
         extra_senders,
         target_weights,
         selector_weights,
+        auto_rank_targets: args.auto_rank_targets,
         ..Default::default()
     };
 
@@ -600,6 +601,7 @@ fn handle_test(args: sci_fuzz::cli::TestArgs) -> Result<()> {
         rpc_url: args.fork_url.clone(),
         rpc_block_number: args.fork_block,
         test_mode: args.mode,
+        auto_rank_targets: args.auto_rank_targets,
         ..Default::default()
     };
 

@@ -251,6 +251,10 @@ pub struct ForgeArgs {
     /// Only run invariants matching these name prefixes (comma-separated).
     #[arg(long, value_delimiter = ',')]
     pub invariant_prefix: Vec<String>,
+
+    /// Weight higher-value targets (mutating / token / oracle-like ABIs) more often.
+    #[arg(long)]
+    pub auto_rank_targets: bool,
 }
 
 /// Arguments for the `benchmark` subcommand
@@ -399,6 +403,10 @@ pub struct TestArgs {
     /// Testing mode: controls which oracles and property checks are active.
     #[arg(short = 'm', long, default_value = "property")]
     pub mode: TestMode,
+
+    /// Weight higher-value targets (mutating / token / oracle-like ABIs) more often.
+    #[arg(long)]
+    pub auto_rank_targets: bool,
 }
 
 /// Arguments for the `ci` subcommand

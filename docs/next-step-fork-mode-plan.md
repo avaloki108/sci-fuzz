@@ -20,21 +20,19 @@ Move from “campaign runs on repos” to **meaningful fork-based fuzzing** of l
 
 ### Address manifest JSON
 
-Preferred (engineering default):
+Preferred:
 
 ```json
 {
   "chain_id": 1,
   "targets": [
-    { "name": "Vault", "address": "0x…" },
-    { "name": "Router", "address": "0x…" }
+    { "name": "Vault", "address": "0x0000000000000000000000000000000000000001" },
+    { "name": "Router", "address": "0x0000000000000000000000000000000000000002" }
   ]
 }
 ```
 
-Also supported:
-
-- `chainId` (alias), `rpcLabel`, legacy `contracts` map `{ "Name": "0x…" }`.
+Also supported: `chainId` (alias for `chain_id`), `rpcLabel`, and legacy `contracts` as `{ "Vault": "0x…" }`.
 
 Manifest `chain_id` is applied to `CampaignConfig.fork_expected_chain_id` when set (with `FORK_CHAIN_ID` env override).
 
