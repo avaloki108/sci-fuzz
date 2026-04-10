@@ -1049,6 +1049,11 @@ pub struct CampaignConfig {
     /// This allows harness setUp() to deploy contracts that aren't fuzz targets.
     #[serde(default)]
     pub all_artifacts: Vec<ContractInfo>,
+    /// Use the LibAFL-backed campaign loop instead of the legacy custom loop.
+    /// Enables CmpLog, Z3 concolic, coverage-guided corpus minimization.
+    /// Default: false (legacy loop for backwards compatibility).
+    #[serde(default)]
+    pub use_libafl: bool,
 }
 
 fn default_true() -> bool {
@@ -1115,6 +1120,7 @@ impl Default for CampaignConfig {
             cmp_log_ratio: None,
             auto_rank_targets: false,
             protocol_semantic_oracles: true,
+            use_libafl: false,
         }
     }
 }

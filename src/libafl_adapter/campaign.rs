@@ -186,6 +186,7 @@ impl LibAflCampaign {
             }
         }
 
+        eprintln!("[libafl_campaign] starting fuzz_loop_for with {} iters", self.max_iters);
         fuzzer.fuzz_loop_for(
             &mut stages,
             &mut executor,
@@ -193,6 +194,7 @@ impl LibAflCampaign {
             &mut mgr,
             self.max_iters,
         )?;
+        eprintln!("[libafl_campaign] fuzz_loop_for complete");
 
         let corpus_size = state.corpus().count();
         let executions = *state.executions();

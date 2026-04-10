@@ -155,7 +155,9 @@ impl<DB: Database> Inspector<DB> for CoverageInspector {
         _inputs: &CallInputs,
         outcome: CallOutcome,
     ) -> CallOutcome {
-        eprintln!("[call_end] depth: {} -> {}, result: {:?}", self.call_depth, self.call_depth.saturating_sub(1), outcome.result.result);
+        if std::env::var("CF_TRACE").is_ok() {
+            eprintln!("[call_end] depth: {} -> {}, result: {:?}", self.call_depth, self.call_depth.saturating_sub(1), outcome.result.result);
+        }
         if self.call_depth > 0 {
             self.call_depth -= 1;
         }
@@ -168,11 +170,12 @@ impl<DB: Database> Inspector<DB> for CoverageInspector {
             .bytecode_address
             .unwrap_or(interp.contract.target_address);
 
-        // Debug: log ALL instructions to understand the full execution flow
         let pc = interp.program_counter();
         let op = interp.current_opcode();
-        eprintln!("[step] addr={:?} pc={} op={:#04x} ({}) depth={}",
-            address, pc, op as u16, op as u8, self.call_depth);
+        if std::env::var("CF_TRACE").is_ok() {
+            eprintln!("[step] addr={:?} pc={} op={:#04x} ({}) depth={}",
+                address, pc, op as u16, op as u8, self.call_depth);
+        }
 
         if self.last_coverage_address != Some(address) {
             self.prev_pc = None;
@@ -510,8 +513,10 @@ impl EvmExecutor {
         // CREATE uses the deployer's on-chain nonce (including forked state).
         let nonce_before = self.deployer_nonce(deployer);
 
-        eprintln!("[deploy] starting CREATE: deployer={:?}, nonce={}, bytecode_len={}",
-            deployer, nonce_before, bytecode.len());
+        if std::env::var("CF_TRACE").is_ok() {
+            eprintln!("[deploy] starting CREATE: deployer={:?}, nonce={}, bytecode_len={}",
+                deployer, nonce_before, bytecode.len());
+        }
 
         let tx = Transaction {
             sender: deployer,
@@ -523,13 +528,15 @@ impl EvmExecutor {
 
         let result = self.execute(&tx).context("deploy transaction failed")?;
 
-        eprintln!("[deploy] CREATE result: success={}, output_len={}, state_diff_keys={}",
-            result.success, result.output.len(), result.state_diff.storage_writes.len());
-
+        if std::env::var("CF_TRACE").is_ok() {
+            eprintln!("[deploy] CREATE result: success={}, output_len={}, state_diff_keys={}",
+                result.success, result.output.len(), result.state_diff.storage_writes.len());
+            if !result.success {
+                eprintln!("[deploy] CREATE failed: success={}, output_len={}, output=0x{}",
+                    result.success, result.output.len(), hex::encode(&result.output));
+            }
+        }
         if !result.success {
-            // Debug: print the actual execution result for debugging
-            eprintln!("[deploy] CREATE failed: success={}, output_len={}, output=0x{}",
-                result.success, result.output.len(), hex::encode(&result.output));
             return Err(anyhow!(
                 "deploy reverted: 0x{} (output length: {})",
                 hex::encode(&result.output),

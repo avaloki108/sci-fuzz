@@ -6,7 +6,7 @@ use std::process;
 
 use anyhow::{Context, Result};
 use chimera_fuzz::campaign::Campaign;
-use chimera_fuzz::types::{Address, Bytes, CampaignConfig, ContractInfo, ExecutorMode};
+use chimera_fuzz::types::{Address, Bytes, CampaignConfig, ContractInfo, ExecutorMode, Finding};
 
 #[cfg(feature = "cli")]
 use clap::Parser;
@@ -14,8 +14,108 @@ use clap::Parser;
 #[cfg(feature = "cli")]
 use chimera_fuzz::cli::{Cli, Commands};
 
-fn main() {
-    #[cfg(feature = "cli")]
+/// Bridge: run a campaign using the LibAFL backend.
+/// Translates CampaignConfig → LibAflCampaign, returns (findings, total_execs, elapsed_ms).
+fn run_libafl_campaign(config: CampaignConfig) -> Result<(Vec<Finding>, u64, u64)> {
+    use chimera_fuzz::{
+        evm::EvmExecutor,
+        libafl_adapter::campaign::LibAflCampaign,
+        types::Bytes,
+    };
+    use std::time::Instant;
+
+    let t0 = Instant::now();
+    let attacker = config.attacker_address.unwrap_or(Address::repeat_byte(0x42));
+    let deployer = attacker; // use same address as deployer for access control oracle
+
+    // Build and seed the EVM.
+    let mut evm = EvmExecutor::new();
+    evm.set_balance(attacker, chimera_fuzz::types::U256::from(100_000_000_000_000_000_000_u128));
+    for (addr, bal) in &config.fork_fund_addresses {
+        evm.set_balance(*addr, *bal);
+    }
+
+    // Deploy all target contracts.
+    let mut deployed_targets = Vec::new();
+    for target in &config.targets {
+        if target.deployed_bytecode.is_empty() {
+            deployed_targets.push(target.clone());
+            continue;
+        }
+        if let Some(creation) = &target.creation_bytecode {
+            match evm.deploy(deployer, creation.clone()) {
+                Ok(addr) => {
+                    let code = evm.get_code(addr).map(|b| b.to_vec()).unwrap_or_default();
+                    let mut t = target.clone();
+                    t.address = addr;
+                    t.deployed_bytecode = code.into();
+                    deployed_targets.push(t);
+                }
+                Err(_) => {
+                    // Constructor requires args (e.g. attacker contracts) —
+                    // etch the deployed bytecode directly at the target address.
+                    eprintln!("[libafl] deploy {} via CREATE failed, etching deployed bytecode instead",
+                        target.name.as_deref().unwrap_or("?"));
+                    let bytecode = chimera_fuzz::evm::RevmBytecode::new_legacy(
+                        target.deployed_bytecode.clone());
+                    let info = chimera_fuzz::evm::RevmAccountInfo {
+                        code: Some(bytecode),
+                        ..Default::default()
+                    };
+                    evm.insert_account_info(target.address, info);
+                    deployed_targets.push(target.clone());
+                }
+            }
+        } else {
+            let bytecode = chimera_fuzz::evm::RevmBytecode::new_legacy(
+                target.deployed_bytecode.clone());
+            let info = chimera_fuzz::evm::RevmAccountInfo {
+                code: Some(bytecode),
+                ..Default::default()
+            };
+            evm.insert_account_info(target.address, info);
+            deployed_targets.push(target.clone());
+        }
+    }
+
+    // Compute max_iters from timeout or max_execs.
+    // LibAFL runs single-threaded; cap iterations to avoid OOM in release mode.
+    let max_iters = config.max_execs.unwrap_or_else(|| {
+        let secs = config.timeout.as_secs();
+        if secs <= 60 { 10_000 }
+        else if secs <= 300 { 100_000 }
+        else { 500_000 }
+    });
+
+    // Filter down to contracts with real ABI/bytecode; cap at 8 to keep selector pool manageable.
+    let deployed_targets: Vec<_> = deployed_targets.into_iter()
+        .filter(|t| !t.deployed_bytecode.is_empty() && t.abi.is_some())
+        .take(8)
+        .collect();
+    eprintln!("[libafl] {} real targets selected for fuzzing", deployed_targets.len());
+
+    let result = LibAflCampaign::builder()
+        .evm(evm)
+        .targets(deployed_targets)
+        .attacker(attacker)
+        .deployer(deployer)
+        .seed(config.seed)
+        .max_iters(max_iters)
+        .test_mode(config.test_mode)
+        .build()
+        .map_err(|e| anyhow::anyhow!("LibAflCampaign build error: {e}"))?
+        .run()
+        .map_err(|e| anyhow::anyhow!("LibAflCampaign run error: {e}"))?;
+    let elapsed_ms = t0.elapsed().as_millis() as u64;
+    eprintln!("\n[LibAFL] {} execs in {}ms ({:.0} execs/sec), {} corpus entries, {} findings",
+        result.executions, elapsed_ms,
+        result.executions as f64 / (elapsed_ms as f64 / 1000.0).max(0.001),
+        result.corpus_size, result.findings.len());
+
+    Ok((result.findings, result.executions, elapsed_ms))
+}
+
+fn main() {    #[cfg(feature = "cli")]
     {
         let cli = Cli::parse();
         init_logging(&cli.verbosity);
@@ -262,8 +362,22 @@ fn handle_forge(args: chimera_fuzz::cli::ForgeArgs) -> Result<()> {
         target_weights,
         selector_weights,
         auto_rank_targets: args.auto_rank_targets,
+        use_libafl: args.libafl,
         ..Default::default()
     };
+
+    // Route to LibAFL backend if --libafl flag is set.
+    if config.use_libafl {
+        println!("🚀 [LibAFL] Starting campaign with CmpLog + Z3 concolic backend...");
+        let (findings, total_execs, elapsed_ms) = run_libafl_campaign(config)?;
+        let finding_count = findings.len();
+        chimera_fuzz::output::print_campaign_summary(
+            &findings, total_execs, elapsed_ms,
+            finding_count, finding_count, None, None,
+            !args.no_replay,
+        );
+        return Ok(());
+    }
 
     let mut campaign = Campaign::new(config);
     let report = campaign.run_with_report()?;
@@ -631,8 +745,27 @@ fn handle_test(args: chimera_fuzz::cli::TestArgs) -> Result<()> {
         rpc_block_number: args.fork_block,
         test_mode: args.mode,
         auto_rank_targets: args.auto_rank_targets,
+        use_libafl: args.libafl,
         ..Default::default()
     };
+
+    // Route to LibAFL backend if --libafl flag is set.
+    if config.use_libafl {
+        println!("🚀 [LibAFL] Starting audit with CmpLog + Z3 concolic backend...");
+        let (findings, total_execs, elapsed_ms) = run_libafl_campaign(config)?;
+        if findings.is_empty() {
+            println!("✅ No invariant violations found. ({total_execs} execs in {elapsed_ms}ms)");
+            return Ok(());
+        }
+        println!("🐛 Found {} invariant violation(s):", findings.len());
+        for (i, f) in findings.iter().enumerate() {
+            println!("  [{i}] [{}] {}", f.severity, f.title);
+        }
+        if args.fail_fast {
+            anyhow::bail!("campaign reported findings and --fail-fast is set");
+        }
+        return Ok(());
+    }
 
     let mut campaign = Campaign::new(config);
     let findings = campaign.run()?;

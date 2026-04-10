@@ -219,6 +219,11 @@ pub struct ForgeArgs {
     #[arg(long)]
     pub system_mode: bool,
 
+    /// Use the LibAFL-backed campaign loop (CmpLog, Z3 concolic, coverage-guided corpus).
+    /// Significantly better at finding reentrancy, access control, and value-barrier bugs.
+    #[arg(long)]
+    pub libafl: bool,
+
     /// Enable ABI-inferred invariants (access control, pause, supply, getters).
     /// Enabled by default; use --no-infer-invariants to disable.
     #[arg(long, default_value = "true")]
@@ -407,6 +412,10 @@ pub struct TestArgs {
     /// Weight higher-value targets (mutating / token / oracle-like ABIs) more often.
     #[arg(long)]
     pub auto_rank_targets: bool,
+
+    /// Use the LibAFL-backed campaign loop (CmpLog, Z3 concolic, coverage-guided corpus).
+    #[arg(long)]
+    pub libafl: bool,
 }
 
 /// Arguments for the `ci` subcommand
@@ -431,6 +440,10 @@ pub struct CiArgs {
     /// Fail on high findings
     #[arg(long)]
     pub fail_on_high: bool,
+
+    /// Use the LibAFL-backed campaign loop (CmpLog, Z3 concolic, coverage-guided corpus).
+    #[arg(long)]
+    pub libafl: bool,
 
     /// Timeout in seconds
     #[arg(long, default_value = "600")]
