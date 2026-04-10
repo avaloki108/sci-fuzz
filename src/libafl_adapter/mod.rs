@@ -28,6 +28,10 @@ pub use mutators::{AbiCalldataMutator, SenderValueMutator, SequenceStructureMuta
 pub mod cmplog;
 pub use cmplog::CmpLogMutator;
 
-// pub mod scheduler;  // Phase 5
+pub mod scheduler;
+pub use scheduler::{make_rand, CorpusStats};
+// build_coverage_pipeline! macro is exported at crate root via #[macro_export]
+
+// pub mod campaign;   // Phase 6
 // pub mod campaign;   // Phase 6
 // pub mod concolic;   // Phase 7
