@@ -61,6 +61,14 @@ pub struct SharedCoverageMap {
     inner: UnsafeCell<[u8; MAP_SIZE]>,
 }
 
+impl Default for SharedCoverageMap {
+    fn default() -> Self {
+        Self {
+            inner: UnsafeCell::new([0u8; MAP_SIZE]),
+        }
+    }
+}
+
 // SAFETY: chimerafuzz is single-threaded per campaign worker.
 unsafe impl Sync for SharedCoverageMap {}
 
@@ -136,8 +144,12 @@ fn edge_slot(addr: &Address, prev_pc: usize, curr_pc: usize) -> usize {
 /// Wraps `HitcountsMapObserver<StdMapObserver<u8>>` — LibAFL's standard
 /// AFL-style hitcount bucketing observer. It reads from the `SharedCoverageMap`
 /// that `LibAflEvmExecutor` wrote into.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(bound = "")]
 pub struct EvmCoverageObserver {
     /// The shared bitmap (executor writes, observer reads).
+    /// Skipped in serialization — recreated from SharedCoverageMap on restore.
+    #[serde(skip)]
     shared: Arc<SharedCoverageMap>,
     /// Name for LibAFL's metadata registry.
     name: Cow<'static, str>,

@@ -18,6 +18,7 @@ use core::{
 };
 
 use libafl::inputs::Input;
+use libafl_bolts::HasLen;
 use serde::{Deserialize, Serialize};
 
 use crate::types::Transaction;
@@ -66,6 +67,13 @@ impl EvmInput {
 impl Hash for EvmInput {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.transactions.hash(state);
+    }
+}
+
+/// LibAFL `HasLen` trait — used by the minimizer scheduler to prefer shorter inputs.
+impl HasLen for EvmInput {
+    fn len(&self) -> usize {
+        self.transactions.len()
     }
 }
 

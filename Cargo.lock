@@ -740,6 +740,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "tuple_list",
  "ureq",
  "walkdir",
 ]

@@ -565,6 +565,7 @@ fn biased_token_amount(dict: &ValueDictionary, rng: &mut impl Rng) -> U256 {
 // ---------------------------------------------------------------------------
 
 /// Generates and mutates transactions targeting smart contracts.
+#[derive(Clone)]
 pub struct TxMutator {
     /// Known contract targets.
     targets: Vec<ContractInfo>,
