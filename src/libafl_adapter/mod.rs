@@ -19,8 +19,9 @@
 pub mod input;
 pub use input::EvmInput;
 
-// pub mod executor;   // Phase 2
-// pub mod observer;   // Phase 2
+pub mod observer;
+pub use observer::{EvmCoverageObserver, LibAflEvmExecutor, SharedCoverageMap, MAP_SIZE};
+
 // pub mod mutators;   // Phase 3
 // pub mod scheduler;  // Phase 5
 // pub mod campaign;   // Phase 6
