@@ -1,18 +1,18 @@
-//! sci-fuzz — Smart Contract Invariant Fuzzer
+//! chimerafuzz — Next-Generation Smart Contract Fuzzer
 //!
 //! CLI entry point.
 
 use std::process;
 
 use anyhow::{Context, Result};
-use sci_fuzz::campaign::Campaign;
-use sci_fuzz::types::{Address, Bytes, CampaignConfig, ContractInfo, ExecutorMode};
+use chimera_fuzz::campaign::Campaign;
+use chimera_fuzz::types::{Address, Bytes, CampaignConfig, ContractInfo, ExecutorMode};
 
 #[cfg(feature = "cli")]
 use clap::Parser;
 
 #[cfg(feature = "cli")]
-use sci_fuzz::cli::{Cli, Commands};
+use chimera_fuzz::cli::{Cli, Commands};
 
 fn main() {
     #[cfg(feature = "cli")]
@@ -28,7 +28,7 @@ fn main() {
 
     #[cfg(not(feature = "cli"))]
     {
-        eprintln!("sci-fuzz was compiled without the `cli` feature.");
+        eprintln!("chimerafuzz was compiled without the `cli` feature.");
         eprintln!("Re-build with: cargo build --features cli");
         process::exit(1);
     }
@@ -57,19 +57,20 @@ fn run(cli: Cli) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "cli")]
-fn handle_benchmark(args: sci_fuzz::cli::BenchmarkArgs) -> Result<()> {
-    use sci_fuzz::benchmark::{
-        efcf_demo_plan, plan_for_foundry_project, run_benchmark_plan, write_benchmark_artifacts,
+fn handle_benchmark(args: chimera_fuzz::cli::BenchmarkArgs) -> Result<()> {
+    use chimera_fuzz::benchmark::{
+        efcf_demo_plan, efcf_matrix_plan, plan_for_foundry_project, run_benchmark_plan,
+        write_benchmark_artifacts, write_benchmark_matrix_report_json,
     };
-    use sci_fuzz::scoreboard::BenchmarkEngine;
+    use chimera_fuzz::scoreboard::BenchmarkEngine;
 
     let engines: Vec<BenchmarkEngine> = args
         .engines
         .iter()
         .map(|engine| match engine {
-            sci_fuzz::cli::BenchmarkEngineArg::SciFuzz => BenchmarkEngine::SciFuzz,
-            sci_fuzz::cli::BenchmarkEngineArg::Echidna => BenchmarkEngine::Echidna,
-            sci_fuzz::cli::BenchmarkEngineArg::Forge => BenchmarkEngine::Forge,
+            chimera_fuzz::cli::BenchmarkEngineArg::ChimeraFuzz => BenchmarkEngine::ChimeraFuzz,
+            chimera_fuzz::cli::BenchmarkEngineArg::Echidna => BenchmarkEngine::Echidna,
+            chimera_fuzz::cli::BenchmarkEngineArg::Forge => BenchmarkEngine::Forge,
         })
         .collect();
 
@@ -88,15 +89,16 @@ fn handle_benchmark(args: sci_fuzz::cli::BenchmarkArgs) -> Result<()> {
     } else {
         match args.preset.as_str() {
             "efcf-demo" => efcf_demo_plan(timeout, args.depth, max_execs),
+            "efcf-matrix" => efcf_matrix_plan(timeout, args.depth, max_execs),
             other => {
                 anyhow::bail!(
-                    "Unknown benchmark preset `{other}`. Use `efcf-demo` or pass --project."
+                    "Unknown benchmark preset `{other}`. Use `efcf-demo`, `efcf-matrix`, or pass --project."
                 );
             }
         }
     };
 
-    println!("⚡ sci-fuzz benchmark");
+    println!("⚡ chimerafuzz benchmark");
     println!("  seeds      : {:?}", args.seeds);
     println!("  engines    : {:?}", args.engines);
     println!("  timeout    : {}s", args.timeout);
@@ -107,6 +109,9 @@ fn handle_benchmark(args: sci_fuzz::cli::BenchmarkArgs) -> Result<()> {
 
     let board = run_benchmark_plan(&plan, &args.seeds, &engines);
     write_benchmark_artifacts(&board, &args.output_dir)?;
+    if args.preset == "efcf-matrix" {
+        write_benchmark_matrix_report_json(&plan, &args.output_dir.join("benchmark_matrix.json"))?;
+    }
 
     println!("raw results:");
     board.print_csv();
@@ -131,15 +136,21 @@ fn handle_benchmark(args: sci_fuzz::cli::BenchmarkArgs) -> Result<()> {
         "  {}",
         args.output_dir.join("benchmark_summary.json").display()
     );
+    if args.preset == "efcf-matrix" {
+        println!(
+            "  {}",
+            args.output_dir.join("benchmark_matrix.json").display()
+        );
+    }
 
     Ok(())
 }
 
 #[cfg(feature = "cli")]
-fn handle_forge(args: sci_fuzz::cli::ForgeArgs) -> Result<()> {
-    use sci_fuzz::{campaign::Campaign, project::Project, types::CampaignConfig};
+fn handle_forge(args: chimera_fuzz::cli::ForgeArgs) -> Result<()> {
+    use chimera_fuzz::{campaign::Campaign, project::Project, types::CampaignConfig};
 
-    println!("⚡ sci-fuzz — Smart Contract Invariant Fuzzer");
+    println!("⚡ chimerafuzz — Next-Generation Smart Contract Fuzzer");
     println!();
     println!("  project : {}", args.project.display());
     println!("  depth   : {}", args.depth);
@@ -153,6 +164,13 @@ fn handle_forge(args: sci_fuzz::cli::ForgeArgs) -> Result<()> {
     println!("running forge build...");
 
     let (project, bootstrap, artifact_count) = Project::build_and_select_targets(&project_root)?;
+
+    // Extract all discovered contracts for vm.deployCode() support
+    let all_artifacts: Vec<chimera_fuzz::types::ContractInfo> = project
+        .contracts
+        .values()
+        .cloned()
+        .collect();
 
     let fork_url = args
         .fork_url
@@ -231,7 +249,8 @@ fn handle_forge(args: sci_fuzz::cli::ForgeArgs) -> Result<()> {
         seed: args.seed.unwrap_or_else(|| rand::random()),
         targets: bootstrap.runtime_targets,
         harness: bootstrap.harness,
-        mode: sci_fuzz::types::ExecutorMode::Fast,
+        all_artifacts,
+        mode: chimera_fuzz::types::ExecutorMode::Fast,
         rpc_url: fork_url,
         rpc_block_number: args.fork_block,
         attacker_address,
@@ -248,14 +267,14 @@ fn handle_forge(args: sci_fuzz::cli::ForgeArgs) -> Result<()> {
 
     let mut campaign = Campaign::new(config);
     let report = campaign.run_with_report()?;
-    let findings: Vec<sci_fuzz::types::Finding> = report
+    let findings: Vec<chimera_fuzz::types::Finding> = report
         .findings
         .into_iter()
         .map(|r| r.finding)
         .collect();
 
     let generate_replay = !args.no_replay;
-    sci_fuzz::output::print_campaign_summary(
+    chimera_fuzz::output::print_campaign_summary(
         &findings,
         report.total_execs,
         report.elapsed_ms,
@@ -268,7 +287,7 @@ fn handle_forge(args: sci_fuzz::cli::ForgeArgs) -> Result<()> {
 
     // Save JSON report if requested.
     if args.save_report {
-        let json = sci_fuzz::output::json_report(
+        let json = chimera_fuzz::output::json_report(
             &findings,
             report.total_execs,
             report.elapsed_ms,
@@ -282,7 +301,7 @@ fn handle_forge(args: sci_fuzz::cli::ForgeArgs) -> Result<()> {
             .output
             .as_deref()
             .unwrap_or_else(|| std::path::Path::new("."));
-        let report_path = std::path::Path::new(out_path).join("sci-fuzz-report.json");
+        let report_path = std::path::Path::new(out_path).join("chimerafuzz-report.json");
         if let Err(e) = std::fs::write(&report_path, &json) {
             eprintln!("[warn] failed to save report: {e}");
         } else {
@@ -294,7 +313,7 @@ fn handle_forge(args: sci_fuzz::cli::ForgeArgs) -> Result<()> {
     if args.fail_on_critical
         && findings
             .iter()
-            .any(|f| matches!(f.severity, sci_fuzz::types::Severity::Critical))
+            .any(|f| matches!(f.severity, chimera_fuzz::types::Severity::Critical))
     {
         std::process::exit(1);
     }
@@ -303,11 +322,11 @@ fn handle_forge(args: sci_fuzz::cli::ForgeArgs) -> Result<()> {
 }
 
 #[cfg(feature = "cli")]
-fn handle_audit(args: sci_fuzz::cli::AuditArgs) -> Result<()> {
+fn handle_audit(args: chimera_fuzz::cli::AuditArgs) -> Result<()> {
     // Load .env if present (best-effort; ignore errors).
     let _ = dotenvy_load();
 
-    println!("⚡ sci-fuzz audit");
+    println!("⚡ chimerafuzz audit");
 
     use std::path::Path;
     let mut manifest_chain_id: Option<u64> = None;
@@ -315,7 +334,7 @@ fn handle_audit(args: sci_fuzz::cli::AuditArgs) -> Result<()> {
     if args.addresses.len() == 1 {
         let p = &args.addresses[0];
         if Path::new(p).is_file() {
-            let m = sci_fuzz::bootstrap::AddressManifest::load_path_or_inline(p)
+            let m = chimera_fuzz::bootstrap::AddressManifest::load_path_or_inline(p)
                 .with_context(|| format!("failed to load address manifest from {p}"))?;
             manifest_chain_id = m.chain_id;
             if let Some(ref label) = m.rpc_label {
@@ -386,7 +405,7 @@ fn handle_audit(args: sci_fuzz::cli::AuditArgs) -> Result<()> {
     }
     println!();
     println!("  ℹ️  RpcCacheDB fork (lazy-load on first access).");
-    match sci_fuzz::rpc::rpc_probe_url(&rpc_url) {
+    match chimera_fuzz::rpc::rpc_probe_url(&rpc_url) {
         Ok(()) => println!("  ✅ RPC reachable (eth_blockNumber)"),
         Err(e) => eprintln!("  ⚠️  RPC probe failed: {e}"),
     }
@@ -408,7 +427,7 @@ fn handle_audit(args: sci_fuzz::cli::AuditArgs) -> Result<()> {
                 "  🔍 Fetching ABI from Etherscan for {} ({})…",
                 addr_str, args.chain
             );
-            match sci_fuzz::rpc::fetch_etherscan_abi(&addr_str, &args.chain, &api_key) {
+            match chimera_fuzz::rpc::fetch_etherscan_abi(&addr_str, &args.chain, &api_key) {
                 Ok(abi) => {
                     println!("  ✅ ABI retrieved successfully!");
                     abi_val = Some(abi);
@@ -454,6 +473,7 @@ fn handle_audit(args: sci_fuzz::cli::AuditArgs) -> Result<()> {
         seed: rand::random(),
         targets,
         harness: None,
+        all_artifacts: Vec::new(), // Scan mode loads from manifest, no all_artifacts
         mode: ExecutorMode::Realistic, // Audits should use realistic mode by default
         rpc_url: Some(rpc_url.clone()),
         rpc_block_number: block,
@@ -479,7 +499,7 @@ fn handle_audit(args: sci_fuzz::cli::AuditArgs) -> Result<()> {
     if args.flashloan {
         println!(
             "   Flashloan : Enabled (Mock Pool 0x{})",
-            hex::encode(sci_fuzz::flashloan::MOCK_FLASHLOAN_POOL.as_slice())
+            hex::encode(chimera_fuzz::flashloan::MOCK_FLASHLOAN_POOL.as_slice())
         );
     }
     println!();
@@ -538,10 +558,10 @@ fn dotenvy_load() -> anyhow::Result<()> {
 }
 
 #[cfg(feature = "cli")]
-fn handle_test(args: sci_fuzz::cli::TestArgs) -> Result<()> {
-    use sci_fuzz::{project::Project, types::CampaignConfig};
+fn handle_test(args: chimera_fuzz::cli::TestArgs) -> Result<()> {
+    use chimera_fuzz::{project::Project, types::CampaignConfig};
 
-    println!("⚡ sci-fuzz test");
+    println!("⚡ chimerafuzz test");
     if let Some(ref pat) = args.match_test {
         println!("  match-test : {pat}");
     }
@@ -557,7 +577,7 @@ fn handle_test(args: sci_fuzz::cli::TestArgs) -> Result<()> {
         .unwrap_or(std::path::PathBuf::from("."));
     println!("  project    : {}", project_root.display());
     println!("running forge build...");
-    let (_project, bootstrap, artifact_count) = Project::build_and_select_targets(&project_root)?;
+    let (project, bootstrap, artifact_count) = Project::build_and_select_targets(&project_root)?;
     println!("discovered {} artifact(s)", artifact_count);
 
     let mut targets = bootstrap.runtime_targets;
@@ -586,8 +606,15 @@ fn handle_test(args: sci_fuzz::cli::TestArgs) -> Result<()> {
     }
 
     if targets.is_empty() {
-        anyhow::bail!("no targets matched filters for `sci-fuzz test`");
+        anyhow::bail!("no targets matched filters for `chimerafuzz test`");
     }
+
+    // Extract all discovered contracts for vm.deployCode() support
+    let all_artifacts: Vec<chimera_fuzz::types::ContractInfo> = project
+        .contracts
+        .values()
+        .cloned()
+        .collect();
 
     let config = CampaignConfig {
         timeout: std::time::Duration::from_secs(300),
@@ -598,7 +625,8 @@ fn handle_test(args: sci_fuzz::cli::TestArgs) -> Result<()> {
         seed: 0x51f5_7e57,
         targets,
         harness: bootstrap.harness,
-        mode: sci_fuzz::types::ExecutorMode::Fast,
+        all_artifacts,
+        mode: chimera_fuzz::types::ExecutorMode::Fast,
         rpc_url: args.fork_url.clone(),
         rpc_block_number: args.fork_block,
         test_mode: args.mode,
@@ -624,13 +652,13 @@ fn handle_test(args: sci_fuzz::cli::TestArgs) -> Result<()> {
 }
 
 #[cfg(feature = "cli")]
-fn handle_ci(args: sci_fuzz::cli::CiArgs) -> Result<()> {
-    use sci_fuzz::cli::CiOutputFormat;
-    use sci_fuzz::output::{forge_reproducer, junit_from_findings, sarif_from_findings};
-    use sci_fuzz::{campaign::Campaign, project::Project, types::CampaignConfig};
+fn handle_ci(args: chimera_fuzz::cli::CiArgs) -> Result<()> {
+    use chimera_fuzz::cli::CiOutputFormat;
+    use chimera_fuzz::output::{forge_reproducer, junit_from_findings, sarif_from_findings};
+    use chimera_fuzz::{campaign::Campaign, project::Project, types::CampaignConfig};
     use std::time::Instant;
 
-    println!("⚡ sci-fuzz ci");
+    println!("⚡ chimerafuzz ci");
     println!("  project : {}", args.project.display());
     println!("  format  : {:?}", args.output_format);
     println!("  timeout : {}s", args.timeout);
@@ -642,10 +670,17 @@ fn handle_ci(args: sci_fuzz::cli::CiArgs) -> Result<()> {
     let project_root = args.project.canonicalize().unwrap_or(args.project.clone());
     println!("running forge build...");
 
-    let (_project, bootstrap, artifact_count) = Project::build_and_select_targets(&project_root)?;
+    let (project, bootstrap, artifact_count) = Project::build_and_select_targets(&project_root)?;
     println!("discovered {} artifact(s)", artifact_count);
     println!("starting security scan...");
     println!();
+
+    // Extract all discovered contracts for vm.deployCode() support
+    let all_artifacts: Vec<chimera_fuzz::types::ContractInfo> = project
+        .contracts
+        .values()
+        .cloned()
+        .collect();
 
     let config = CampaignConfig {
         timeout: std::time::Duration::from_secs(args.timeout),
@@ -657,7 +692,8 @@ fn handle_ci(args: sci_fuzz::cli::CiArgs) -> Result<()> {
         seed: 0xcafebabe,
         targets: bootstrap.runtime_targets,
         harness: bootstrap.harness,
-        mode: sci_fuzz::types::ExecutorMode::Fast,
+        all_artifacts,
+        mode: chimera_fuzz::types::ExecutorMode::Fast,
         corpus_dir: args.corpus_dir.clone(),
         test_mode: args.mode,
         ..Default::default()
@@ -672,8 +708,8 @@ fn handle_ci(args: sci_fuzz::cli::CiArgs) -> Result<()> {
     if args.github_actions {
         for f in &findings {
             let level = match f.severity {
-                sci_fuzz::types::Severity::Critical | sci_fuzz::types::Severity::High => "error",
-                sci_fuzz::types::Severity::Medium => "warning",
+                chimera_fuzz::types::Severity::Critical | chimera_fuzz::types::Severity::High => "error",
+                chimera_fuzz::types::Severity::Medium => "warning",
                 _ => "notice",
             };
             // ::error/warning/notice title=<title>::<message>
@@ -692,7 +728,7 @@ fn handle_ci(args: sci_fuzz::cli::CiArgs) -> Result<()> {
         CiOutputFormat::Sarif | CiOutputFormat::GitHub | CiOutputFormat::GitLab => {
             sarif_from_findings(&findings, tool_version)
         }
-        CiOutputFormat::Junit => junit_from_findings(&findings, "sci-fuzz", elapsed),
+        CiOutputFormat::Junit => junit_from_findings(&findings, "chimerafuzz", elapsed),
     };
 
     // Write to file or stdout.
@@ -732,11 +768,11 @@ fn handle_ci(args: sci_fuzz::cli::CiArgs) -> Result<()> {
     } else {
         let critical = findings
             .iter()
-            .filter(|f| matches!(f.severity, sci_fuzz::types::Severity::Critical))
+            .filter(|f| matches!(f.severity, chimera_fuzz::types::Severity::Critical))
             .count();
         let high = findings
             .iter()
-            .filter(|f| matches!(f.severity, sci_fuzz::types::Severity::High))
+            .filter(|f| matches!(f.severity, chimera_fuzz::types::Severity::High))
             .count();
 
         println!(
@@ -756,8 +792,8 @@ fn handle_ci(args: sci_fuzz::cli::CiArgs) -> Result<()> {
 }
 
 #[cfg(feature = "cli")]
-fn handle_diff(args: sci_fuzz::cli::DiffArgs) -> Result<()> {
-    use sci_fuzz::diff::{print_diff_result, run_diff};
+fn handle_diff(args: chimera_fuzz::cli::DiffArgs) -> Result<()> {
+    use chimera_fuzz::diff::{print_diff_result, run_diff};
 
     if args.reference.is_some() {
         anyhow::bail!("--reference is not implemented in MVP diff mode");
@@ -787,11 +823,11 @@ fn handle_diff(args: sci_fuzz::cli::DiffArgs) -> Result<()> {
 }
 
 #[cfg(feature = "cli")]
-fn handle_replay(args: sci_fuzz::cli::ReplayArgs) -> Result<()> {
-    use sci_fuzz::campaign::{Campaign, CampaignFindingRecord};
-    use sci_fuzz::types::{Address, CampaignConfig, ExecutorMode};
+fn handle_replay(args: chimera_fuzz::cli::ReplayArgs) -> Result<()> {
+    use chimera_fuzz::campaign::{Campaign, CampaignFindingRecord};
+    use chimera_fuzz::types::{Address, CampaignConfig, ExecutorMode};
 
-    println!("⚡ sci-fuzz replay");
+    println!("⚡ chimerafuzz replay");
     println!("  finding  : {}", args.finding.display());
     println!();
 
@@ -817,7 +853,7 @@ fn handle_replay(args: sci_fuzz::cli::ReplayArgs) -> Result<()> {
     println!("found project: {}", project_root.display());
     println!("running forge build...");
     let (project, bootstrap, artifact_count) =
-        sci_fuzz::project::Project::build_and_select_targets(&project_root)?;
+        chimera_fuzz::project::Project::build_and_select_targets(&project_root)?;
     println!("discovered {} artifact(s)", artifact_count);
     println!(
         "selected {} runtime fuzz target(s)",
@@ -852,7 +888,7 @@ fn handle_replay(args: sci_fuzz::cli::ReplayArgs) -> Result<()> {
         rpc_url: fork_url,
         rpc_block_number: args.fork_block,
         attacker_address,
-        test_mode: sci_fuzz::types::TestMode::default(),
+        test_mode: chimera_fuzz::types::TestMode::default(),
         ..Default::default()
     };
 
@@ -878,7 +914,7 @@ fn handle_replay(args: sci_fuzz::cli::ReplayArgs) -> Result<()> {
 #[cfg(feature = "cli")]
 fn handle_version() -> Result<()> {
     println!(
-        "sci-fuzz {} — Smart Contract Invariant Fuzzer",
+        "chimerafuzz {} — Next-Generation Smart Contract Fuzzer",
         env!("CARGO_PKG_VERSION")
     );
     println!("License: {}", env!("CARGO_PKG_LICENSE"));
@@ -890,20 +926,20 @@ fn handle_version() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "cli")]
-fn init_logging(verbosity: &sci_fuzz::cli::Verbosity) {
+fn init_logging(verbosity: &chimera_fuzz::cli::Verbosity) {
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
     let level = match verbosity {
-        sci_fuzz::cli::Verbosity::Error => "error",
-        sci_fuzz::cli::Verbosity::Warn => "warn",
-        sci_fuzz::cli::Verbosity::Info => "info",
-        sci_fuzz::cli::Verbosity::Debug => "debug",
-        sci_fuzz::cli::Verbosity::Trace => "trace",
+        chimera_fuzz::cli::Verbosity::Error => "error",
+        chimera_fuzz::cli::Verbosity::Warn => "warn",
+        chimera_fuzz::cli::Verbosity::Info => "info",
+        chimera_fuzz::cli::Verbosity::Debug => "debug",
+        chimera_fuzz::cli::Verbosity::Trace => "trace",
     };
 
     // Respect RUST_LOG if set, otherwise use the CLI flag.
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(format!("sci_fuzz={level}")));
+        .unwrap_or_else(|_| EnvFilter::new(format!("chimera_fuzz={level}")));
 
     tracing_subscriber::registry()
         .with(fmt::layer().with_target(false).with_thread_ids(false))
@@ -917,7 +953,7 @@ fn init_logging(verbosity: &sci_fuzz::cli::Verbosity) {
 
 #[cfg(test)]
 mod tests {
-    use sci_fuzz::cli::DiffArgs;
+    use chimera_fuzz::cli::DiffArgs;
 
     #[test]
     fn version_is_set() {

@@ -3,9 +3,9 @@
 //!
 //! These tests deploy tiny Solidity contracts (pre-compiled to bytecode)
 //! into a real `EvmExecutor`, wire up `EchidnaPropertyCaller`, and verify
-//! that sci-fuzz's property verdicts match Echidna's documented semantics:
+//! that chimerafuzz's property verdicts match Echidna's documented semantics:
 //!
-//! | Contract       | Property                  | Returns | Echidna verdict | sci-fuzz must agree |
+//! | Contract       | Property                  | Returns | Echidna verdict | chimerafuzz must agree |
 //! |----------------|---------------------------|---------|-----------------|---------------------|
 //! | PropFalse      | echidna_always_false       | false   | VIOLATED        | yes — finding       |
 //! | PropReverts    | echidna_always_reverts     | reverts | HOLDS           | yes — no finding    |
@@ -18,9 +18,9 @@
 
 use std::path::Path;
 
-use sci_fuzz::evm::EvmExecutor;
-use sci_fuzz::invariant::EchidnaPropertyCaller;
-use sci_fuzz::types::{Address, Bytes, Transaction, U256};
+use chimera_fuzz::evm::EvmExecutor;
+use chimera_fuzz::invariant::EchidnaPropertyCaller;
+use chimera_fuzz::types::{Address, Bytes, Transaction, U256};
 
 // ---------------------------------------------------------------------------
 // Helpers

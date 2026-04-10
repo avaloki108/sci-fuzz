@@ -1,4 +1,4 @@
-//! Core types for sci-fuzz — Smart Contract Invariant Fuzzer.
+//! Core types for chimerafuzz — Smart Contract Invariant Fuzzer.
 //!
 //! This module defines the fundamental data structures referenced throughout the
 //! crate.  All Ethereum primitives come from [`alloy_primitives`] so that every
@@ -16,7 +16,7 @@ use std::time::Duration;
 #[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 pub enum TestMode {
     /// Check `echidna_*` / `invariant_*` bool properties + all economic oracles.
-    /// This is the default and matches legacy sci-fuzz behavior.
+    /// This is the default and matches legacy chimerafuzz behavior.
     #[default]
     Property,
     /// Check assertion/panic failures only (`EchidnaProperty` events + property
@@ -27,6 +27,10 @@ pub enum TestMode {
     Economic,
     /// ABI-inferred invariants (access control, pause, timelock, supply, getters, etc.).
     Inferred,
+    /// Foundry-style invariant test mode (proxy for foundry invariant config)
+    FoundryInvariant,
+    /// Optimization mode — find max/min function values
+    Optimization,
     /// Pure coverage-guided exploration. No oracles or property callers are
     /// registered. Useful for building a corpus before switching modes.
     Exploration,
@@ -46,7 +50,7 @@ pub enum ExecutorMode {
 }
 
 // ── Re-exports ───────────────────────────────────────────────────────────────
-// Consumers can `use sci_fuzz::types::{Address, U256, …}` without pulling in
+// Consumers can `use chimera_fuzz::types::{Address, U256, …}` without pulling in
 // alloy-primitives directly.
 
 pub use alloy_primitives::{Address, Bytes, B256, U256};
@@ -164,6 +168,30 @@ impl Default for Transaction {
     }
 }
 
+// ── Comparison tracing (CmpLog / Redqueen-style) ─────────────────────────────
+
+/// EVM comparison opcode observed during concrete execution.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CmpOpcodeKind {
+    Eq,
+    Lt,
+    Gt,
+    Slt,
+    Sgt,
+    IsZero,
+}
+
+/// One comparison site for seeding [`crate::mutator::ValueDictionary`] and concolic hooks.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ComparisonEvent {
+    pub contract: Address,
+    pub call_depth: u32,
+    pub pc: usize,
+    pub kind: CmpOpcodeKind,
+    pub lhs: U256,
+    pub rhs: U256,
+}
+
 // ── Execution Result ─────────────────────────────────────────────────────────
 
 /// The outcome of executing a single [`Transaction`].
@@ -210,6 +238,9 @@ pub struct ExecutionResult {
     /// active call frame pending return.
     #[serde(default)]
     pub sstore_in_nested_call: bool,
+    /// Comparison events (EQ/LT/GT/…) for CmpLog-style value mining.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cmp_events: Vec<ComparisonEvent>,
 }
 
 impl Default for ExecutionResult {
@@ -228,6 +259,7 @@ impl Default for ExecutionResult {
             assume_violated: false,
             revert_was_expected: false,
             sstore_in_nested_call: false,
+            cmp_events: Vec::new(),
         }
     }
 }
@@ -651,7 +683,8 @@ impl Finding {
             })
             .take(32)
             .collect::<String>();
-        let filename = format!("finding_{}_{}.json", format!("{}", self.severity), slug,);
+        let short_hash = self.dedup_hash() % 10000;
+        let filename = format!("finding_{}_{}_{:04}.json", format!("{}", self.severity), slug, short_hash);
         let path = dir.join(&filename);
         let json = serde_json::to_string_pretty(self)?;
         std::fs::write(&path, json)?;
@@ -904,8 +937,9 @@ pub struct CampaignConfig {
     /// Number of parallel fuzzing workers. Values greater than `1` spawn
     /// threads that share coverage feedback, the snapshot corpus, saved DB
     /// snapshots, and deduplicated findings. Ordering is not reproducible across
-    /// runs when `workers > 1`. If `rpc_url` is set, the campaign forces a
-    /// single worker (RPC fork state is not shared across threads).
+    /// runs when `workers > 1`. With `rpc_url` set, workers share a read-mostly
+    /// [`crate::rpc::RpcCacheDB`] clone while each thread keeps its own EVM
+    /// database overlay for isolation.
     pub workers: usize,
     /// Deterministic seed for the PRNG.
     pub seed: u64,
@@ -1006,6 +1040,10 @@ pub struct CampaignConfig {
     /// Register extended protocol-semantics oracles (rewards, governance hints, …).
     #[serde(default = "default_true")]
     pub protocol_semantic_oracles: bool,
+    /// All discovered contracts (including library dependencies) for vm.deployCode() support.
+    /// This allows harness setUp() to deploy contracts that aren't fuzz targets.
+    #[serde(default)]
+    pub all_artifacts: Vec<ContractInfo>,
 }
 
 fn default_true() -> bool {
@@ -1046,6 +1084,7 @@ impl Default for CampaignConfig {
             seed: 0,
             targets: Vec::new(),
             harness: None,
+            all_artifacts: Vec::new(),
             mode: ExecutorMode::Fast,
             rpc_url: None,
             rpc_block_number: None,

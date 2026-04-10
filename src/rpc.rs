@@ -7,7 +7,7 @@
 //! # Usage
 //!
 //! ```no_run
-//! use sci_fuzz::rpc::RpcCacheDB;
+//! use chimera_fuzz::rpc::RpcCacheDB;
 //! let db = RpcCacheDB::new("https://eth-mainnet.g.alchemy.com/v2/KEY", None)
 //!     .expect("failed to connect");
 //! ```

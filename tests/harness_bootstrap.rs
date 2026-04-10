@@ -4,15 +4,15 @@
 use std::path::Path;
 use std::time::Duration;
 
-use sci_fuzz::evm::EvmExecutor;
-use sci_fuzz::harness;
-use sci_fuzz::invariant::EchidnaPropertyCaller;
-use sci_fuzz::project::{abi_has_echidna_property, abi_has_set_up, Project};
-use sci_fuzz::types::{Address, CampaignConfig, ContractInfo, ExecutorMode, U256};
+use chimera_fuzz::evm::EvmExecutor;
+use chimera_fuzz::harness;
+use chimera_fuzz::invariant::EchidnaPropertyCaller;
+use chimera_fuzz::project::{abi_has_echidna_property, abi_has_set_up, Project};
+use chimera_fuzz::types::{Address, CampaignConfig, ContractInfo, ExecutorMode, U256};
 
 const FIXTURE_ROOT: &str = "tests/fixtures/harness_project";
 
-fn load_fixture_bootstrap() -> sci_fuzz::FuzzBootstrap {
+fn load_fixture_bootstrap() -> chimera_fuzz::FuzzBootstrap {
     let root = Path::new(FIXTURE_ROOT);
     let mut project = Project::load(root).expect("fixture project");
     project
@@ -115,7 +115,7 @@ fn campaign_runs_harness_setup_before_fuzzing() {
         ..Default::default()
     };
 
-    let mut campaign = sci_fuzz::campaign::Campaign::new(config);
+    let mut campaign = chimera_fuzz::campaign::Campaign::new(config);
     let findings = campaign.run().expect("campaign completes");
     let bad: Vec<_> = findings
         .iter()
@@ -129,8 +129,8 @@ fn campaign_runs_harness_setup_before_fuzzing() {
 
 #[test]
 fn mutator_does_not_include_set_up_selector() {
-    use sci_fuzz::mutator::TxMutator;
-    use sci_fuzz::types::contract_info_for_mutator;
+    use chimera_fuzz::mutator::TxMutator;
+    use chimera_fuzz::types::contract_info_for_mutator;
 
     let b = load_fixture_bootstrap();
     let h = b.harness.expect("harness");
@@ -142,8 +142,9 @@ fn mutator_does_not_include_set_up_selector() {
         name: h.name.clone(),
         source_path: h.source_path.clone(),
         deployed_source_map: None,
-            source_file_list: vec![],
-                abi: h.abi.clone(),
+        source_file_list: vec![],
+        abi: h.abi.clone(),
+        link_references: Default::default(),
     };
     let stripped = contract_info_for_mutator(&c, &["setUp", "beforeTest", "afterTest"]);
     let m = TxMutator::new(vec![stripped]);

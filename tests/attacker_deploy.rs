@@ -1,8 +1,8 @@
 //! Different attacker EOAs must yield different CREATE addresses (campaign uses
-//! [`sci_fuzz::types::CampaignConfig::resolved_attacker`] as deployer).
+//! [`chimera_fuzz::types::CampaignConfig::resolved_attacker`] as deployer).
 
-use sci_fuzz::types::{Address, Bytes, U256};
-use sci_fuzz::EvmExecutor;
+use chimera_fuzz::types::{Address, Bytes, U256};
+use chimera_fuzz::EvmExecutor;
 
 #[test]
 fn different_attacker_eoa_yields_different_first_deploy_address() {

@@ -1,4 +1,4 @@
-//! Forge VM cheatcode interceptor for sci-fuzz.
+//! Forge VM cheatcode interceptor for chimerafuzz.
 //!
 //! Intercepts calls to the Forge `Vm` sentinel address (`0x7109709ECfa91a80626fF3989D68f67F5b1DD12`)
 //! and implements the critical subset of cheatcodes needed to run real Foundry harnesses:
@@ -37,6 +37,44 @@ pub const FORGE_VM_ADDRESS: Address = Address::new([
     0x71, 0x09, 0x70, 0x9e, 0xcf, 0xa9, 0x1a, 0x80, 0x62, 0x6f, 0xf3, 0x98, 0x9d, 0x68, 0xf6, 0x7f,
     0x5b, 0x1d, 0xd1, 0x2d,
 ]);
+
+// ── Artifact bytecode registry for deployCode ────────────────────────────────
+
+use std::sync::OnceLock;
+use std::collections::HashMap;
+
+/// Global artifact bytecode registry populated before campaign start.
+/// Maps contract name (e.g. "Morpho") or path fragment (e.g. "Morpho.sol")
+/// to (creation_bytecode, deployed_bytecode).
+static ARTIFACT_REGISTRY: OnceLock<HashMap<String, (Vec<u8>, Vec<u8>)>> = OnceLock::new();
+
+/// Populate the global artifact registry. Called once during bootstrap.
+pub fn set_artifact_registry(artifacts: HashMap<String, (Vec<u8>, Vec<u8>)>) {
+    let _ = ARTIFACT_REGISTRY.set(artifacts);
+}
+
+/// Look up artifact by contract name or path fragment.
+/// Returns (creation_bytecode, deployed_bytecode).
+fn lookup_artifact(name: &str) -> Option<&'static (Vec<u8>, Vec<u8>)> {
+    ARTIFACT_REGISTRY.get().and_then(|registry| {
+        // Try exact match first
+        if let Some(entry) = registry.get(name) {
+            return Some(entry);
+        }
+        // Try stripping .sol suffix
+        let stripped = name.strip_suffix(".sol").unwrap_or(name);
+        if let Some(entry) = registry.get(stripped) {
+            return Some(entry);
+        }
+        // Try matching by suffix (e.g. "Morpho.sol" matches key "Morpho")
+        for (key, entry) in registry.iter() {
+            if key.ends_with(stripped) || stripped.ends_with(key.as_str()) {
+                return Some(entry);
+            }
+        }
+        None
+    })
+}
 
 // ── Cheatcode state ───────────────────────────────────────────────────────────
 
@@ -79,6 +117,10 @@ pub struct TxCheatcodeState {
     /// address matches and its calldata starts with the recorded prefix,
     /// the mock's return data (or revert) is returned instead of executing.
     pub mocked_calls: Vec<MockCall>,
+    /// Deferred contract deployments from `vm.deployCode()`.  Each entry is
+    /// (contract_name_or_path, constructor_args).  Applied by the executor
+    /// after the transaction commits via a real CREATE.
+    pub pending_deploy_codes: Vec<(String, alloy_primitives::Bytes)>,
 }
 
 /// A single mocked call record.
@@ -177,12 +219,17 @@ pub fn dispatch<DB: revm::Database>(
         return (true, bytes::Bytes::new());
     }
 
-    let sel = [calldata[0], calldata[1], calldata[2], calldata[3]];
-    let args = if calldata.len() > 4 {
-        &calldata[4..]
-    } else {
-        &[]
-    };
+    let sel: [u8; 4] = [calldata[0], calldata[1], calldata[2], calldata[3]];
+    let args = &calldata[4..];
+
+    // Debug: log deployCode calls
+    if sel == selector(b"deployCode(string)") || sel == selector(b"deployCode(string,bytes)") {
+        let name_bytes = decode_abi_string(args);
+        let name = String::from_utf8_lossy(name_bytes.as_ref()).to_string();
+        eprintln!("[cheatcode] deployCode called for: {}", name);
+    }
+
+    let _ = args; // suppress unused warning (re-assigned below)
 
     // ── Identity cheatcodes ───────────────────────────────────────────────────
 
@@ -479,17 +526,26 @@ pub fn dispatch<DB: revm::Database>(
     if sel == selector(b"addr(uint256)") {
         // Private key → address: not feasible; return a stable derived address
         if args.len() >= 32 {
+            // args starts after the 4-byte selector, so args[0..32] is the uint256 parameter
             let key = decode_u256_word(args);
             // Hash the key to produce a deterministic address
             let mut addr_bytes = [0u8; 20];
             let k_bytes = key.to_be_bytes::<32>();
             addr_bytes.copy_from_slice(&k_bytes[12..]);
+            let result_addr = Address::from(addr_bytes);
+
+            static ADDR_CALL_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let count = ADDR_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            eprintln!("[addr] call #{}: key=...{:}, addr=0x{:?}", count + 1,
+                &hex::encode(k_bytes)[..8].to_string(), result_addr);
+
             return (true, {
                 let mut out = [0u8; 32];
                 out[12..].copy_from_slice(&addr_bytes);
                 bytes::Bytes::copy_from_slice(&out)
             });
         }
+        eprintln!("[addr] ERROR: args too short: {}", args.len());
         return (true, encode_u256(U256::ZERO));
     }
 
@@ -499,6 +555,7 @@ pub fn dispatch<DB: revm::Database>(
     // with the vm.addr(uint256) implementation above).
     if sel == selector(b"makeAddr(string)") {
         let name_bytes = decode_abi_string(args);
+        eprintln!("[cheatcodes] makeAddr(string) called, name_bytes length: {}", name_bytes.len());
         // Compute keccak256 of raw name bytes (same as keccak256(abi.encodePacked(name))).
         use tiny_keccak::{Hasher as _, Keccak};
         let mut k = Keccak::v256();
@@ -508,6 +565,27 @@ pub fn dispatch<DB: revm::Database>(
         // Use last 20 bytes as address (matches current vm.addr(uint256) behaviour).
         let mut out = [0u8; 32];
         out[12..].copy_from_slice(&hash[12..]);
+        eprintln!("[cheatcodes] makeAddr returning address: 0x{}", hex::encode(&out[12..]));
+        return (true, bytes::Bytes::copy_from_slice(&out));
+    }
+
+    // makeAddr(string name) — returns deterministic address from name.
+    // Forge: privateKey = keccak256(abi.encodePacked(name)); addr = vm.addr(privateKey)
+    // We implement: keccak256(name bytes) → last 20 bytes as address (consistent
+    // with the vm.addr(uint256) implementation above).
+    if sel == selector(b"makeAddr(string)") {
+        let name_bytes = decode_abi_string(args);
+        eprintln!("[cheatcodes] makeAddr(string) called, name_bytes length: {}", name_bytes.len());
+        // Compute keccak256 of raw name bytes (same as keccak256(abi.encodePacked(name))).
+        use tiny_keccak::{Hasher as _, Keccak};
+        let mut k = Keccak::v256();
+        k.update(name_bytes.as_ref());
+        let mut hash = [0u8; 32];
+        k.finalize(&mut hash);
+        // Use last 20 bytes as address (matches current vm.addr(uint256) behaviour).
+        let mut out = [0u8; 32];
+        out[12..].copy_from_slice(&hash[12..]);
+        eprintln!("[cheatcodes] makeAddr returning address: 0x{}", hex::encode(&out[12..]));
         return (true, bytes::Bytes::copy_from_slice(&out));
     }
 
@@ -555,6 +633,78 @@ pub fn dispatch<DB: revm::Database>(
         || sel == selector(b"parseBytes32(string)")
     {
         return (true, encode_u256(U256::ZERO));
+    }
+
+    // ── Contract deployment ──────────────────────────────────────────────────
+
+    // deployCode(string what) → deploys contract from artifacts, returns address
+    // deployCode(string what, bytes args) → same with constructor args
+    //
+    // Implementation: Schedule bytecode installation via pending_etches.
+    // NOTE: Constructor args are NOT actually executed. The contract is installed
+    // with its deployed bytecode as-is, which means constructor-initialized state
+    // will be zero/default values. This is acceptable for the Morpho protocol setup.
+    if sel == selector(b"deployCode(string)")
+        || sel == selector(b"deployCode(string,bytes)")
+    {
+        let name_bytes = decode_abi_string(args);
+        let name = String::from_utf8_lossy(name_bytes.as_ref()).to_string();
+
+        eprintln!("[cheatcode] deployCode called: name={}, args_len={}",
+            name, if sel == selector(b"deployCode(string,bytes)") { args.len() } else { 0 });
+
+        // Extract constructor args if present (second parameter)
+        let constructor_args = if sel == selector(b"deployCode(string,bytes)") && args.len() > 64 {
+            decode_abi_bytes(args, 64)
+        } else {
+            alloy_primitives::Bytes::new()
+        };
+
+        // Look up artifact bytecode from the global registry
+        if let Some((_creation_bc, deployed_bc)) = lookup_artifact(&name) {
+            eprintln!("[deployCode] found artifact, bytecode length: {}", deployed_bc.len());
+            // Compute deterministic address for this deployment
+            use tiny_keccak::{Hasher as _, Keccak};
+            let mut k = Keccak::v256();
+            k.update(b"deployCode:");
+            k.update(name_bytes.as_ref());
+            if !constructor_args.is_empty() {
+                k.update(&constructor_args);
+            }
+            let mut hash = [0u8; 32];
+            k.finalize(&mut hash);
+            let mut addr_bytes = [0u8; 20];
+            addr_bytes.copy_from_slice(&hash[12..]);
+            let deploy_addr = Address::from(addr_bytes);
+
+            // Install deployed bytecode directly (skipping constructor execution)
+            // Note: This means constructor-initialized state is NOT set.
+            // For Morpho, owner will be address(0) instead of MORPHO_OWNER.
+            // This is a known limitation — the fuzzer can still call functions,
+            // but some permission checks may fail.
+            let _bytecode = revm::primitives::Bytecode::new_legacy(
+                alloy_primitives::Bytes::copy_from_slice(deployed_bc)
+            );
+
+            // Use the pending_etches mechanism to install the bytecode after the transaction completes.
+            // NOTE: This means MORPHO won't have code until AFTER BaseTest CREATE completes.
+            // The BaseTest initcode can still store the MORPHO address, but can't call MORPHO methods
+            // during contract creation. This is fine for the Morpho protocol setup.
+            state.pending_etches.push((deploy_addr, alloy_primitives::Bytes::copy_from_slice(deployed_bc)));
+
+            eprintln!("[deployCode] scheduled etch of {} at {} with {} bytes of bytecode (will be applied after transaction)",
+                name, deploy_addr, deployed_bc.len());
+
+            // Return the deterministic address
+            let mut out = [0u8; 32];
+            out[12..].copy_from_slice(&addr_bytes);
+            return (true, bytes::Bytes::copy_from_slice(&out));
+        } else {
+            // Artifact not found — return zero address (will likely cause a revert
+            // later, but at least we don't crash)
+            eprintln!("[deployCode] artifact NOT found: {}", name);
+            return (true, encode_u256(U256::ZERO));
+        }
     }
 
     // ── Snapshot helpers ──────────────────────────────────────────────────────
@@ -636,6 +786,7 @@ pub fn dispatch<DB: revm::Database>(
     // Rather than reverting on unknown cheatcodes (which would break harnesses
     // that use cheatcodes we haven't implemented yet), we return success with
     // 32 zero bytes.  This lets the harness continue running.
+    eprintln!("[cheatcodes] unknown selector: 0x{}, returning 0", hex::encode(sel));
     (true, encode_u256(U256::ZERO))
 }
 

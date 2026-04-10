@@ -1,8 +1,8 @@
-//! Benchmark and comparison pipeline for sci-fuzz.
+//! Benchmark and comparison pipeline for chimerafuzz.
 //!
 //! This module provides:
 //! - reusable benchmark case definitions for compiled and Foundry targets
-//! - a first-class sci-fuzz benchmark runner
+//! - a first-class chimerafuzz benchmark runner
 //! - comparison scaffolding for Echidna / Forge that degrades gracefully
 //! - stable CSV / JSON artifact emission through [`crate::scoreboard`]
 
@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use crate::benchmark_matrix::{benchmark_matrix, benchmark_matrix_len, ExpectedBug};
 use crate::campaign::{Campaign, CampaignFindingRecord};
 use crate::project::Project;
 use crate::scoreboard::{BenchmarkEngine, BenchmarkStatus, Scoreboard, ScorecardEntry};
@@ -173,8 +174,8 @@ pub fn run_benchmark_plan(
         for &seed in seeds {
             for &engine in engines {
                 let row = match (entry, engine) {
-                    (BenchmarkPlanEntry::Ready(case), BenchmarkEngine::SciFuzz) => {
-                        run_sci_fuzz_case(case, seed)
+                    (BenchmarkPlanEntry::Ready(case), BenchmarkEngine::ChimeraFuzz) => {
+                        run_chimera_fuzz_case(case, seed)
                     }
                     (BenchmarkPlanEntry::Ready(case), BenchmarkEngine::Echidna) => {
                         ExternalComparisonAdapter::echidna().run_case(case, seed)
@@ -297,7 +298,124 @@ pub fn efcf_demo_plan(
     .collect()
 }
 
-fn run_sci_fuzz_case(case: &BenchmarkCase, seed: u64) -> ScorecardEntry {
+/// Map matrix expected bug class to a [`FindingMatcher`] for pass/fail rows.
+pub fn matcher_for_expected_bug(bug: ExpectedBug) -> FindingMatcher {
+    match bug {
+        ExpectedBug::EtherDrain => FindingMatcher::TitleContains("balance increase".into()),
+        ExpectedBug::Selfdestruct => FindingMatcher::TitleContains("selfdestruct".into()),
+        ExpectedBug::Reentrancy => FindingMatcher::TitleContains("Reentrancy".into()),
+        ExpectedBug::IntegerOverflow => FindingMatcher::AnyFinding,
+        ExpectedBug::PropertyViolation => FindingMatcher::TitleContains("Echidna".into()),
+        ExpectedBug::AccessControl => FindingMatcher::AnyFinding,
+        ExpectedBug::None => FindingMatcher::AnyFinding,
+    }
+}
+
+fn property_label_for_bug(bug: ExpectedBug) -> String {
+    match bug {
+        ExpectedBug::EtherDrain => "BalanceIncrease".into(),
+        ExpectedBug::Selfdestruct => "Selfdestruct".into(),
+        ExpectedBug::Reentrancy => "Reentrancy".into(),
+        ExpectedBug::IntegerOverflow => "IntegerOverflow".into(),
+        ExpectedBug::PropertyViolation => "EchidnaProperty".into(),
+        ExpectedBug::AccessControl => "AccessControl".into(),
+        ExpectedBug::None => "campaign".into(),
+    }
+}
+
+fn category_label_for_bug(bug: ExpectedBug) -> String {
+    match bug {
+        ExpectedBug::EtherDrain => "EtherDrain".into(),
+        ExpectedBug::Selfdestruct => "Selfdestruct".into(),
+        ExpectedBug::Reentrancy => "Reentrancy".into(),
+        ExpectedBug::IntegerOverflow => "IntegerOverflow".into(),
+        ExpectedBug::PropertyViolation => "PropertyViolation".into(),
+        ExpectedBug::AccessControl => "AccessControl".into(),
+        ExpectedBug::None => "Campaign".into(),
+    }
+}
+
+/// File stem (no extension) from a path like `tests/contracts/efcf-core/Foo.sol`.
+pub fn contract_stem_from_path(path: &str) -> String {
+    Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path)
+        .to_string()
+}
+
+/// Full EF/CF benchmark matrix as [`BenchmarkPlanEntry`] rows.
+///
+/// Rows use compiled fixtures under `tests/contracts/efcf-compiled/{Stem}.bin` when present;
+/// otherwise they are [`BenchmarkPlanEntry::Unavailable`] with a reason (so CI can track
+/// coverage of the matrix vs available bytecode).
+pub fn efcf_matrix_plan(
+    timeout: Duration,
+    max_depth: u32,
+    max_execs: Option<u64>,
+) -> Vec<BenchmarkPlanEntry> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let compiled_root = root.join("tests").join("contracts").join("efcf-compiled");
+    let mut out = Vec::new();
+    for entry in benchmark_matrix() {
+        let stem = contract_stem_from_path(entry.contract_file);
+        let bin_path = compiled_root.join(format!("{stem}.bin"));
+        if !bin_path.exists() {
+            out.push(BenchmarkPlanEntry::Unavailable {
+                target: stem.clone(),
+                property: property_label_for_bug(entry.expected_bug),
+                category: category_label_for_bug(entry.expected_bug),
+                mode: "fast".into(),
+                reason: format!("compiled fixture missing: {}", bin_path.display()),
+            });
+            continue;
+        }
+        let matcher = matcher_for_expected_bug(entry.expected_bug);
+        match load_compiled_fixture_case(
+            &stem,
+            &property_label_for_bug(entry.expected_bug),
+            &category_label_for_bug(entry.expected_bug),
+            matcher,
+            timeout,
+            max_depth,
+            max_execs,
+            "campaign",
+        ) {
+            Ok(case) => out.push(BenchmarkPlanEntry::Ready(case)),
+            Err(err) => out.push(BenchmarkPlanEntry::Unavailable {
+                target: stem,
+                property: property_label_for_bug(entry.expected_bug),
+                category: category_label_for_bug(entry.expected_bug),
+                mode: "fast".into(),
+                reason: err.to_string(),
+            }),
+        }
+    }
+    out
+}
+
+/// Write matrix plan statistics JSON (ready vs unavailable fixture counts).
+pub fn write_benchmark_matrix_report_json(
+    plan: &[BenchmarkPlanEntry],
+    output_path: &Path,
+) -> crate::Result<()> {
+    let ready = plan
+        .iter()
+        .filter(|e| matches!(e, BenchmarkPlanEntry::Ready(_)))
+        .count();
+    let unavailable = plan.len() - ready;
+    let v = serde_json::json!({
+        "schema": "chimerafuzz-benchmark-matrix-v1",
+        "total_matrix_entries": benchmark_matrix_len(),
+        "plan_entries": plan.len(),
+        "ready": ready,
+        "unavailable": unavailable,
+    });
+    std::fs::write(output_path, serde_json::to_string_pretty(&v)?)?;
+    Ok(())
+}
+
+fn run_chimera_fuzz_case(case: &BenchmarkCase, seed: u64) -> ScorecardEntry {
     let config = CampaignConfig {
         timeout: case.timeout,
         max_execs: case.max_execs,
@@ -338,7 +456,7 @@ fn run_sci_fuzz_case(case: &BenchmarkCase, seed: u64) -> ScorecardEntry {
                 matched.map(|record| record.finding.reproducer.len()),
                 report.finding_count,
                 report.deduped_finding_count,
-                BenchmarkEngine::SciFuzz,
+                BenchmarkEngine::ChimeraFuzz,
                 case.detection_mechanism.clone(),
             )
         }
@@ -348,14 +466,14 @@ fn run_sci_fuzz_case(case: &BenchmarkCase, seed: u64) -> ScorecardEntry {
             &case.category,
             &case.mode,
             seed,
-            BenchmarkEngine::SciFuzz,
+            BenchmarkEngine::ChimeraFuzz,
             BenchmarkStatus::Failed,
             err.to_string(),
         ),
     }
 }
 
-fn load_compiled_fixture_case(
+pub(crate) fn load_compiled_fixture_case(
     name: &str,
     property: &str,
     category: &str,
@@ -456,7 +574,7 @@ impl ExternalComparisonAdapter {
                 BenchmarkStatus::Skipped,
                 "echidna adapter currently supports no benchmark case format in this pipeline",
             ),
-            BenchmarkEngine::SciFuzz => ScorecardEntry::with_status(
+            BenchmarkEngine::ChimeraFuzz => ScorecardEntry::with_status(
                 &case.target,
                 &case.property,
                 &case.category,
@@ -576,7 +694,7 @@ fn prepare_forge_run_context(
         ));
     }
     let scratch_dir = std::env::temp_dir().join(format!(
-        "sci-fuzz-benchmark-{}-{}",
+        "chimerafuzz-benchmark-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -741,20 +859,20 @@ mod tests {
     }
 
     #[test]
-    fn multi_seed_sci_fuzz_benchmark_emits_stable_schema_artifacts() {
+    fn multi_seed_chimera_fuzz_benchmark_emits_stable_schema_artifacts() {
         let case = BenchmarkCase::new("Empty", "campaign", "Smoke", Vec::new())
             .with_timeout(Duration::from_millis(1))
             .with_max_execs(Some(0));
         let plan = vec![BenchmarkPlanEntry::Ready(case)];
         let seeds = [11u64, 22u64];
-        let engines = [BenchmarkEngine::SciFuzz, BenchmarkEngine::Forge];
+        let engines = [BenchmarkEngine::ChimeraFuzz, BenchmarkEngine::Forge];
         let board = run_benchmark_plan(&plan, &seeds, &engines);
 
         assert_eq!(board.len(), 4);
         assert_eq!(
             board.entries()[0].status,
             BenchmarkStatus::Measured,
-            "first row should be the measured sci-fuzz run"
+            "first row should be the measured chimerafuzz run"
         );
         assert!(board
             .entries()

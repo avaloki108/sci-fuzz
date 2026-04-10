@@ -1,7 +1,7 @@
 # Pre-Sequence Protocol Reconciliation: Phases 2-5 Handoff
 
 ## Summary of Work
-Building on the pre-sequence probe infrastructure completed in Phase 1, we have successfully implemented the full **Delta-Driven Accounting Reconciliation Layer** for `sci-fuzz`. The fuzzer now actively parses sequence execution logs, formulates an expected event-driven accounting intent, and strictly reconciles this intent against the snapshot protocol probes (pre vs. post sequence).
+Building on the pre-sequence probe infrastructure completed in Phase 1, we have successfully implemented the full **Delta-Driven Accounting Reconciliation Layer** for `chimerafuzz`. The fuzzer now actively parses sequence execution logs, formulates an expected event-driven accounting intent, and strictly reconciles this intent against the snapshot protocol probes (pre vs. post sequence).
 
 ### Key Accomplishments
 1. **Phase 2 (Translation):** 

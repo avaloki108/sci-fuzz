@@ -1,0 +1,10 @@
+{
+  "schema": "chimerafuzz-benchmark-plan-v1",
+  "description": "Default pinned benchmark parameters for regression scripts",
+  "presets": ["efcf-demo", "efcf-matrix"],
+  "seeds": [1, 2, 3],
+  "max_execs": 5000,
+  "timeout_secs": 30,
+  "max_depth": 8,
+  "engines": ["chimerafuzz"]
+}

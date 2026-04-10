@@ -315,14 +315,14 @@ pub fn append_triage_simple(
 ) -> String {
     let head = if let Some(p) = profile {
         format!(
-            "Protocol classification (sci-fuzz): {} (erc4626_score={}, erc20_score={}, amm_score={}).\n",
+            "Protocol classification (chimerafuzz): {} (erc4626_score={}, erc20_score={}, amm_score={}).\n",
             protocol_kind_label(p.primary),
             p.erc4626_score,
             p.erc20_score,
             p.amm_score
         )
     } else {
-        "Protocol classification (sci-fuzz): unknown (no ABI profile).\n".to_string()
+        "Protocol classification (chimerafuzz): unknown (no ABI profile).\n".to_string()
     };
     format!(
         "{base}\n\n{head}\

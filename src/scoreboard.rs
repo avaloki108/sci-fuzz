@@ -14,7 +14,7 @@ use crate::types::Finding;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BenchmarkEngine {
-    SciFuzz,
+    ChimeraFuzz,
     Echidna,
     Forge,
 }
@@ -22,7 +22,7 @@ pub enum BenchmarkEngine {
 impl std::fmt::Display for BenchmarkEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::SciFuzz => write!(f, "sci-fuzz"),
+            Self::ChimeraFuzz => write!(f, "chimerafuzz"),
             Self::Echidna => write!(f, "echidna"),
             Self::Forge => write!(f, "forge"),
         }
@@ -81,7 +81,7 @@ elapsed_ms,repro_len_raw,repro_len_shrunk,finding_count,deduped_finding_count,en
 detection_mechanism,error"
     }
 
-    /// Legacy helper used by existing tests: sci-fuzz measured miss.
+    /// Legacy helper used by existing tests: chimerafuzz measured miss.
     pub fn not_found(
         target: &str,
         property: &str,
@@ -105,14 +105,14 @@ detection_mechanism,error"
             repro_len_shrunk: None,
             finding_count: 0,
             deduped_finding_count: 0,
-            engine: BenchmarkEngine::SciFuzz,
+            engine: BenchmarkEngine::ChimeraFuzz,
             status: BenchmarkStatus::Measured,
             detection_mechanism: None,
             error: None,
         }
     }
 
-    /// Legacy helper used by existing tests: sci-fuzz measured hit.
+    /// Legacy helper used by existing tests: chimerafuzz measured hit.
     pub fn found(
         target: &str,
         property: &str,
@@ -140,7 +140,7 @@ detection_mechanism,error"
             repro_len_shrunk: Some(finding.reproducer.len()),
             finding_count: 1,
             deduped_finding_count: 1,
-            engine: BenchmarkEngine::SciFuzz,
+            engine: BenchmarkEngine::ChimeraFuzz,
             status: BenchmarkStatus::Measured,
             detection_mechanism: Some(detection_mechanism.into()),
             error: None,
@@ -579,7 +579,7 @@ mod tests {
         );
 
         let json = serde_json::to_string(&entry).unwrap();
-        assert!(json.contains("\"engine\":\"sci-fuzz\""));
+        assert!(json.contains("\"engine\":\"chimerafuzz\""));
         assert!(json.contains("\"status\":\"measured\""));
         let roundtrip: ScorecardEntry = serde_json::from_str(&json).unwrap();
         assert!(roundtrip.found);
@@ -647,7 +647,7 @@ mod tests {
                 Some(3),
                 2,
                 1,
-                BenchmarkEngine::SciFuzz,
+                BenchmarkEngine::ChimeraFuzz,
                 Some("oracle".into()),
             ),
             ScorecardEntry::measured(
@@ -665,7 +665,7 @@ mod tests {
                 None,
                 0,
                 0,
-                BenchmarkEngine::SciFuzz,
+                BenchmarkEngine::ChimeraFuzz,
                 None,
             ),
             ScorecardEntry::measured(
@@ -683,7 +683,7 @@ mod tests {
                 Some(5),
                 1,
                 1,
-                BenchmarkEngine::SciFuzz,
+                BenchmarkEngine::ChimeraFuzz,
                 Some("oracle".into()),
             ),
         ];
@@ -717,7 +717,7 @@ mod tests {
         assert_eq!(summaries.len(), 2);
         assert!(summaries
             .iter()
-            .any(|summary| summary.engine == BenchmarkEngine::SciFuzz));
+            .any(|summary| summary.engine == BenchmarkEngine::ChimeraFuzz));
         assert!(summaries
             .iter()
             .any(|summary| summary.engine == BenchmarkEngine::Echidna));

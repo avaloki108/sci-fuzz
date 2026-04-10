@@ -107,6 +107,57 @@ impl Invariant for BalanceIncrease {
     }
 }
 
+/// ERC-20 attacker token gain from `balanceOf(attacker)` probes (pre vs post tx).
+pub struct Erc20AttackerTokenGainOracle {
+    pub attacker: Address,
+    pub min_gain: U256,
+}
+
+impl Invariant for Erc20AttackerTokenGainOracle {
+    fn name(&self) -> &str {
+        "erc20-attacker-token-gain"
+    }
+
+    fn check(
+        &self,
+        _pre_balances: &HashMap<Address, U256>,
+        pre_probes: &crate::types::ProtocolProbeReport,
+        result: &ExecutionResult,
+        sequence: &[Transaction],
+    ) -> Option<Finding> {
+        if sequence.is_empty() {
+            return None;
+        }
+        use crate::protocol_probes::probe_u256;
+        for (addr, post_snap) in &result.protocol_probes.per_contract {
+            let pre_snap = pre_probes.per_contract.get(addr)?;
+            let post_e = post_snap.erc20.as_ref()?;
+            let pre_e = pre_snap.erc20.as_ref()?;
+            let pre_b = probe_u256(pre_e.balance_of_caller.as_ref()?)?;
+            let post_b = probe_u256(post_e.balance_of_caller.as_ref()?)?;
+            if post_b > pre_b {
+                let gain = post_b - pre_b;
+                if gain >= self.min_gain {
+                    return Some(Finding {
+                        severity: Severity::High,
+                        title: format!(
+                            "ERC-20 attacker balance increased by {gain} (token {addr:#x})"
+                        ),
+                        description: format!(
+                            "balanceOf({}) on token {addr:#x} increased from {pre_b} to {post_b}",
+                            self.attacker
+                        ),
+                        contract: *addr,
+                        reproducer: sequence.to_vec(),
+                        exploit_profit: Some(gain),
+                    });
+                }
+            }
+        }
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Built-in: UnexpectedRevert
 // ---------------------------------------------------------------------------
@@ -1208,6 +1259,10 @@ impl InvariantRegistry {
             attacker,
             threshold: U256::from(1u64),
         }));
+        reg.add(Box::new(Erc20AttackerTokenGainOracle {
+            attacker,
+            min_gain: crate::economic::MIN_LARGE_TOKEN_MOVE,
+        }));
         reg.add(Box::new(UnexpectedRevert::default()));
         reg.add(Box::new(SelfDestructDetector { attacker }));
         reg.add(Box::new(EchidnaProperty));
@@ -1340,6 +1395,7 @@ mod tests {
             assume_violated: false,
             revert_was_expected: false,
             sstore_in_nested_call: false,
+            cmp_events: Vec::new(),
         }
     }
 
@@ -1487,8 +1543,8 @@ mod tests {
         // UniswapV2StyleSwapReserve, AmmSyncExplained, Erc4626PreviewVsDepositEvent,
         // UniswapV2StyleSyncVsGetReserves, Erc4626RateJumpWithoutTokenFlow,
         // Erc4626DepositVsUnderlyingTransfer, Erc4626FirstDepositorInflation,
-        // ReentrancyOracle, LendingHealthOracle (22 total)
-        assert_eq!(reg.len(), 22);
+        // ReentrancyOracle, Erc20AttackerTokenGainOracle, LendingHealthOracle (23 total)
+        assert_eq!(reg.len(), 23);
         assert!(!reg.is_empty());
     }
 
@@ -1539,6 +1595,7 @@ mod tests {
             assume_violated: false,
             revert_was_expected: false,
             sstore_in_nested_call: false,
+            cmp_events: Vec::new(),
         }
     }
 
@@ -1677,8 +1734,8 @@ mod tests {
         let attacker = Address::repeat_byte(0x99);
         let tokens = vec![Address::repeat_byte(0xA1), Address::repeat_byte(0xA2)];
         let reg = InvariantRegistry::with_erc20(attacker, &tokens);
-        // 22 defaults + 2 ERC20Supply invariants
-        assert_eq!(reg.len(), 24);
+        // 23 defaults + 2 ERC20Supply invariants
+        assert_eq!(reg.len(), 25);
     }
 
     // -- EchidnaPropertyCaller tests ------------------------------------------
@@ -1899,6 +1956,7 @@ mod tests {
             assume_violated: false,
             revert_was_expected: false,
             sstore_in_nested_call,
+            cmp_events: Vec::new(),
         }
     }
 

@@ -1,5 +1,5 @@
 [package]
-name = "sci-fuzz"
+name = "chimerafuzz"
 version = "0.1.0"
 edition = "2021"
 description = "Smart Contract Invariant Fuzzer — a coverage-guided fuzzer for EVM smart contracts"
@@ -7,7 +7,7 @@ license = "MIT"
 publish = false
 
 [lib]
-name = "sci_fuzz"
+name = "chimera_fuzz"
 path = "src/lib.rs"
 
 # ---------------------------------------------------------------------------
@@ -15,7 +15,7 @@ path = "src/lib.rs"
 # ---------------------------------------------------------------------------
 
 [[bin]]
-name = "sci-fuzz"
+name = "chimerafuzz"
 path = "src/main.rs"
 
 [dependencies]

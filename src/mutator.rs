@@ -214,6 +214,15 @@ impl ValueDictionary {
             self.extract_words_from_bytes(&log.data);
         }
 
+        // CmpLog / comparison constants (Redqueen-style auto-dictionary).
+        for ev in &result.cmp_events {
+            for v in [ev.lhs, ev.rhs] {
+                if !self.uint_values.contains(&v) {
+                    self.uint_values.push(v);
+                }
+            }
+        }
+
         // Extract from storage writes.
         for (addr, writes) in &result.state_diff.storage_writes {
             if !self.address_values.contains(addr) {

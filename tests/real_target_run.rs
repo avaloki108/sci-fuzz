@@ -1,5 +1,5 @@
 //! Integration test: deploy a real compiled contract, run the fuzzer against it,
-//! and verify that sci-fuzz produces an actual finding with a concrete
+//! and verify that chimerafuzz produces an actual finding with a concrete
 //! reproducer.
 //!
 //! This is the "targets > 0" proof that the engine actually works end-to-end:
@@ -18,13 +18,13 @@ use std::time::{Duration, Instant};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use sci_fuzz::evm::EvmExecutor;
-use sci_fuzz::feedback::CoverageFeedback;
-use sci_fuzz::invariant::EchidnaPropertyCaller;
-use sci_fuzz::mutator::TxMutator;
-use sci_fuzz::oracle::OracleEngine;
-use sci_fuzz::snapshot::SnapshotCorpus;
-use sci_fuzz::types::{
+use chimera_fuzz::evm::EvmExecutor;
+use chimera_fuzz::feedback::CoverageFeedback;
+use chimera_fuzz::invariant::EchidnaPropertyCaller;
+use chimera_fuzz::mutator::TxMutator;
+use chimera_fuzz::oracle::OracleEngine;
+use chimera_fuzz::snapshot::SnapshotCorpus;
+use chimera_fuzz::types::{
     Address, Bytes, CampaignConfig, ContractInfo, ExecutorMode, Finding, StateSnapshot,
     Transaction, U256,
 };
@@ -131,11 +131,11 @@ fn real_target_prop_false_found() {
     // --- Main fuzzing loop (mini-campaign) ---------------------------------
     while start.elapsed() < timeout && findings.is_empty() {
         let db_snap = executor.snapshot();
-        let pre_seq_balances = sci_fuzz::oracle::capture_eth_baseline(&executor, deployer);
+        let pre_seq_balances = chimera_fuzz::oracle::capture_eth_baseline(&executor, deployer);
 
         let seq_len: usize = rng.gen_range(1..=4);
         let mut sequence: Vec<Transaction> = Vec::new();
-        let mut cumulative_logs: Vec<sci_fuzz::types::Log> = Vec::new();
+        let mut cumulative_logs: Vec<chimera_fuzz::types::Log> = Vec::new();
 
         for _ in 0..seq_len {
             let tx = if sequence.is_empty() || rng.gen_bool(0.3) {
@@ -153,7 +153,7 @@ fn real_target_prop_false_found() {
                     sequence.push(tx.clone());
 
                     // Check built-in invariants (sequence includes current tx).
-                    let oracle_findings = oracle.check(&pre_seq_balances, &sci_fuzz::types::ProtocolProbeReport::default(), &result, &sequence);
+                    let oracle_findings = oracle.check(&pre_seq_balances, &chimera_fuzz::types::ProtocolProbeReport::default(), &result, &sequence);
                     for f in oracle_findings {
                         let mut finding = f;
                         let mut repro = sequence.clone();
@@ -184,7 +184,7 @@ fn real_target_prop_false_found() {
 
     assert!(
         !findings.is_empty(),
-        "PropFalse has an always-false property — sci-fuzz MUST find it. \
+        "PropFalse has an always-false property — chimerafuzz MUST find it. \
          Executed {total_execs} transactions in {:.2}s with 0 findings.",
         start.elapsed().as_secs_f64(),
     );
@@ -364,7 +364,7 @@ fn real_target_prop_stateful_found_via_fuzzing() {
             elapsed.as_secs_f64(),
         );
         eprintln!("    This is expected for a random fuzzer without targeted sequence generation.");
-        eprintln!("    To make this reliable, sci-fuzz needs:");
+        eprintln!("    To make this reliable, chimerafuzz needs:");
         eprintln!(
             "    - Corpus-based sequence building (reuse successful deposit before withdraw)"
         );
@@ -447,7 +447,7 @@ fn campaign_with_real_target() {
         ..Default::default()
     };
 
-    let mut campaign = sci_fuzz::campaign::Campaign::new(config);
+    let mut campaign = chimera_fuzz::campaign::Campaign::new(config);
     let findings = campaign.run().expect("campaign must not error");
 
     // The campaign's built-in oracle might or might not detect the always-false
@@ -609,7 +609,7 @@ fn campaign_solves_prop_stateful() {
         ..Default::default()
     };
 
-    let mut campaign = sci_fuzz::campaign::Campaign::new(config);
+    let mut campaign = chimera_fuzz::campaign::Campaign::new(config);
     let findings = campaign.run().expect("campaign must not error");
 
     let prop_findings: Vec<&Finding> = findings

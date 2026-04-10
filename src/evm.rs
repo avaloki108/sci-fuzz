@@ -1,4 +1,4 @@
-//! EVM execution wrapper for sci-fuzz.
+//! EVM execution wrapper for chimerafuzz.
 //!
 //! Wraps [`revm`] (v19.x) to provide a simple, snapshot-capable EVM executor
 //! for smart-contract fuzzing.  The executor uses an in-memory
@@ -25,9 +25,10 @@ use crate::cheatcodes::{self, TxCheatcodeState};
 use crate::path_id::{native_flashloan_path_id, PathStreamHasher};
 use crate::rpc::FuzzerDatabase;
 use crate::types::{
-    Address, Bytes, CoverageMap, ExecutionResult, ExecutorMode, Log, StateDiff, Transaction, B256,
-    U256,
+    Address, Bytes, CmpOpcodeKind, ComparisonEvent, CoverageMap, ExecutionResult, ExecutorMode,
+    Log, StateDiff, Transaction, B256, U256,
 };
+use revm::interpreter::opcode;
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
@@ -64,6 +65,8 @@ struct CoverageInspector {
     /// Set to `true` the first time an `SSTORE` fires while `call_depth > 0`.
     /// Propagated into [`ExecutionResult::sstore_in_nested_call`] by the executor.
     pub sstore_in_nested_call: bool,
+    /// CmpLog-style comparison events (bounded).
+    cmp_events: Vec<ComparisonEvent>,
 }
 
 impl<DB: Database> Inspector<DB> for CoverageInspector {
@@ -80,7 +83,18 @@ impl<DB: Database> Inspector<DB> for CoverageInspector {
         // ── Cheatcode interception ────────────────────────────────────────────
         if inputs.target_address == cheatcodes::FORGE_VM_ADDRESS {
             let calldata = inputs.input.as_ref();
+            let selector = if calldata.len() >= 4 {
+                [calldata[0], calldata[1], calldata[2], calldata[3]]
+            } else {
+                [0, 0, 0, 0]
+            };
+
+            eprintln!("[cheatcode] CALLED: selector={:#02x}{:02x}{:02x}{:02x}, data_len={}",
+                selector[0], selector[1], selector[2], selector[3], calldata.len());
+
             let (success, output) = cheatcodes::dispatch(&mut self.cheatcodes, context, calldata);
+
+            eprintln!("[cheatcode] RETURN: success={}, output_len={}", success, output.len());
 
             let instruction_result = if success {
                 InstructionResult::Return
@@ -88,14 +102,19 @@ impl<DB: Database> Inspector<DB> for CoverageInspector {
                 InstructionResult::Revert
             };
 
-            return Some(CallOutcome {
+            let outcome = CallOutcome {
                 result: InterpreterResult {
                     result: instruction_result,
                     output: output.into(),
-                    gas: Gas::new(inputs.gas_limit),
+                    gas: Gas::new(inputs.gas_limit), // TODO: track actual gas usage
                 },
                 memory_offset: inputs.return_memory_offset.clone(),
-            });
+            };
+
+            eprintln!("[cheatcode] CallOutcome: result={:?}, output_len={}, memory_offset={:?}",
+                outcome.result.result, outcome.result.output.len(), outcome.memory_offset);
+
+            return Some(outcome);
         }
 
         // ── Mock call interception ────────────────────────────────────────────
@@ -136,6 +155,7 @@ impl<DB: Database> Inspector<DB> for CoverageInspector {
         _inputs: &CallInputs,
         outcome: CallOutcome,
     ) -> CallOutcome {
+        eprintln!("[call_end] depth: {} -> {}, result: {:?}", self.call_depth, self.call_depth.saturating_sub(1), outcome.result.result);
         if self.call_depth > 0 {
             self.call_depth -= 1;
         }
@@ -147,6 +167,12 @@ impl<DB: Database> Inspector<DB> for CoverageInspector {
             .contract
             .bytecode_address
             .unwrap_or(interp.contract.target_address);
+
+        // Debug: log ALL instructions to understand the full execution flow
+        let pc = interp.program_counter();
+        let op = interp.current_opcode();
+        eprintln!("[step] addr={:?} pc={} op={:#04x} ({}) depth={}",
+            address, pc, op as u16, op as u8, self.call_depth);
 
         if self.last_coverage_address != Some(address) {
             self.prev_pc = None;
@@ -171,7 +197,61 @@ impl<DB: Database> Inspector<DB> for CoverageInspector {
         if op == revm::interpreter::opcode::SSTORE && self.call_depth > 0 {
             self.sstore_in_nested_call = true;
         }
+
+        // CmpLog-style comparison harvesting (bounded) for Redqueen/dictionary seeding.
+        const MAX_CMP: usize = 512;
+        if self.cmp_events.len() < MAX_CMP {
+            let depth = self.call_depth;
+            let stack_len = interp.stack().len();
+            match op {
+                opcode::EQ | opcode::LT | opcode::GT | opcode::SLT | opcode::SGT
+                    if stack_len >= 2 =>
+                {
+                    if let (Ok(a), Ok(b)) = (interp.stack().peek(0), interp.stack().peek(1)) {
+                        let lhs = u256_from_revm_word(b);
+                        let rhs = u256_from_revm_word(a);
+                        let kind = if op == opcode::EQ {
+                            CmpOpcodeKind::Eq
+                        } else if op == opcode::LT {
+                            CmpOpcodeKind::Lt
+                        } else if op == opcode::GT {
+                            CmpOpcodeKind::Gt
+                        } else if op == opcode::SLT {
+                            CmpOpcodeKind::Slt
+                        } else {
+                            CmpOpcodeKind::Sgt
+                        };
+                        self.cmp_events.push(ComparisonEvent {
+                            contract: address,
+                            call_depth: depth,
+                            pc: current_pc,
+                            kind,
+                            lhs,
+                            rhs,
+                        });
+                    }
+                }
+                opcode::ISZERO if stack_len >= 1 => {
+                    if let Ok(v) = interp.stack().peek(0) {
+                        self.cmp_events.push(ComparisonEvent {
+                            contract: address,
+                            call_depth: depth,
+                            pc: current_pc,
+                            kind: CmpOpcodeKind::IsZero,
+                            lhs: u256_from_revm_word(v),
+                            rhs: U256::ZERO,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
     }
+}
+
+#[inline]
+fn u256_from_revm_word(x: revm::primitives::U256) -> U256 {
+    U256::from_be_bytes(x.to_be_bytes::<32>())
 }
 
 // ---------------------------------------------------------------------------
@@ -194,6 +274,10 @@ pub struct EvmExecutor {
     /// Updated after each `execute()` call to propagate `vm.startPrank`
     /// and `vm.warp` / `vm.roll` effects.
     pub cheatcode_state: crate::cheatcodes::ExecutorCheatcodeState,
+    /// Artifact bytecode lookup for `vm.deployCode()` support.
+    /// Maps contract name (e.g. "Morpho") or filename (e.g. "Morpho.sol")
+    /// to creation bytecode (with constructor args appended by the caller).
+    pub artifact_bytecodes: std::collections::HashMap<String, Bytes>,
 }
 
 impl EvmExecutor {
@@ -217,6 +301,7 @@ impl EvmExecutor {
             deploy_nonce: 0,
             mode: ExecutorMode::Fast,
             cheatcode_state: crate::cheatcodes::ExecutorCheatcodeState::default(),
+            artifact_bytecodes: std::collections::HashMap::new(),
         }
     }
 
@@ -309,6 +394,7 @@ impl EvmExecutor {
         let assume_violated = ext.cheatcodes.assume_violation;
         let expected_revert = ext.cheatcodes.expected_revert.take();
         let sstore_in_nested_call = ext.sstore_in_nested_call;
+        let cmp_events = ext.cmp_events.clone();
 
         // Commit state changes into the CacheDB.
         drop(evm); // release mutable borrow on self.db
@@ -344,6 +430,7 @@ impl EvmExecutor {
             coverage,
             dataflow,
             tx_path_id,
+            cmp_events,
         )?;
         exec_result.assume_violated = assume_violated;
         exec_result.sstore_in_nested_call = sstore_in_nested_call;
@@ -423,6 +510,9 @@ impl EvmExecutor {
         // CREATE uses the deployer's on-chain nonce (including forked state).
         let nonce_before = self.deployer_nonce(deployer);
 
+        eprintln!("[deploy] starting CREATE: deployer={:?}, nonce={}, bytecode_len={}",
+            deployer, nonce_before, bytecode.len());
+
         let tx = Transaction {
             sender: deployer,
             to: None,
@@ -432,10 +522,18 @@ impl EvmExecutor {
         };
 
         let result = self.execute(&tx).context("deploy transaction failed")?;
+
+        eprintln!("[deploy] CREATE result: success={}, output_len={}, state_diff_keys={}",
+            result.success, result.output.len(), result.state_diff.storage_writes.len());
+
         if !result.success {
+            // Debug: print the actual execution result for debugging
+            eprintln!("[deploy] CREATE failed: success={}, output_len={}, output=0x{}",
+                result.success, result.output.len(), hex::encode(&result.output));
             return Err(anyhow!(
-                "deploy reverted: 0x{}",
-                hex::encode(&result.output)
+                "deploy reverted: 0x{} (output length: {})",
+                hex::encode(&result.output),
+                result.output.len()
             ));
         }
 
@@ -488,6 +586,18 @@ impl EvmExecutor {
     }
 
     // -- Account helpers ----------------------------------------------------
+
+    /// Get the deployed bytecode at an address (empty Bytes if no code).
+    pub fn get_code(&self, addr: Address) -> Option<Bytes> {
+        match self.db.basic_ref(addr) {
+            Ok(Some(info)) => {
+                info.code.map(|bytecode| {
+                    Bytes::from(bytecode.bytes().to_vec())
+                })
+            }
+            _ => None,
+        }
+    }
 
     /// Insert (or overwrite) account info for `addr`.
     ///
@@ -606,6 +716,7 @@ impl EvmExecutor {
         coverage: CoverageMap,
         dataflow: crate::types::DataflowWaypoints,
         tx_path_id: B256,
+        cmp_events: Vec<ComparisonEvent>,
     ) -> Result<ExecutionResult> {
         let (success, gas_used, output, logs) = match result {
             RevmResult::Success {
@@ -653,6 +764,7 @@ impl EvmExecutor {
             assume_violated: false,
             revert_was_expected: false,
             sstore_in_nested_call: false,
+            cmp_events,
         })
     }
 
@@ -708,7 +820,7 @@ impl Default for EvmExecutor {
 /// Compute the address produced by `CREATE` given `sender` and `nonce`.
 ///
 /// `address = keccak256(rlp([sender, nonce]))[12..]`
-fn compute_create_address(sender: Address, nonce: u64) -> Address {
+pub fn compute_create_address(sender: Address, nonce: u64) -> Address {
     use tiny_keccak::{Hasher, Keccak};
 
     let stream = rlp_encode_sender_nonce(&sender, nonce);

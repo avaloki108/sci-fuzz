@@ -1,4 +1,4 @@
-//! Foundry-style harness setup (`setUp`) executed inside sci-fuzz's revm executor.
+//! Foundry-style harness setup (`setUp`) executed inside chimerafuzz's revm executor.
 
 use anyhow::{Context, Result};
 

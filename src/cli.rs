@@ -11,7 +11,7 @@ use crate::types::TestMode;
 /// Sci-Fuzz: Next-generation smart contract fuzzer
 #[derive(Parser, Debug)]
 #[command(
-    name = "sci-fuzz",
+    name = "chimerafuzz",
     version,
     about = "State-first smart contract fuzzer for EVM targets",
     long_about = r#"
@@ -73,7 +73,7 @@ deep-state vulnerabilities.
         long_about = r#"
 Fork at a block (or `latest`) and fuzz one or more predeployed addresses on that chain state.
 Requires `--rpc-url` or `ETH_RPC_URL`. Optional Etherscan ABI fetch per address when an API key is set.
-This is sci-fuzz’s own revm campaign — not `forge test` and not a cheatcode VM.
+This is chimerafuzz’s own revm campaign — not `forge test` and not a cheatcode VM.
 "#
     )]
     Audit(AuditArgs),
@@ -83,7 +83,7 @@ This is sci-fuzz’s own revm campaign — not `forge test` and not a cheatcode 
         name = "test",
         about = "Run Foundry tests with enhanced fuzzing",
         long_about = r#"
-Thin project-mode wrapper for in-engine sci-fuzz campaigns.
+Thin project-mode wrapper for in-engine chimerafuzz campaigns.
 Builds the Foundry project in the current directory, selects fuzz targets,
 optionally filters by `--match-contract` / `--match-test`, and runs a campaign
 with test-oriented defaults.
@@ -115,7 +115,7 @@ Load a serialized CampaignFindingRecord from a JSON file and re-execute
 its reproducer sequence against the target contracts. Reports whether
 the finding still triggers.
 
-Usage: sci-fuzz replay --project ./my-proj finding_0001_critical.json
+Usage: chimerafuzz replay --project ./my-proj finding_0001_critical.json
 "#
     )]
     Replay(ReplayArgs),
@@ -144,7 +144,7 @@ pub struct ForgeArgs {
     #[arg(short, long, default_value = ".")]
     pub project: PathBuf,
 
-    /// Path to sci-fuzz.toml config file (default: auto-discover)
+    /// Path to chimerafuzz.toml config file (default: auto-discover)
     #[arg(long)]
     pub config: Option<String>,
 
@@ -281,7 +281,7 @@ pub struct BenchmarkArgs {
     pub category: String,
 
     /// Engines to include, comma-separated
-    #[arg(long, value_delimiter = ',', default_values_t = vec![BenchmarkEngineArg::SciFuzz, BenchmarkEngineArg::Echidna, BenchmarkEngineArg::Forge])]
+    #[arg(long, value_delimiter = ',', default_values_t = vec![BenchmarkEngineArg::ChimeraFuzz, BenchmarkEngineArg::Echidna, BenchmarkEngineArg::Forge])]
     pub engines: Vec<BenchmarkEngineArg>,
 
     /// Seeds to run, comma-separated
@@ -511,7 +511,7 @@ pub enum SnapshotStrategy {
 /// Benchmark engines supported by the CLI
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum BenchmarkEngineArg {
-    SciFuzz,
+    ChimeraFuzz,
     Echidna,
     Forge,
 }
@@ -519,7 +519,7 @@ pub enum BenchmarkEngineArg {
 impl std::fmt::Display for BenchmarkEngineArg {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::SciFuzz => write!(f, "sci-fuzz"),
+            Self::ChimeraFuzz => write!(f, "chimerafuzz"),
             Self::Echidna => write!(f, "echidna"),
             Self::Forge => write!(f, "forge"),
         }
@@ -625,7 +625,7 @@ pub fn display_version() {
     );
     println!();
     println!("License: MIT OR Apache-2.0");
-    println!("Repository: https://github.com/your-org/sci-fuzz");
+    println!("Repository: https://github.com/your-org/chimerafuzz");
 }
 
 /// Convert verbosity level to tracing level
@@ -645,7 +645,7 @@ pub fn init_logging(verbosity: &Verbosity) {
 
     let level = verbosity_to_level(verbosity);
     let filter = EnvFilter::from_default_env()
-        .add_directive(format!("sci_fuzz={}", level.as_str()).parse().unwrap());
+        .add_directive(format!("chimera_fuzz={}", level.as_str()).parse().unwrap());
 
     tracing_subscriber::registry()
         .with(fmt::layer().with_target(false).with_thread_ids(false))
@@ -664,7 +664,7 @@ mod tests {
         Cli::command().debug_assert();
 
         // Test basic argument parsing
-        let args = vec!["sci-fuzz", "forge", "--depth", "100"];
+        let args = vec!["chimerafuzz", "forge", "--depth", "100"];
         let cli = Cli::parse_from(args);
         match cli.command {
             Commands::Forge(ref forge_args) => {
@@ -674,7 +674,7 @@ mod tests {
         }
 
         let audit = vec![
-            "sci-fuzz",
+            "chimerafuzz",
             "audit",
             "0x1111111111111111111111111111111111111111",
             "0x2222222222222222222222222222222222222222",

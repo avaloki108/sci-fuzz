@@ -522,9 +522,9 @@ impl Project {
         // This is prioritized over the standard `out/` when present because it
         // typically was built specifically for fuzzing (smaller artifact set,
         // echidna harnesses included).
-        let scifuzz_out = self.root.join("out-scifuzz");
-        if scifuzz_out.exists() {
-            return scifuzz_out;
+        let chimerafuzz_out = self.root.join("out-chimerafuzz");
+        if chimerafuzz_out.exists() {
+            return chimerafuzz_out;
         }
 
         from_config.unwrap_or_else(|| self.root.join("out"))

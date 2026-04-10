@@ -44,12 +44,8 @@ fn worker_rng_seed(root_seed: u64, worker_id: usize) -> u64 {
 }
 
 /// Parallel fuzzing uses multiple threads only when local DB mode is active.
-fn effective_worker_count(workers: usize, rpc_url: &Option<String>) -> usize {
-    if rpc_url.is_some() && workers > 1 {
-        1
-    } else {
-        workers.max(1)
-    }
+fn effective_worker_count(workers: usize) -> usize {
+    workers.max(1)
 }
 
 fn executor_block_meta(executor: &EvmExecutor) -> (u64, u64) {
@@ -263,22 +259,22 @@ impl Campaign {
     /// Run the fuzzing loop and return both findings and execution metrics.
     pub fn run_with_report(&mut self) -> anyhow::Result<CampaignReport> {
         // NOTE: replay_sequence() is defined above if you need a no-fuzz reproducer path.
-        let effective_workers = effective_worker_count(self.config.workers, &self.config.rpc_url);
-        if self.config.rpc_url.is_some() && self.config.workers > 1 {
-            eprintln!(
-                "[campaign] RPC mode: forcing workers=1 (fork DB is not shared across threads)"
-            );
-        }
+        let effective_workers = effective_worker_count(self.config.workers);
 
         let mut rng = StdRng::seed_from_u64(self.config.seed);
         // --- 1. Set up the Executor ----------------------------------------
-        let mut executor = if let Some(ref url) = self.config.rpc_url {
+        let fork_rpc_shared = if let Some(ref url) = self.config.rpc_url {
             let url = url.trim();
             if url.is_empty() {
                 anyhow::bail!("fork campaign requires a non-empty rpc_url");
             }
-            let rpc_db = crate::rpc::RpcCacheDB::new(url, self.config.rpc_block_number)?;
-            EvmExecutor::new_with_db(FuzzerDatabase::Rpc(rpc_db))
+            Some(crate::rpc::RpcCacheDB::new(url, self.config.rpc_block_number)?)
+        } else {
+            None
+        };
+
+        let mut executor = if let Some(ref rpc_db) = fork_rpc_shared {
+            EvmExecutor::new_with_db(FuzzerDatabase::Rpc(rpc_db.clone()))
         } else {
             EvmExecutor::new()
         };
@@ -343,6 +339,39 @@ impl Campaign {
         }
 
         crate::bootstrap::fund_fork_addresses(&mut executor, &self.config);
+
+        // Populate the global artifact registry for vm.deployCode() support.
+        // This allows harness setUp() that uses deployCode() to find contracts.
+        // We register ALL discovered artifacts (including library dependencies)
+        // so deployCode("Morpho.sol", ...) works even when Morpho.sol isn't a fuzz target.
+        {
+            let mut artifacts: std::collections::HashMap<String, (Vec<u8>, Vec<u8>)> =
+                std::collections::HashMap::new();
+
+            // Register all discovered artifacts (targets + libraries + interfaces)
+            for contract in &self.config.all_artifacts {
+                let name = contract.name.clone().unwrap_or_default();
+                let creation = contract.creation_bytecode.as_ref()
+                    .map(|b| b.to_vec())
+                    .unwrap_or_default();
+                let deployed = contract.deployed_bytecode.to_vec();
+                if !deployed.is_empty() {
+                    // Register by name
+                    artifacts.insert(name.clone(), (creation.clone(), deployed.clone()));
+                    // Register by source path basename (e.g. "Morpho.sol")
+                    if let Some(ref path) = contract.source_path {
+                        if let Some(basename) = std::path::Path::new(path).file_name() {
+                            if let Some(bn) = basename.to_str() {
+                                artifacts.entry(bn.to_string())
+                                    .or_insert_with(|| (creation.clone(), deployed.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+
+            crate::cheatcodes::set_artifact_registry(artifacts);
+        }
 
         let bootstrap = crate::bootstrap::bootstrap_targets(&mut executor, &self.config, attacker)?;
         eprintln!(
@@ -439,6 +468,10 @@ impl Campaign {
                     Some(Arc::clone(&protocol_profiles)),
                 )
             }
+            TestMode::Economic | TestMode::Inferred => OracleEngine::new_with_protocol_profiles(
+                attacker,
+                Some(Arc::clone(&protocol_profiles)),
+            ),
         };
 
         // --- ABI-inferred invariants (Phase 6) ------------------------------
@@ -616,6 +649,7 @@ impl Campaign {
                 first_hit_time_ms: None,
                 seq_corpus,
             };
+            let fork_block_env = executor.block_env().clone();
             return run_parallel_campaign(
                 self.config.clone(),
                 inner,
@@ -626,6 +660,8 @@ impl Campaign {
                 attacker,
                 effective_workers,
                 deployed_targets,
+                fork_rpc_shared.clone(),
+                fork_block_env,
             );
         }
 
@@ -1126,6 +1162,8 @@ fn run_parallel_campaign(
     attacker: Address,
     worker_count: usize,
     deployed_targets: Vec<ContractInfo>,
+    fork_rpc_shared: Option<crate::rpc::RpcCacheDB>,
+    fork_block_env: revm::primitives::BlockEnv,
 ) -> anyhow::Result<CampaignReport> {
     let shared = Arc::new(Mutex::new(inner));
     let total_execs = Arc::new(AtomicU64::new(0));
@@ -1209,6 +1247,8 @@ fn run_parallel_campaign(
             let target_abis = Arc::clone(&target_abis);
             let protocol_profiles = protocol_profiles.clone();
             let config = Arc::clone(&config);
+            let fork_rpc = fork_rpc_shared.clone();
+            let fork_block_env = fork_block_env.clone();
             s.spawn(move || {
                 parallel_worker_loop(
                     worker_id,
@@ -1221,6 +1261,8 @@ fn run_parallel_campaign(
                     protocol_profiles,
                     attacker,
                     start,
+                    fork_rpc,
+                    fork_block_env,
                 );
             });
         }
@@ -1279,10 +1321,17 @@ fn parallel_worker_loop(
     protocol_profiles: ProtocolProfileMap,
     attacker: Address,
     campaign_start: Instant,
+    fork_rpc: Option<crate::rpc::RpcCacheDB>,
+    fork_block_env: revm::primitives::BlockEnv,
 ) {
     let mut rng = StdRng::seed_from_u64(worker_rng_seed(config.seed, worker_id));
-    let mut executor = EvmExecutor::new();
+    let mut executor = if let Some(db) = fork_rpc {
+        EvmExecutor::new_with_db(FuzzerDatabase::Rpc(db))
+    } else {
+        EvmExecutor::new()
+    };
     executor.set_mode(config.mode);
+    *executor.block_env_mut() = fork_block_env;
 
     loop {
         if campaign_start.elapsed() >= config.timeout {
@@ -1900,13 +1949,9 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn effective_worker_count_rpc_forces_single_thread() {
-        assert_eq!(
-            effective_worker_count(8, &Some("http://127.0.0.1:8545".to_string())),
-            1
-        );
-        assert_eq!(effective_worker_count(8, &None), 8);
-        assert_eq!(effective_worker_count(0, &None), 1);
+    fn effective_worker_count_clamps_workers() {
+        assert_eq!(effective_worker_count(8), 8);
+        assert_eq!(effective_worker_count(0), 1);
     }
 
     #[test]

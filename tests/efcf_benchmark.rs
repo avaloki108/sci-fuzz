@@ -1,6 +1,6 @@
 //! EF/CF benchmark run — evidence collection against real compiled contracts.
 //!
-//! Runs sci-fuzz against three representative EF/CF contract classes:
+//! Runs chimerafuzz against three representative EF/CF contract classes:
 //!   - Reentrancy (SimpleDAO)
 //!   - Property violation (harvey_baz — Echidna property)
 //!   - Access control (Delegatecall)
@@ -22,14 +22,14 @@ use std::time::{Duration, Instant};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use sci_fuzz::evm::EvmExecutor;
-use sci_fuzz::feedback::CoverageFeedback;
-use sci_fuzz::invariant::EchidnaPropertyCaller;
-use sci_fuzz::mutator::TxMutator;
-use sci_fuzz::oracle::OracleEngine;
-use sci_fuzz::scoreboard::{Scoreboard, ScorecardEntry};
-use sci_fuzz::snapshot::SnapshotCorpus;
-use sci_fuzz::types::{
+use chimera_fuzz::evm::EvmExecutor;
+use chimera_fuzz::feedback::CoverageFeedback;
+use chimera_fuzz::invariant::EchidnaPropertyCaller;
+use chimera_fuzz::mutator::TxMutator;
+use chimera_fuzz::oracle::OracleEngine;
+use chimera_fuzz::scoreboard::{Scoreboard, ScorecardEntry};
+use chimera_fuzz::snapshot::SnapshotCorpus;
+use chimera_fuzz::types::{
     Address, Bytes, ContractInfo, Finding, Severity, StateSnapshot, Transaction, U256,
 };
 
@@ -95,7 +95,8 @@ impl BenchmarkLoop {
             source_path: None,
             deployed_source_map: None,
             source_file_list: vec![],
-                abi: abi.clone(),
+            abi: abi.clone(),
+            link_references: Default::default(),
         };
 
         let mut mutator = TxMutator::new(vec![target]);
@@ -142,10 +143,10 @@ impl BenchmarkLoop {
 
             let db_snap = self.executor.snapshot();
             let pre_seq_balances =
-                sci_fuzz::oracle::capture_eth_baseline(&self.executor, self.attacker);
+                chimera_fuzz::oracle::capture_eth_baseline(&self.executor, self.attacker);
             let seq_len: usize = self.rng.gen_range(1..=max_depth as usize);
             let mut sequence: Vec<Transaction> = Vec::new();
-            let mut cumulative_logs: Vec<sci_fuzz::types::Log> = Vec::new();
+            let mut cumulative_logs: Vec<chimera_fuzz::types::Log> = Vec::new();
 
             for _ in 0..seq_len {
                 let prev_sender = sequence.last().map(|t| t.sender);
@@ -178,7 +179,7 @@ impl BenchmarkLoop {
 
                         // Oracle checks.
                         let oracle_findings =
-                            self.oracle.check(&pre_seq_balances, &sci_fuzz::types::ProtocolProbeReport::default(), &result, &sequence);
+                            self.oracle.check(&pre_seq_balances, &chimera_fuzz::types::ProtocolProbeReport::default(), &result, &sequence);
                         for mut f in oracle_findings {
                             f.reproducer = sequence.clone();
                             let h = f.dedup_hash();
@@ -305,7 +306,7 @@ fn efcf_harvey_baz_property() {
     eprintln!("{}", ScorecardEntry::csv_header());
     eprintln!("{}", entry.to_csv_row());
 
-    // ASSERTION: harvey_baz is a property-only contract; sci-fuzz MUST
+    // ASSERTION: harvey_baz is a property-only contract; chimerafuzz MUST
     // discover the violation because the echidna_all_states() function
     // returns false when all five branches are covered.
     // NOTE: This requires the ABI-aware mutation to generate int256 args
@@ -548,7 +549,7 @@ fn efcf_delegatecall_access_control() {
         first_hit_ms,
     );
 
-    // sci-fuzz does not yet have an explicit access-control oracle.
+    // chimerafuzz does not yet have an explicit access-control oracle.
     // The built-in oracles (BalanceIncrease, SelfDestruct) don't fire here
     // because the Delegatecall contract doesn't hold ETH.
     //
@@ -571,7 +572,7 @@ fn efcf_delegatecall_access_control() {
     } else {
         eprintln!(
             "  NOT FOUND — access-control bugs require a dedicated oracle. \
-             sci-fuzz currently has: BalanceIncrease, SelfDestruct, EchidnaProperty. \
+             chimerafuzz currently has: BalanceIncrease, SelfDestruct, EchidnaProperty. \
              An AccessControl oracle (detect privileged ops from non-privileged senders) \
              is a known missing capability."
         );

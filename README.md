@@ -1,344 +1,347 @@
-# sci-fuzz — Smart Contract Invariant Fuzzer
+# chimerafuzz — Next-Generation Smart Contract Fuzzer
 
-A coverage-guided, snapshot-based EVM fuzzer that discovers invariant violations with minimal manual specification.
+> *The most advanced open-source EVM fuzzer ever built.*
 
-**Status: production-capable prototype.** Six improvement phases complete. The fuzzing loop, EVM executor, oracle stack (including lending health detection), CI output pipeline, corpus persistence, and a narrow `sci-fuzz diff` MVP all run. What remains is measured validation against real targets and a semantic shrinker.
+**chimerafuzz** is a Rust-based, coverage-guided, snapshot-based smart contract fuzzer that discovers real vulnerabilities with minimal manual specification. It combines the best ideas from academic fuzzing research with practical exploit-oriented invariant detection — delivering a tool designed to find bugs that other fuzzers miss.
 
-## What This Is
+## The Vision
 
-sci-fuzz is a Rust-based smart contract fuzzer built on [revm](https://github.com/bluealloy/revm). It combines ideas from ItyFuzz (snapshot-based state exploration), AFL++ (hitcount bucketing and power scheduling), EF/CF (structure-aware mutation and benchmarks), and Echidna (property-based testing) into a single tool.
+Most smart contract fuzzers today force you into one of two traps:
 
-The name stands for **S**mart **C**ontract **I**nvariant **Fuzz**er. The thesis is that the biggest barrier to effective smart contract fuzzing isn't execution speed — it's the cost of writing good invariants. sci-fuzz attacks that problem through automated invariant generation, template libraries, and economic oracle detection.
+1. **Write everything by hand.** Define every property, set up every invariant, babysit the harness. The fuzzer is fast — *you're* the bottleneck.
+2. **Run a scanner and hope.** Black-box mutation throws random bytes at your contracts. It finds nothing because it doesn't understand what a function call *is*.
+
+chimerafuzz attacks the real bottleneck: **the cost of writing good invariants.** Instead of making you manually specify every property, it ships a built-in library of exploit-grade economic oracles, protocol-aware invariant checkers, and ABI-driven mutation that understands your contracts from the first run.
+
+The goal: point it at a target, get real findings back.
+
+## What Makes It Different
+
+**Rust-native EVM execution.** Built on revm 19.7 — no Haskell, no Python, no JVM. Snapshot/restore, dual execution modes (Fast for exploration, Realistic for exploit validation), and real per-contract edge coverage with AFL++ hitcount bucketing. Framework overhead is measured in the hundreds of thousands of executions per second on empty targets; real contracts with storage run 1–5k execs/sec.
+
+**Automatic invariant detection.** You don't need to write `echidna_reentrancy` or `echidna_access_control`. The fuzzer ships with built-in oracles that detect:
+- Balance anomalies and unexpected ETH profit
+- Reentrancy with state writes in nested calls
+- Access control violations (non-owner calling `onlyOwner` functions)
+- ERC-4626 vault manipulations (rate manipulation, impossible deposit/withdraw tuples, exchange rate jumps)
+- ERC-20 accounting violations (mints without supply updates, transfers without balance changes)
+- Uniswap V2 AMM sanity (amountOut exceeding reserves)
+- Lending protocol health (net-unbacked borrow debt)
+- Token-flow conservation (attacker gains exceeding target losses)
+- Self-destruct detection
+- Flashloan economic profit oracles
+
+**Protocol-aware ABI analysis.** The fuzzer reads your contract ABIs and builds per-address protocol profiles — detecting whether something looks like a vault, a token, an AMM, or a lending pool. These profiles drive smarter mutation, better triage text, and false-positive reduction. No ABI? It still works — just with less signal.
+
+**Foundry-native workflow.** `chimerafuzz forge --project .` runs `forge build`, ingests artifacts, deploys contracts into a revm instance, executes `setUp()` harnesses, handles `vm.warp`/`vm.roll`/`vm.prank`/`vm.deal`/`vm.expectRevert`/`vm.assume`/`vm.store`/`vm.load` cheatcodes, discovers `echidna_*` properties, and starts fuzzing. One command.
+
+**On-chain auditing.** `chimerafuzz audit 0xAddr --rpc-url $RPC` forks mainnet state and fuzzes deployed contracts directly. Pin a block for reproducibility. Pass multiple addresses for multi-contract attack surfaces. Optional Etherscan ABI fetch.
+
+**Differential fuzzing.** `chimerafuzz diff ImplA ImplB` deploys two implementations into isolated EVMs, drives identical call sequences, and reports divergences — success/revert mismatches, ABI-decoded output differences, and log discrepancies.
+
+**CI-ready output.** SARIF 2.1.0 (GitHub Code Scanning, GitLab SAST), JUnit XML, and compilable Forge `.t.sol` reproducer skeletons. The `chimerafuzz ci` command runs a full campaign and exits with the right code for your pipeline.
+
+**Corpus persistence.** Save and resume fuzzing sessions with `--corpus-dir`. Interesting inputs carry forward between runs.
+
+## Use Cases
+
+### Bug Bounty Hunting
+
+Point chimerafuzz at a target repo or deployed contract and let the economic oracles find the money paths. The built-in profit oracles, vault manipulation detectors, and token-flow conservation checks are designed to surface exactly the kind of high-severity findings that pay out.
+
+```bash
+# Fuzz a local Foundry project
+chimerafuzz forge --project ./target-repo --timeout 600 --depth 32
+
+# Fuzz deployed contracts on mainnet
+chimerafuzz audit 0xVaultAddr 0xTokenAddr --rpc-url $ETH_RPC_URL --timeout 300
+```
+
+### Audit Contest Sprinting
+
+Time-boxed audit contests need maximum signal per minute. chimerafuzz's automatic invariant detection means you spend zero time writing harnesses and all your time analyzing findings. Run it alongside manual review to catch what you missed.
+
+```bash
+# Quick CI scan with SARIF output
+chimerafuzz ci --project . --output-format sarif --output findings.sarif --fail-on-critical
+
+# Differential: compare two implementations for divergent behavior
+chimerafuzz diff OriginalImplementation PatchedImplementation --project . --max-execs 5000
+```
+
+### Protocol Team Security Regression
+
+Ship chimerafuzz in your CI pipeline. The SARIF and JUnit output integrates with GitHub Actions, GitLab SAST, and any standard CI consumer. Forge `.t.sol` reproducers give you copy-paste test cases for every finding.
+
+```yaml
+# GitHub Actions
+- name: Fuzz
+  run: |
+    chimerafuzz ci --project . --output-format sarif --output results.sarif --github-actions --fail-on-critical
+- name: Upload SARIF
+  uses: github/codeql-action/upload-sarif@v3
+  with:
+    sarif_file: results.sarif
+```
+
+### On-Chain Monitoring
+
+Fork mainnet, pin a block, fuzz deployed contracts, compare results across blocks. Useful for continuous monitoring of live protocols or pre-deployment security review.
+
+```bash
+# Fork and fuzz at a specific block
+chimerafuzz forge --project ./my-project --fork-url $RPC --fork-block 19000000 --timeout 600
+```
+
+### Security Research & Benchmarking
+
+The built-in EF/CF benchmark matrix (~86 entries mapping contracts to expected vulnerability types) gives you a structured way to measure and compare fuzzer performance.
+
+```bash
+# Run the benchmark matrix
+chimerafuzz benchmark --preset efcf-matrix --seeds 1,2,3 --max-execs 5000 --output-dir target/bench
+
+# Quick demo benchmark
+chimerafuzz benchmark --preset efcf-demo --seeds 1 --max-execs 2000 --output-dir target/demo
+```
 
 ## What Works Today
 
-> Five improvement phases have been completed since initial prototype. New or significantly improved items are tagged **[Phase N]**.
+**Core Engine:**
+- EVM execution via revm 19.7 with full snapshot/restore
+- Per-contract edge coverage with AFL++ hitcount bucketing (8 classes)
+- Power scheduling (novelty × new-bits × depth ÷ √exploration-count)
+- Dual executor modes: Fast (max exploration) and Realistic (balance-enforced)
+- ABI-aware mutation (typed argument generation, 5+ mutation strategies, value dictionary seeded from bytecode + execution)
+- Deterministic sequence shrinking (prefix/suffix/word removal, sender simplification, optional ABI-aware argument reduction)
+- Multi-worker parallel campaigns (shared coverage/corpus, per-worker executor)
+- Ordered path IDs (per-tx and per-sequence rolling hash fingerprints for novelty detection)
+- CmpLog-style comparison events (EQ/LT/GT/ISZERO operands fed into value dictionary)
+- Concolic helper stubs (Z3 adapter surface, future branch-distance integration)
+- Dependency planner MVP (dynamic read/write hints for call ordering)
 
-- **EVM execution** via revm 19.7 with snapshot/restore (CacheDB cloning)
-- **Per-contract control-flow edge coverage** via a revm inspector that records `(prev_pc, current_pc)` transitions (per attributed contract) with raw hitcounts during execution
-- **Ordered path IDs (per tx and per sequence)** — [`ExecutionResult::tx_path_id`](src/types.rs) fingerprints the **order** of dynamic edges via a rolling hash finalized with `keccak256` (see [`path_id.rs`](src/path_id.rs)), using the same `(contract, prev_pc, current_pc)` attribution as coverage. The campaign combines successive tx path IDs into a sequence-level ID for novelty. [`PathFeedback`](src/feedback.rs) records first-seen tx/sequence path hashes with **bounded** FIFO-capped sets (default 50k each). Corpus snapshots can gain a small energy multiplier via [`PowerMetadata::path_bits`](src/snapshot.rs) when retained primarily for path-order novelty. **Not** a full exported BB trace; not a separate call-stack key beyond today’s bytecode/target attribution; hash collisions are possible in theory; in **multi-worker** mode each thread has its own executor while path state merges into shared feedback; **fork** mode uses the same machinery at `workers = 1`.
-- **Dual executor modes**: `Fast` (all safety checks off, best for exploration) and `Realistic` (balance enforcement on, reduces false positives from impossible states)
-- **AFL++ hitcount bucketing** — tracks not just "was this edge taken?" but which hitcount bucket (1, 2, 4, 8, 16, 32, 64, 128+), using real transition hitcounts from the executor so loop iteration differences count as new coverage
-- **Power scheduling** — snapshot selection weighted by novelty × new-bits boost × depth bonus ÷ √exploration-count, ported from LibAFL's power schedule and now driven by real execution coverage instead of storage-write heuristics
-- **RPC-backed fork / deployed-state execution** — When [`CampaignConfig::rpc_url`](src/types.rs) is set, the campaign builds an [`RpcCacheDB`](src/rpc.rs) (`eth_getBalance`, `eth_getCode`, `eth_getTransactionCount`, `eth_getStorageAt` at a pinned block or `latest`), probes the endpoint (`eth_blockNumber`), logs `eth_chainId`, aligns [`BlockEnv`](src/evm.rs) with **full** `eth_getBlockByNumber` header fields (number, timestamp, gas limit, base fee, difficulty, `mixHash` → `prevrandao`, `excessBlobGas` → blob fee via revm’s helper), and uses the forked DB as the **campaign root**. Targets with **no** creation/runtime bytecode are treated as **already deployed** at the configured address: the engine runs an enriched preflight (`eth_getCode`), logs code size and an **EIP-1167 minimal-proxy hint** when the pattern matches (for triage only; no automatic implementation lookup), and optionally **hydrates** empty [`ContractInfo::deployed_bytecode`](src/types.rs) from RPC so logs and value-dictionary seeding see non-zero bytecode (execution already used chain code). Configure via [`CampaignConfig::fork_hydrate_deployed_bytecode`](src/types.rs) (default `true`). Optional [`CampaignConfig::fork_expected_chain_id`](src/types.rs): mismatch with the RPC’s `eth_chainId` emits a warning. **Not** a Forge cheatcode VM: no `vm.*` semantics. [`RpcCacheDB::code_by_hash`](src/rpc.rs) is still a stub (empty); execution relies on bytecode in account info / `CacheDB` overlays — rare `code_by_hash`-only lookups may misbehave.
-- **Project-mode fork** — `sci-fuzz forge --fork-url … --fork-block …` sets `rpc_url` / `rpc_block_number`. If `--fork-url` is omitted, `[profile.default] eth_rpc_url` from `foundry.toml` is used when present. CLI overrides `foundry.toml`. When forking **and** deploying local bytecode, the campaign logs that this is **not** Forge script replay.
-- **Audit deployed contracts** — `sci-fuzz audit <addr> [<addr> …] --rpc-url …` **requires** an RPC URL (`ETH_RPC_URL` or `--rpc-url`). Pass **multiple addresses** to fuzz several predeployed contracts in one run (shared fork root). Optional Etherscan ABI fetch per address when `ETHERSCAN_API_KEY` is set; otherwise a one-line note that ABIs may be missing.
-- **Attacker / sender model** — [`CampaignConfig::resolved_attacker`](src/types.rs) is the EOA: optional [`CampaignConfig::attacker_address`](src/types.rs), else default `0x4242…4242`. **Local** campaigns still seed **100 ETH** in the overlay DB. **Fork** campaigns: by default [`CampaignConfig::fork_attacker_balance_wei`](src/types.rs) (100 ETH) **replaces** the attacker balance in the overlay; set [`CampaignConfig::fork_preserve_attacker_balance`](src/types.rs) to keep the forked chain balance instead. CLI `--attacker` on `forge` / `audit` sets `attacker_address`. The same address is used for deploy/setup, mutator sender pool, Echidna property `static_call` context, and balance/profit oracles.
-- **Multi-worker parallel campaign (local in-memory DB)** — Implemented in `campaign.rs` as `run_parallel_campaign`: after calibration, one OS thread per worker (`parallel_worker_loop`), each with its **own** `EvmExecutor`. Shared resources — coverage feedback, snapshot corpus, saved DB snapshots, finding dedupe, aggregated `CampaignReport` counters — sit behind **mutexes** and are updated from all workers.
-  - **RPC mode:** If `rpc_url` is set, the campaign **forces `workers = 1`**. Fork/RPC-backed state is not shared safely across threads.
-  - **Reproducibility:** With `workers > 1`, **scheduling is not fully reproducible** across runs (thread interleaving differs).
-  - **Scaling:** **Lock contention** on shared corpus/state and a **shared mutator** (serialized selector / value-dictionary updates) can **cap throughput**; do not expect linear speedup vs worker count.
-  - **Scope:** **No distributed fuzzing** — in-process threads only; no multi-machine corpus sync (see *What Does Not Work Yet*).
-- **Calibration phase** — runs seed transactions before the main loop to establish coverage baselines and populate the value dictionary
-- **ABI-aware mutation** — extracts function selectors from ABI JSON, generates typed arguments (uint256, address, bool, bytes32), mutates with bit-flip, byte-replace, selector-swap, value-change, sender-swap
-- **Value dictionary** — seeded from EVM bytecode (PUSH1–PUSH32 operand extraction) and grown from execution results (return data, log topics, storage writes)
-- **Core invariant checkers** (always registered): BalanceIncrease, UnexpectedRevert, SelfDestruct, EchidnaProperty (log-based assertion detection), FlashloanEconomicOracle (profit after mock flashloan scaffold). ETH balance baselines for profit-style checks are **per sequence**: captured immediately before executing the sequence (after restoring the selected snapshot), not once at campaign start — so non-root corpus snapshots compare against the correct pre-sequence balances.
-- **Exploit-grade economic oracles** ([`economic.rs`](src/economic.rs)) with optional **ABI-derived protocol hints** ([`protocol_semantics.rs`](src/protocol_semantics.rs)): the campaign builds a per-address profile from each target’s JSON ABI (function/event names + soft name/path hints). Profiles **do not** recover storage layout; they drive **triage text**, **false-positive reduction** on some checks when ABI is present, and **honest fallbacks** when ABI is missing. All checks still use execution evidence (logs + per-tx `state_diff`, plus **sequence-cumulative logs** where noted):
-  - ERC-4626 impossible `Deposit` / `Withdraw` event tuples (assets/shares consistency); findings include classification/triage footer.
-  - ERC-20 **mint** and **burn** (large `Transfer` from/to `address(0)`) without an OpenZeppelin-style `_totalSupply` storage write (slot 2 heuristic) — descriptions note whether `totalSupply()` appears in the ABI.
-  - ERC-20 balance mapping writes with no `Transfer` in the same tx — **suppressed** when ABI classifies the contract as non–ERC-20-like (reduces accidental hits on non-token layouts).
-  - ERC-4626 exchange-rate **jumps** / **plunges** on consecutive **`Deposit`** / **`Withdraw`** events (cumulative log stream; default 5× threshold) — **suppressed** when ABI is present but shows no ERC-4626 signals (`erc4626_score == 0`), to reduce topic-collision noise.
-  - ERC-4626 **same-transaction multi-`Deposit` rate spread** — same gating as rate jumps.
-  - **ERC-4626 rate shock without visible `Transfer` to vault** — cumulative `Deposit`-implied rate jump with no ERC-20 `Transfer` to the vault in the same log stream (medium severity; native ETH / non-ERC-20 paths not modeled).
-  - **Uniswap V2–shaped AMM sanity** — if `Sync(uint112,uint112)` and `Swap(address,uint256,uint256,uint256,uint256,address)` topics match, flags `amountOut` exceeding the last `Sync` reserves before the swap in **log order** (not full constant-product or multi-hop modeling).
-  - **Reserve / conservation oracles** ([`conservation.rs`](src/conservation.rs), [`conservation_oracles.rs`](src/conservation_oracles.rs)) — first-pass **observable-flow** checks (not formal verification): **[`AmmSyncExplainedOracle`](src/conservation_oracles.rs)** flags two `Sync` events for the same pair whose reserves **change** with no intervening Uniswap V2–shaped `Swap` / `Mint` / `Burn` on that pair in **log order** (uses [`ExecutionResult::sequence_cumulative_logs`](src/types.rs) when present). **[`Erc4626DepositVsUnderlyingTransferOracle`](src/conservation_oracles.rs)** compares each `Deposit` event’s `assets` to the sum of ERC-20 `Transfer` deliveries **to the vault** on the probed underlying asset address in the **same transaction**, with optional triage text from a post-state `balanceOf(vault)` probe on the underlying token.
-  - Optional [`PairwiseStorageDriftOracle`](src/economic.rs) for lending-style debt-vs-collateral **raw slot** comparison when wired manually (not in the default registry).
-  - **Executor-backed protocol probes** ([`protocol_probes.rs`](src/protocol_probes.rs)) — after each successful transaction, the campaign fills [`ExecutionResult::protocol_probes`](src/types.rs) using [`EvmExecutor::static_call`](src/evm.rs) at **post-state** (same DB the next tx would see). Classification + per-target JSON ABI gate calls; a hard cap limits `static_call`s per step. **ERC-4626-like:** `asset()`, `totalAssets()`, **`balanceOf(vault)` on the underlying asset** (standard `balanceOf` selector when `asset()` resolves), and for each `Deposit` / `Withdraw` in this step’s logs, `previewDeposit` / `convertToShares` / `previewWithdraw` / `previewRedeem` on **event-derived amounts** where the ABI lists the function. **ERC-20-like:** `totalSupply()`, `balanceOf(attacker)`. **AMM/pair-like:** `getReserves()`. Missing ABI, missing functions, reverts, and decode failures are skipped gracefully.
-  - **Probe-informed economic oracles:** [`Erc4626PreviewVsDepositEventOracle`](src/economic.rs) flags large divergence between `previewDeposit(assets)` and `Deposit` event minted shares (tolerance ~0.1% relative + a few wei). [`UniswapV2StyleSyncVsGetReservesOracle`](src/economic.rs) compares the last `Sync` reserves in the tx to post-state `getReserves()` (uint112-expanded vs ABI-decoded words). Other economic oracles unchanged; probe rows are available for triage text.
-  - **Still not:** **complete** multi-asset / constant-product reserve proofs, **full cross-asset collateralization/liquidation proofs**, full **bridge** custody semantics, ABI-driven storage slot discovery, or complete ERC-4626 / AMM coverage (see *What Does Not Work Yet*). Basic lending-health (borrow/repay flows) is supported via the [`LendingHealthOracle`](src/invariant.rs). Conservation checks are **heuristic** (donations + `sync()`, fee-on-transfer, non-standard events, and native ETH paths can confuse them).
-- **Sequence-cumulative logs** — the campaign and shrink replay attach all logs from the current transaction sequence to [`ExecutionResult::sequence_cumulative_logs`](src/types.rs) so oracles can reason about multi-step event history without wrapping external fuzzers.
-- **ERC20Supply** (optional via `InvariantRegistry::with_erc20`) — large mint/burn monitoring (legacy heuristic, separate from supply-vs-storage reconciliation above)
-- **Real Echidna property calling** — `EchidnaPropertyCaller` discovers `echidna_*` functions from ABI, calls them via `static_call` after each sequence, checks bool returns. This is the actual Echidna workflow, not just log watching.
-- **Deterministic sequence shrinking** — findings are replayed from the same pre-sequence snapshot and reduced by prefix/suffix elimination, whole-tx removal, calldata-word reduction, `msg.value` reduction, and sender simplification
-- **Foundry artifact ingestion** — `sci-fuzz forge --project /path/to/project` runs `forge build`, parses standard `out/` artifacts, extracts ABI plus creation/runtime bytecode, and hands selected contracts to the existing campaign
-- **Foundry harness / `setUp()` (first pass)** — the engine classifies `src/` runtime contracts vs `test/` harness candidates (ABI must include parameterless `setUp()` and creation bytecode). It deploys runtime targets first, then at most one harness (preferring a contract whose ABI also lists `echidna_*` properties), executes `setUp()` once through revm, then records the root snapshot and starts calibration/fuzzing. Lifecycle functions `setUp`, `beforeTest`, and `afterTest` are stripped from the mutator’s ABI so setup is not randomly re-invoked during fuzzing; `echidna_*` discovery still uses the full ABI on the deployed harness
-- **Structured benchmark pipeline** — `sci-fuzz benchmark` runs repeatable multi-seed benchmark cases, records first-hit / repro / finding metrics, and emits stable CSV + JSON result files plus grouped summaries
-- **Comparison schema for Echidna / Forge** — benchmark rows include `engine` and `status`, so one artifact format can hold measured sci-fuzz runs plus external-tool rows
-- **External comparison MVP (Forge, Foundry project cases)** — for benchmark plans created with `--project`, the Forge adapter now runs `forge test --match-contract <target> --fuzz-seed <seed>` end-to-end, records wall-clock time, and marks rows as `measured` only when the command actually ran. Found/miss is mapped from Forge’s reported failed-test count (`N failed` ⇒ found). Exec counts and first-hit metrics remain unavailable for external engines and are left empty/zero by design.
-- **Benchmark matrix** — 81 entries mapping EF/CF contracts to expected vulnerability types, with file-existence and category-coverage validation tests
-- **Forge VM cheatcodes** **[Phase 1]** — `vm.warp()`, `vm.roll()`, `vm.prank()`, `vm.deal()`, `vm.expectRevert()`, `vm.assume()`, `vm.store()`, and `vm.load()` are intercepted inside the revm execution loop. Harnesses that use these cheatcodes in `setUp()` and test functions now execute correctly instead of reverting.
-- **Extended mutation engine** **[Phase 2]** — configurable mutation depth limits, sequence-splice mutations (cross-sequence segment recombination), and time-aware mutations (block timestamp / block number perturbation during calldata generation). These lift coverage on time-gated and multi-step state machines that were previously invisible to the fuzzer.
-- **Access-control oracle** **[Phase 3]** — `AccessControlOracle` detects when a non-owner sender successfully calls a function that contains `onlyOwner` / `onlyRole`-pattern reverts for other senders. Auto-registers on contracts whose ABIs include standard `Ownable` / `AccessControl` event signatures.
-- **Reentrancy oracle** **[Phase 3]** — `ReentrancyOracle` flags `SSTORE` writes inside nested calls (`call_depth > 1`) combined with net ETH profit. Integrates with the `CoverageInspector` via the `sstore_in_nested_call` flag on `ExecutionResult`.
-- **Token-flow conservation oracle** **[Phase 3]** — `TokenFlowConservationOracle` detects ERC-20 balance drain: tracks pre/post-sequence `balanceOf` for a specified token and target, fires High/Critical when the attacker gains more tokens than the target loses.
-- **CI output pipeline** **[Phase 4]** — `src/output.rs` provides three pure formatters:
-  - `sarif_from_findings()` — SARIF 2.1.0 JSON (GitHub Code Scanning, GitLab SAST, any SARIF consumer). Deduplicates the `rules` array; maps Critical/High → `"error"`, Medium → `"warning"`, Low/Info → `"note"`.
-  - `junit_from_findings()` — JUnit XML. Emits a passing testcase on clean runs so CI parsers always see at least one result.
-  - `forge_reproducer()` — compilable Solidity `.t.sol` skeleton with `vm.prank()` + `call{value:}` for each transaction in the reproducer sequence.
-- **`sci-fuzz ci` command** **[Phase 4]** — fully implemented (`handle_ci()` in `main.rs`). Runs a real campaign (50k execs, seed `0xcafebabe`, 2 workers, configurable timeout). Emits GitHub Actions `::error/warning/notice` annotations when `--github-actions` is passed. Writes Forge `.t.sol` reproducers to `test/repros/`. Exits with code `2` when critical/high findings meet configured thresholds (distinct from build error exit `1`).
-- **Corpus persistence** **[Phase 5]** — `CampaignConfig::corpus_dir` (optional `PathBuf`) enables JSON-based corpus save/load across campaign runs. Load injects up to 64 prior entries at campaign start; save runs at campaign end after the main loop. All I/O failures are `tracing::warn!` only — corpus loss never terminates a run. CLI flags: `--corpus-dir` on both `forge` and `ci` subcommands.
-- **Lending health oracle** **[Phase 6]** — `LendingHealthOracle` detects net-unbacked borrow debt by scanning sequence-cumulative logs for standard `Borrow` event signatures. Handles both a generic `Borrow(address,address,uint256)` shape and the Compound-v2 `Borrow(address,uint256,uint256,uint256)` shape (amount always decoded from `data[0..32]`). Paired `Repay` and `RepayBorrow` events are subtracted; only net open debt above `min_net_borrow` fires. Profile-gated via `is_lending_like()` (ABI lending score ≥ 3 from `protocol_semantics.rs`) when profiles are attached — silent on non-lending targets. Severity escalates from Medium to High when the attacker also gains ETH in the same sequence.
+**Foundry Integration:**
+- Artifact ingestion from `forge build` output
+- `setUp()` harness detection, deployment, and execution
+- Forge VM cheatcodes: `vm.warp`, `vm.roll`, `vm.prank`, `vm.deal`, `vm.expectRevert`, `vm.assume`, `vm.store`, `vm.load`
+- `echidna_*` property discovery and evaluation via `static_call`
+- `foundry.toml` RPC URL inheritance for fork mode
+
+**On-Chain / Fork Mode:**
+- RPC-backed state fork with full block header alignment
+- Shared `RpcCacheDB` for multi-worker fork campaigns
+- Deployed contract audit mode (`chimerafuzz audit`)
+- Etherscan ABI fetch when `ETHERSCAN_API_KEY` is set
+- EIP-1167 minimal proxy detection
+
+**Invariant Oracles (built-in, always active):**
+- BalanceIncrease, UnexpectedRevert, SelfDestruct
+- EchidnaProperty (log-based assertion + `echidna_*` function calling)
+- FlashloanEconomicOracle
+- ERC-20 attacker token gain oracle
+- AccessControlOracle
+- ReentrancyOracle
+- TokenFlowConservationOracle
+- LendingHealthOracle
+- ERC20Supply (opt-in)
+
+**Economic Oracles (exploit-grade, protocol-aware):**
+- ERC-4626: impossible Deposit/Withdraw tuples, exchange rate jumps/plunges, same-tx multi-Deposit rate spread, rate shock without visible Transfer
+- ERC-20: mint/burn without supply update, balance write without Transfer
+- AMM: Uniswap V2 amountOut vs Sync reserves, unexplained Sync reserve changes
+- Conservation: Deposit vs underlying Transfer, probe-informed preview vs event divergence
+- Protocol probes: post-tx `static_call` probes for vault/token/AMM state (asset(), totalAssets(), totalSupply(), getReserves(), previewDeposit(), etc.)
+
+**CI & Output:**
+- SARIF 2.1.0, JUnit XML, Forge `.t.sol` reproducers
+- `chimerafuzz ci` command with GitHub Actions annotations
+- Corpus persistence via `--corpus-dir`
+
+**Benchmarking:**
+- EF/CF benchmark matrix (~86 entries, validated by tests)
+- Multi-seed measurement with CSV/JSON artifact output
+- Forge external comparison path for side-by-side measurement
+- `efcf-matrix` preset for full matrix coverage reports
 
 ## What Does Not Work Yet
 
-Honesty matters more than marketing. These are real gaps:
+Honesty is a feature, not a bug. These are real gaps:
 
-- **Path IDs are a compact fingerprint, not a perfect trace.** Full canonical basic-block traces, call-depth-indexed edge keys beyond the current contract attribution, and a global path database are still out of scope. Path novelty uses bounded caches — under extreme uniqueness pressure, older path IDs may be evicted and re-novel. Native mock-flashloan txs use a deterministic synthetic path ID (no bytecode inspector).
-- **Shrinking is still a first pass.** The shrinker is deterministic and useful today, but it is not yet a full semantic reducer: it does not reason about ABI types, storage dependencies, or minimal base-state snapshots, and it does not guarantee globally minimal sequences.
-- **No distributed fuzzing** — parallel workers are threads in one process only; there is no multi-machine corpus or coordinator (see multi-worker **Scope** above).
-- **Foundry integration gaps beyond basic cheatcodes.** Script-based deploy flows, library-specific bootstrapping, `StdInvariant` / `targetContract` wiring, and multi-contract setup scripts are not implemented. Phase 1 covered the common cheatcodes (`vm.warp`, `vm.roll`, `vm.prank`, `vm.deal`, `vm.expectRevert`, `vm.assume`, `vm.store`, `vm.load`), but full equivalence with Foundry's invariant runner is not the goal.
-- **`sci-fuzz diff` is now an MVP differential executor, not a semantic proof system.** It compares two local Foundry artifacts/contract targets by replaying identical generated calls and reports reproducible divergences: success/revert asymmetry, ABI-decoded output differences when output ABIs match, raw return-data differences when decode is unavailable, and lightweight log topic0 sequence/count differences. It does **not** prove correctness, semantic equivalence, or cross-chain behavior.
-- **External comparison execution is still partial.** Forge now has a real measured path for Foundry-project benchmark cases only; Echidna and non-project cases are still `skipped`/`unavailable` with explicit reasons.
-- **Partial Echidna compatibility.** `EchidnaPropertyCaller` implements the core workflow (discover `echidna_*` functions, call them, check bool return). `EchidnaProperty` detects assertion events in logs. Neither handles revert/assert distinction with full Echidna fidelity, and the property-harness workflow (`targetContract`, configurable test limits, shrinking) is not implemented.
-- **Economic and conservation oracles remain heuristic despite ABI hints and probes.** Storage slot layouts (ERC-20 `totalSupply` at slot 2, balances at mapping slot 0) still match common OpenZeppelin layouts and break on proxies, diamonds, and custom storage. Classification and gating reduce some noise but do not guarantee soundness. Rate-jump, same-tx spread, and “no Transfer to vault” checks can still false-positive on extreme rounding, first-liquidity edges, donation economics, or non-standard vaults. Probe-vs-event checks can false-positive on fee-on-transfer assets, donation-style reserve moves, or non-standard vaults/pairs. **Conservation** checks (Sync window explanation, Deposit vs underlying `Transfer`) improve triage for pools and vaults but are **not** sound accounting proofs; bridges are still not modeled. `LendingHealthOracle` covers common `Borrow`-event patterns but is not a full collateral-ratio proof — multi-asset positions, health-factor math, and liquidation thresholds are not modeled.
-- **The 207k execs/sec number is a smoke test.** It measures empty-target throughput. Real contracts with storage and complex logic will run at 1–5k execs/sec. The number demonstrates low framework overhead, not security-testing strength.
+- **Shrinking is a first pass.** It doesn't reason about storage dependencies or guarantee globally minimal sequences.
+- **No distributed fuzzing.** Multi-worker is in-process threads only; no multi-machine corpus sync.
+- **Foundry integration has limits.** Script-based deploy flows, `StdInvariant`/`targetContract` wiring, and multi-contract setup scripts aren't implemented.
+- **Economic oracles are heuristic.** Storage slot heuristics match common OZ layouts and break on proxies/diamonds. Conservation checks can false-positive on fee-on-transfer tokens, donations, and non-standard vaults. They're not sound accounting proofs.
+- **Differential fuzzing doesn't prove equivalence.** No divergence within budget ≠ equivalent contracts.
+- **Benchmark comparisons are partial.** Forge has a real measured path; other external engine rows are scaffolded.
+- **The 207k execs/sec number is a smoke test.** Real contracts run 1–5k execs/sec. The number measures framework overhead, not security-testing strength.
 
 ## Architecture
 
 ```text
-campaign.rs          main loop: calibrate → (optional) parallel workers → shared corpus/feedback → execute → check → learn
-                     corpus save/load via corpus_dir in both sequential and parallel paths
-harness.rs           Foundry-style setUp() selector + one-shot setup execution on the revm executor
+campaign.rs          Main loop: calibrate → (optional) parallel workers → corpus/feedback → execute → check → learn
+harness.rs           Foundry setUp() selector + one-shot setup execution
 evm.rs               revm 19.7 wrapper: execute, deploy, static_call, snapshot/restore, Fast/Realistic modes
-                     edge coverage + ordered path stream + call_depth tracking + sstore_in_nested_call flag [Phase 3]
-path_id.rs           rolling path hash, per-sequence fold, native-flashloan synthetic id
-snapshot.rs          state corpus: novelty-weighted selection, power scheduling metadata, auto-pruning over real coverage
+path_id.rs           Rolling path hash, per-sequence fold
+snapshot.rs          State corpus: novelty-weighted selection, power scheduling, auto-pruning
 feedback.rs          AFL++ hitcount bucketing (8 classes), virgin-bits tracking, bounded path-ID novelty
-mutator.rs           ABI-aware generation, 5 mutation strategies + splice + time-aware mutations [Phase 2], value dictionary
-output.rs            SARIF 2.1 / JUnit XML / Forge .t.sol reproducer formatters [Phase 4]
-economic.rs          exploit-oriented economic invariants (ERC-4626, ERC-20 accounting, AMM swap/sync sanity, optional lending drift, probe-informed checks)
-conservation.rs      log-order helpers for reserve/Sync conservation reasoning
-conservation_oracles.rs  AmmSyncExplainedOracle, Erc4626DepositVsUnderlyingTransferOracle
-protocol_probes.rs   post-tx static_call probes (ERC-4626 / ERC-20 / AMM) into ExecutionResult
-protocol_semantics.rs  best-effort ABI/event protocol classification and triage helpers for economic oracles
-invariant.rs         Invariant trait + default registry + EchidnaPropertyCaller
-                     AccessControlOracle, ReentrancyOracle, TokenFlowConservationOracle [Phase 3]
-                     LendingHealthOracle [Phase 6]
-oracle.rs            routes execution results through invariant registry; balance baselines supplied per check
-types.rs             core types built on alloy-primitives (Address, U256, B256)
-                     ExecutionResult: tx_path_id, sequence_cumulative_logs, protocol_probes, sstore_in_nested_call [Phase 3]
-                     CampaignConfig: corpus_dir [Phase 5]
-scoreboard.rs        stable benchmark result / summary schema + CSV / JSON writers
-benchmark.rs         benchmark case loading, sci-fuzz measurement, Forge project comparison path, comparison scaffolding
-cli.rs               clap-based CLI: benchmark, forge, audit, test (thin wrapper), ci (implemented), diff (MVP differential executor), version
-rpc.rs               JSON-RPC fork DB (RpcCacheDB), chain id, full block header parse/merge into BlockEnv
-main.rs              CLI dispatch; handle_forge(), handle_ci() [Phase 4], handle_benchmark(), handle_audit()
+mutator.rs           ABI-aware generation, 5+ mutation strategies, value dictionary
+output.rs            SARIF 2.1 / JUnit XML / Forge .t.sol reproducer formatters
+economic.rs          Exploit-oriented economic invariants (ERC-4626, ERC-20, AMM, lending)
+conservation.rs      Log-order helpers for reserve/Sync conservation
+conservation_oracles.rs  AMM Sync explanation, Deposit vs underlying Transfer
+protocol_probes.rs   Post-tx static_call probes (vault/token/AMM state)
+protocol_semantics.rs  ABI/event protocol classification for economic oracles
+invariant.rs         Invariant trait + registry + EchidnaPropertyCaller + access control + reentrancy + lending
+oracle.rs            Routes execution results through invariant registry
+types.rs             Core types on alloy-primitives (Address, U256, B256)
+scoreboard.rs        Benchmark result/summary schema + CSV/JSON writers
+benchmark.rs         Benchmark case loading, measurement, Forge comparison, matrix reports
+benchmark_matrix.rs  EF/CF expected bug-class table (~86 entries)
+concolic/            Bounded SMT/solver helpers (MVP)
+dependency_planner.rs Dynamic RW hints for sequence ordering (MVP)
+cli.rs               CLI: forge, audit, ci, benchmark, diff, version
+rpc.rs               JSON-RPC fork DB, chain ID, full block header parse
+main.rs              CLI dispatch
 ```
 
 ## Installation
 
 ```bash
 # From source (Rust 1.75+)
-git clone https://github.com/your-org/sci-fuzz
-cd sci-fuzz
+git clone https://github.com/your-org/chimerafuzz
+cd chimerafuzz
 cargo build --release
+
+# The binary will be at target/release/chimerafuzz
+```
+
+## Quick Start
+
+```bash
+# Fuzz a Foundry project
+chimerafuzz forge --project ./my-project --timeout 120
+
+# Fuzz deployed contracts on mainnet
+chimerafuzz audit 0xTarget1 0xTarget2 --rpc-url https://eth.llamarpc.com --timeout 300
+
+# CI scan with SARIF output
+chimerafuzz ci --project . --output-format sarif --output results.sarif --github-actions
+
+# Compare two implementations
+chimerafuzz diff ImplA ImplB --project . --seed 42
+
+# Run benchmarks
+chimerafuzz benchmark --preset efcf-matrix --seeds 1,2,3 --output-dir target/bench
 ```
 
 ## Usage
 
+### Fuzz a Foundry Project
+
 ```bash
-# Fuzz the current Foundry project
-sci-fuzz forge --timeout 120
+# Basic
+chimerafuzz forge --project /path/to/project --timeout 120
 
-# Fuzz a specific Foundry project in one command
-sci-fuzz forge --project /path/to/foundry-project --timeout 120
-
-# Deeper exploration with more snapshots
-sci-fuzz forge --project /path/to/foundry-project --depth 32 --max-snapshots 8192 --timeout 600
+# Deeper exploration
+chimerafuzz forge --project /path/to/project --depth 32 --max-snapshots 8192 --timeout 600
 
 # Reproducible run
-sci-fuzz forge --seed 42 --timeout 60
+chimerafuzz forge --seed 42 --timeout 60
 
-# Persist corpus across runs (resumes from prior interesting inputs)
-sci-fuzz forge --project /path/to/project --corpus-dir .sci-fuzz/corpus --timeout 600
+# With corpus persistence (resumes across runs)
+chimerafuzz forge --project /path/to/project --corpus-dir .chimerafuzz/corpus --timeout 600
 
-# Foundry project + JSON-RPC fork (optional block pin; or set eth_rpc_url in foundry.toml)
-sci-fuzz forge --project /path/to/project --fork-url https://eth.llamarpc.com --fork-block 19000000 --timeout 600
-
-# Audit deployed contract(s) (requires ETH_RPC_URL or --rpc-url)
-export ETH_RPC_URL=https://eth.llamarpc.com
-sci-fuzz audit 0xYourTarget --chain mainnet --timeout 300
-# Multiple predeployed targets on the same fork
-sci-fuzz audit 0xVault 0xRouter 0xOracle --chain mainnet --timeout 300
-
-# CI security scan — emits SARIF/JUnit, GitHub Actions annotations, Forge reproducers
-sci-fuzz ci --project . --output-format sarif --output results.sarif --github-actions --fail-on-critical
-sci-fuzz ci --project . --output-format junit --output results.xml --corpus-dir .sci-fuzz/corpus
-
-# Run the built-in EF/CF benchmark preset and emit CSV/JSON evidence
-sci-fuzz benchmark --preset efcf-demo --seeds 1,2,3 --max-execs 5000 --output-dir target/benchmark
-
-# Benchmark a real Foundry project with the same schema
-sci-fuzz benchmark --project /path/to/foundry-project --target Vault --property campaign --category Campaign --seeds 1,2,3 --max-execs 5000
-
-# Differential execution MVP between two local Foundry targets
-sci-fuzz diff ImplA ImplB --project . --max-execs 2000 --depth 8 --seed 42
-
-# Show version
-sci-fuzz version
+# Fork mode (use on-chain state)
+chimerafuzz forge --project /path/to/project --fork-url https://eth.llamarpc.com --fork-block 19000000
 ```
 
-## Differential Execution (`sci-fuzz diff`)
-
-`sci-fuzz diff <ImplA> <ImplB> --project .` deploys two contracts from the
-local Foundry project into isolated revm instances and drives identical
-generated call sequences against both, reporting any reproducible divergence.
-
-### What it reports
-
-| Divergence kind | Condition |
-|---|---|
-| `success-vs-revert` | Impl A succeeded, impl B reverted |
-| `revert-vs-success` | Impl A reverted, impl B succeeded |
-| `output-mismatch` | Both succeeded but returned different bytes |
-| `log-signature-difference` | Different event topic[0] sets (event signatures) |
-
-On first divergence the sequence is deterministically shrunk to a minimal
-reproducer using the existing [`SequenceShrinker`](src/shrinker.rs).
-
-### What it does NOT do
-
-- **Prove equivalence.** No divergence within the budget does not mean the
-  contracts are equivalent.
-- **ABI-decode return values.** Output differences are reported as raw hex.
-  Decoding requires the function's return type from the ABI, which is not
-  yet wired up.
-- **Handle constructor arguments.** Only zero-argument constructors are
-  supported. Contracts with required constructor args will fail to deploy.
-- **On-chain / fork comparison.** `--rpc-url` and `--reference` are explicitly
-  rejected with a clear error. Use local artifacts only.
-- **Continue after the first divergence.** The runner stops after one hit.
-  Re-run with a different `--seed` to search further.
-
-## Running Tests
+### Audit Deployed Contracts
 
 ```bash
-# All tests (unit + integration)
-cargo test
+# Single target
+chimerafuzz audit 0xYourTarget --rpc-url https://eth.llamarpc.com --timeout 300
 
-# Just the benchmark matrix validation
-cargo test --test benchmark_matrix
+# Multiple targets (shared fork root)
+chimerafuzz audit 0xVault 0xRouter 0xOracle --rpc-url https://eth.llamarpc.com --timeout 300
 
-# Just the library unit tests
-cargo test --lib
+# With Etherscan ABI fetch
+ETHERSCAN_API_KEY=your_key chimerafuzz audit 0xTarget --rpc-url $RPC --timeout 300
 ```
 
-## Benchmark Matrix
+### CI Integration
 
-The `tests/benchmark_matrix.rs` file tracks expected results for 81 contracts across 6 categories:
+```bash
+# SARIF output for GitHub Code Scanning
+chimerafuzz ci --project . --output-format sarif --output results.sarif --github-actions --fail-on-critical
 
-| Category | Contracts | Source |
-|----------|-----------|--------|
-| Reentrancy | 23 | EF/CF `tests/`, `reentrancy/` |
-| EtherDrain | 30 | EF/CF `tests/` |
-| Selfdestruct | 12 | EF/CF `tests/` |
-| PropertyViolation | 7 | EF/CF `properties-tests/` |
-| AccessControl | 5 | EF/CF `tests/` |
-| IntegerOverflow | 2 | EF/CF `tests/` |
+# JUnit XML for GitLab/general CI
+chimerafuzz ci --project . --output-format junit --output results.xml --corpus-dir .chimerafuzz/corpus
+```
 
-The matrix is still incomplete, but sci-fuzz now has a real benchmark artifact pipeline for filling it in. Raw benchmark rows can record:
+### Differential Execution
 
-- target / property / bug class / engine / status
-- whether the expected issue was found
-- first-hit execution count and first-hit wall-clock time
-- total executions and elapsed time
-- reproducer length before and after shrinking
-- total finding count and deduped finding count
+```bash
+# Compare two implementations
+chimerafuzz diff ImplA ImplB --project . --max-execs 2000 --depth 8 --seed 42
+```
 
-The built-in `efcf-demo` benchmark preset is real. A full 81-entry populated matrix is still aspirational until those cases are actually run and checked in.
+Reports divergences: success/revert mismatches, ABI-decoded output differences, raw return-data differences, and log topic0 sequence/count differences. Stops after first divergence and shrinks to a minimal reproducer.
 
-## Benchmark Artifacts
+### Benchmarking
 
-`sci-fuzz benchmark` emits four files under the chosen output directory:
+```bash
+# Quick demo
+chimerafuzz benchmark --preset efcf-demo --seeds 1,2,3 --max-execs 5000 --output-dir target/benchmark
 
-- `benchmark_results.csv`
-- `benchmark_results.json`
-- `benchmark_summary.csv`
-- `benchmark_summary.json`
+# Full EF/CF matrix
+chimerafuzz benchmark --preset efcf-matrix --seeds 1 --max-execs 2000 --output-dir target/benchmark-matrix
 
-The raw result schema includes:
+# Benchmark a real Foundry project
+chimerafuzz benchmark --project /path/to/project --target Vault --property campaign --category Campaign --seeds 1,2,3
+```
 
-- `target`
-- `property`
-- `category`
-- `mode`
-- `seed`
-- `found`
-- `first_hit_execs`
-- `first_hit_time_ms`
-- `total_execs`
-- `elapsed_ms`
-- `repro_len_raw`
-- `repro_len_shrunk`
-- `finding_count`
-- `deduped_finding_count`
-- `engine`
-- `status`
+## Design Influences
 
-The grouped summary currently reports:
+Every design choice traces to a specific technique:
 
-- hit rate across measured runs
-- median first-hit execs
-- median first-hit time
-- median elapsed time
-- median shrunk reproducer length
-- counts of `measured`, `unavailable`, `failed`, and `skipped` rows
-
-## What Informed the Design
-
-Every design choice traces to a specific tool in the workspace:
-
-| Decision | Source | Why |
-|----------|--------|-----|
+| Decision | Inspired By | Why |
+|----------|------------|-----|
 | Snapshot-based state corpus | ItyFuzz (ISSTA'23) | Re-executing long sequences to reach deep states is the core bottleneck |
-| Hitcount bucketing | AFL++/LibAFL `feedbacks/map.rs` | Binary "hit or not" misses loop-iteration coverage differences |
-| Power scheduling | LibAFL `schedulers/powersched.rs` | Uniform random wastes budget on over-explored states |
-| ABI-aware mutation | Medusa's weighted strategies | Random bytes almost never produce valid function calls |
-| Bytecode constant extraction | EF/CF `evm2cpp` | PUSH operands contain thresholds, magic values, and bounds the fuzzer needs |
-| Echidna property interface | Echidna + EF/CF property tests | Compatibility with existing test suites is more valuable than a novel format |
-| Assertion event detection | EF/CF assertion tests | Catches `assert()` failures and custom `AssertionFailed` events |
-| Template invariants | Slither's 99 detectors | The detector taxonomy maps directly to invariant categories |
-| Value dictionary from execution | Medusa's Slither integration | Return values and log data contain contract-relevant constants |
-| Benchmark suite | EF/CF `data/` (133 contracts) | Claims without a truth set are self-congratulation |
-
-Notably, LibAFL (v0.16.0) was analyzed but **not** used as a dependency. The type-parameter explosion (every trait generic over 3–5 types), edition-2024 MSRV requirement, and architectural mismatch (LibAFL's Stage pipeline doesn't fit our Plan→Select→Mutate→Execute→Validate→Learn loop) made it better to port the algorithms than adopt the framework.
-
-## Proving the Claims
-
-The minimum proof standard before sci-fuzz earns the label "credible tool":
-
-1. **One real benchmark run** — the 81-entry matrix populated with actual pass/fail/time data
-2. **One real Foundry target** — a nontrivial project fuzzing end-to-end with measured findings
-3. **One minimized reproducer** — a finding with a shrunk transaction sequence
-4. **One side-by-side measured comparison** — sci-fuzz vs Echidna / Forge on a shared target with shared properties
-
-Progress today:
-
-- The benchmark runner and artifact schema are implemented.
-- Multi-seed sci-fuzz measurements are real.
-- Forge comparison rows are measured for Foundry-project benchmark cases; Echidna rows remain scaffolded.
-- The full 81-entry matrix is not populated yet.
-- CI output (SARIF, JUnit, Forge reproducers) is implemented and tested.
-- Corpus persistence across runs is implemented.
-
-Until the shared-target comparison rows become measured rather than scaffolded, sci-fuzz remains a strong prototype rather than a fully validated production tool.
+| Hitcount bucketing | AFL++/LibAFL | Binary "hit or not" misses loop-iteration coverage differences |
+| Power scheduling | LibAFL | Uniform random wastes budget on over-explored states |
+| ABI-aware mutation | Academic fuzzing literature | Random bytes almost never produce valid function calls |
+| Bytecode constant extraction | EF/CF framework | PUSH operands contain thresholds and bounds the fuzzer needs |
+| Echidna property interface | Echidna + EF/CF | Compatibility with existing test suites is more valuable than a novel format |
+| Template invariants | Slither detector taxonomy | 99 detectors map directly to invariant categories |
+| Value dictionary from execution | Coverage-guided fuzzing research | Return values and log data contain contract-relevant constants |
+| Benchmark suite | EF/CF (133 contracts) | Claims without a truth set are self-congratulation |
 
 ## Roadmap
 
 | Phase | Description | Status |
 |-------|-------------|--------|
-| Phase 1 | Forge VM cheatcodes (`vm.warp`, `vm.roll`, `vm.prank`, `vm.deal`, `vm.expectRevert`, `vm.assume`, `vm.store`, `vm.load`) | ✅ Complete |
-| Phase 2 | Mutation depth controls, sequence-splice mutations, time-aware mutations | ✅ Complete |
-| Phase 3 | `AccessControlOracle`, `ReentrancyOracle`, `TokenFlowConservationOracle`; `sstore_in_nested_call` in executor | ✅ Complete |
-| Phase 4 | CI output: SARIF 2.1, JUnit XML, Forge `.t.sol` reproducers; functional `sci-fuzz ci` command | ✅ Complete |
-| Phase 5 | Corpus persistence: JSON save/load across runs, `--corpus-dir` flag | ✅ Complete |
-| Phase 6 | `LendingHealthOracle`: borrow-event net-debt detection, profile-gated, severity escalation | ✅ Complete |
-| Phase 7 | Semantic shrinker: ABI-type-aware reduction, storage-dependency ordering | ⬜ Not started |
-| Phase 8 | `sci-fuzz diff`: differential execution MVP between two implementations | ✅ Narrow MVP implemented |
-| Phase 9 | Parallel corpus persistence: wire `corpus_dir` into `run_parallel_campaign()` | ✅ Complete |
-| Phase 10 | Measured benchmark matrix: 81-entry matrix with real pass/fail/time data | ⬜ Not started |
+| 1 | Forge VM cheatcodes | ✅ Complete |
+| 2 | Extended mutation engine (depth, splice, time-aware) | ✅ Complete |
+| 3 | Access control, reentrancy, token-flow oracles | ✅ Complete |
+| 4 | CI output: SARIF, JUnit, Forge reproducers | ✅ Complete |
+| 5 | Corpus persistence | ✅ Complete |
+| 6 | Lending health oracle | ✅ Complete |
+| 7 | Semantic shrinker (ABI-aware) | 🟨 Partial |
+| 8 | Differential execution | ✅ MVP+ |
+| 9 | Parallel corpus persistence | ✅ Complete |
+| 10 | Measured benchmark matrix | 🟨 Partial |
+
+**Next layers:** CmpLog-style branch-distance guidance, full concolic campaign stages, dependency-guided corpus selection, two-step access-control confirmation, and deeper semantic shrinking.
 
 ## Project Stats
 
 | Metric | Value |
 |--------|-------|
-| Rust source | ~13,800 lines in `src/` (21 modules) |
-| Unit tests | 218+ passing (`cargo test --lib`) |
-| New tests added across Phases 1–5 | 26+ (10 oracle, 12 output, 4 corpus) |
-| Benchmark contracts | 133 (from EF/CF) |
-| Benchmark matrix entries | 81 with expected bug types |
+| Rust source | ~26,500 lines (30+ modules) |
+| Library unit tests | 260+ passing |
+| Benchmark contracts | 133 (EF/CF) |
+| Benchmark matrix entries | ~86 with expected bug types |
 | Dependencies | revm 19.7, alloy-primitives 0.8, clap 4, serde, rand, tiny-keccak |
-| Build time (release) | ~17s |
 | MSRV | Rust 1.75 (edition 2021) |
 
 ## License
@@ -353,4 +356,4 @@ MIT
 - [Echidna](https://github.com/crytic/echidna) — property-based testing interface
 - [Medusa](https://github.com/crytic/medusa) — weighted mutation strategies and value dictionary design
 - [Slither](https://github.com/crytic/slither) — detector taxonomy informing invariant categories
-- [CertoraProver](https://github.com/Certora/CertoraProver) — invariant specification language design
+- [revm](https://github.com/bluealloy/revm) — Rust EVM implementation

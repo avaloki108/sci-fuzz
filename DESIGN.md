@@ -205,16 +205,16 @@ Compare:
 
 ```bash
 # Basic: Replace forge test with enhanced fuzzing
-sci-fuzz test --match-test "test*" --runs 10000
+chimerafuzz test --match-test "test*" --runs 10000
 
 # Deep state: Enable snapshot engine
-sci-fuzz forge --project ./my-project --depth 50 --snapshots
+chimerafuzz forge --project ./my-project --depth 50 --snapshots
 
 # Fork mode: Fuzz deployed protocol
-sci-fuzz forge --project ./my-project --fork-url $ETH_RPC_URL --fork-block 19200000
+chimerafuzz forge --project ./my-project --fork-url $ETH_RPC_URL --fork-block 19200000
 
 # Audit mode: Automatic vulnerability discovery
-sci-fuzz audit 0x742d35Cc6634C0532925a3b844Bc9e... --rpc-url $ETH_RPC_URL
+chimerafuzz audit 0x742d35Cc6634C0532925a3b844Bc9e... --rpc-url $ETH_RPC_URL
 ```
 
 ### CI/CD Integration
@@ -224,13 +224,13 @@ sci-fuzz audit 0x742d35Cc6634C0532925a3b844Bc9e... --rpc-url $ETH_RPC_URL
 name: Sci-Fuzz Security Scan
 on: [push, pull_request]
 jobs:
-  sci-fuzz:
+  chimerafuzz:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
-      - run: cargo install sci-fuzz
-      - run: sci-fuzz ci --output-format junit --fail-on-critical
+      - run: cargo install chimerafuzz
+      - run: chimerafuzz ci --output-format junit --fail-on-critical
 ```
 
 ### Export Formats

@@ -11,7 +11,7 @@ use alloy_primitives::{keccak256, Address, B256};
 /// (e.g. mock flashloan handler). Distinct from an empty trace (`finalize` on zero steps).
 #[inline]
 pub fn native_flashloan_path_id() -> B256 {
-    keccak256(b"sci-fuzz/native-flashloan/v1")
+    keccak256(b"chimerafuzz/native-flashloan/v1")
 }
 
 /// Rolling hasher updated once per interpreter step, in execution order.
@@ -44,11 +44,11 @@ impl PathStreamHasher {
 
     /// Finalize to a compact [`B256`] (single `keccak256` over fixed layout).
     pub fn finalize(&self) -> B256 {
-        let mut packed = [0u8; 40];
+        let mut packed = [0u8; 43];
         packed[0..8].copy_from_slice(&self.state_lo.to_be_bytes());
         packed[8..16].copy_from_slice(&self.state_hi.to_be_bytes());
         packed[16..24].copy_from_slice(&self.step_count.to_be_bytes());
-        packed[24..40].copy_from_slice(b"sci-fuzz-txpath\x01");
+        packed[24..43].copy_from_slice(b"chimerafuzz-txpath\x01");
         keccak256(packed)
     }
 }

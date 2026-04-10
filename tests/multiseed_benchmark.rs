@@ -25,14 +25,14 @@ use std::time::{Duration, Instant};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use sci_fuzz::evm::EvmExecutor;
-use sci_fuzz::invariant::EchidnaPropertyCaller;
-use sci_fuzz::mutator::TxMutator;
-use sci_fuzz::oracle::OracleEngine;
-use sci_fuzz::rpc::FuzzerDatabase;
-use sci_fuzz::scoreboard::{MultiSeedSummary, Scoreboard, ScorecardEntry};
-use sci_fuzz::snapshot::SnapshotCorpus;
-use sci_fuzz::types::{
+use chimera_fuzz::evm::EvmExecutor;
+use chimera_fuzz::invariant::EchidnaPropertyCaller;
+use chimera_fuzz::mutator::TxMutator;
+use chimera_fuzz::oracle::OracleEngine;
+use chimera_fuzz::rpc::FuzzerDatabase;
+use chimera_fuzz::scoreboard::{MultiSeedSummary, Scoreboard, ScorecardEntry};
+use chimera_fuzz::snapshot::SnapshotCorpus;
+use chimera_fuzz::types::{
     Address, Bytes, ContractInfo, Finding, Severity, StateSnapshot, Transaction, U256,
 };
 
@@ -75,7 +75,7 @@ struct BenchmarkHarness {
     property_caller: Option<EchidnaPropertyCaller>,
     oracle: OracleEngine,
     snapshots: SnapshotCorpus,
-    feedback: sci_fuzz::feedback::CoverageFeedback,
+    feedback: chimera_fuzz::feedback::CoverageFeedback,
     rng: StdRng,
     attacker: Address,
     initial_db: revm::db::CacheDB<FuzzerDatabase>,
@@ -100,7 +100,8 @@ impl BenchmarkHarness {
             source_path: None,
             deployed_source_map: None,
             source_file_list: vec![],
-                abi: abi.clone(),
+            abi: abi.clone(),
+            link_references: Default::default(),
         };
 
         let mut mutator = TxMutator::new(vec![target]);
@@ -123,7 +124,7 @@ impl BenchmarkHarness {
             property_caller,
             oracle,
             snapshots,
-            feedback: sci_fuzz::feedback::CoverageFeedback::new(),
+            feedback: chimera_fuzz::feedback::CoverageFeedback::new(),
             rng: StdRng::seed_from_u64(seed),
             attacker: att,
             initial_db,
@@ -150,10 +151,10 @@ impl BenchmarkHarness {
 
             let db_snap = self.executor.snapshot();
             let pre_seq_balances =
-                sci_fuzz::oracle::capture_eth_baseline(&self.executor, self.attacker);
+                chimera_fuzz::oracle::capture_eth_baseline(&self.executor, self.attacker);
             let seq_len = self.rng.gen_range(1..=max_depth as usize);
             let mut sequence: Vec<Transaction> = Vec::new();
-            let mut cumulative_logs: Vec<sci_fuzz::types::Log> = Vec::new();
+            let mut cumulative_logs: Vec<chimera_fuzz::types::Log> = Vec::new();
 
             for _ in 0..seq_len {
                 let prev_sender = sequence.last().map(|t| t.sender);
@@ -184,7 +185,7 @@ impl BenchmarkHarness {
                         sequence.push(tx.clone());
 
                         // Oracle checks (BalanceIncrease, SelfDestruct, …).
-                        for mut f in self.oracle.check(&pre_seq_balances, &sci_fuzz::types::ProtocolProbeReport::default(), &result, &sequence) {
+                        for mut f in self.oracle.check(&pre_seq_balances, &chimera_fuzz::types::ProtocolProbeReport::default(), &result, &sequence) {
                             let mut repro = sequence.clone();
                             f.reproducer = repro;
                             let h = f.dedup_hash();

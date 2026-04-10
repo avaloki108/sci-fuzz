@@ -1,4 +1,4 @@
-# sci-fuzz fork mode — implementation status
+# chimerafuzz fork mode — implementation status
 
 ## Goal
 
@@ -16,7 +16,7 @@ Move from “campaign runs on repos” to **meaningful fork-based fuzzing** of l
 |------|--------|
 | `--fork-url` | On `forge` / `test`, same as `--fork-url` (canonical). On `audit`, **visible alias** for `--rpc-url`. |
 | `--fork-block-number` | Visible alias for `--fork-block` (forge) / `--block-number` (audit). |
-| `sci-fuzz audit … <targets>` | One or more `0x…` addresses, **or** a **single path** to a JSON manifest file. |
+| `chimerafuzz audit … <targets>` | One or more `0x…` addresses, **or** a **single path** to a JSON manifest file. |
 
 ### Address manifest JSON
 
@@ -56,13 +56,13 @@ Manifest `chain_id` is applied to `CampaignConfig.fork_expected_chain_id` when s
 
 ```bash
 # Inline addresses
-sci-fuzz audit 0xVault 0xRouter --rpc-url "$ETH_RPC_URL" --timeout 300
+chimerafuzz audit 0xVault 0xRouter --rpc-url "$ETH_RPC_URL" --timeout 300
 
 # Manifest (single path argument)
-sci-fuzz audit ./manifest.json --rpc-url "$ETH_RPC_URL" --fork-block-number 19000000
+chimerafuzz audit ./manifest.json --rpc-url "$ETH_RPC_URL" --fork-block-number 19000000
 
 # Forge project fuzzing against a fork (hybrid deploy)
-sci-fuzz forge --project ./protocol --fork-url "$ETH_RPC_URL" --fork-block-number 19000000
+chimerafuzz forge --project ./protocol --fork-url "$ETH_RPC_URL" --fork-block-number 19000000
 ```
 
 ## Success criteria (phase 1)

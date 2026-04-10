@@ -1,4 +1,4 @@
-//! # sci-fuzz — Smart Contract Invariant Fuzzer
+//! # chimerafuzz — Smart Contract Invariant Fuzzer
 //!
 //! A coverage-guided, snapshot-based fuzzer for EVM smart contracts that
 //! automatically discovers invariant violations with minimal manual
@@ -98,7 +98,14 @@ pub mod target_rank;
 // ── Benchmark scoreboard ────────────────────────────────────────────────
 
 pub mod benchmark;
+/// EF/CF benchmark matrix (expected bug classes per contract file).
+pub mod benchmark_matrix;
 pub mod scoreboard;
+
+/// Bounded concolic / SMT helpers (MVP).
+pub mod concolic;
+/// Dynamic read/write summaries for sequence planning (MVP).
+pub mod dependency_planner;
 
 // ── Foundry integration ─────────────────────────────────────────────────
 
@@ -128,9 +135,11 @@ pub mod cli;
 // ── Convenience re-exports ──────────────────────────────────────────────
 
 pub use benchmark::{
-    efcf_demo_plan, plan_for_foundry_project, run_benchmark_plan, write_benchmark_artifacts,
-    BenchmarkCase, BenchmarkPlanEntry, FindingMatcher,
+    contract_stem_from_path, efcf_demo_plan, efcf_matrix_plan, matcher_for_expected_bug,
+    plan_for_foundry_project, run_benchmark_plan, write_benchmark_artifacts,
+    write_benchmark_matrix_report_json, BenchmarkCase, BenchmarkPlanEntry, FindingMatcher,
 };
+pub use benchmark_matrix::{benchmark_matrix, benchmark_matrix_len, BenchmarkEntry, ExpectedBug};
 pub use campaign::Campaign;
 pub use campaign::{CampaignFindingRecord, CampaignReport};
 pub use error::{Error, Result};

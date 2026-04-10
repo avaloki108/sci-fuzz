@@ -1,4 +1,4 @@
-//! Error types for sci-fuzz.
+//! Error types for chimerafuzz.
 
 use thiserror::Error;
 

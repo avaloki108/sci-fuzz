@@ -207,12 +207,19 @@ impl SequenceShrinker {
             return None;
         }
 
-        // Try swapping adjacent transactions.
+        let old_key = sequence_order_key(current);
+
+        // Try swapping adjacent transactions. Only accept a swap that strictly
+        // decreases a canonical key; otherwise symmetric predicates can swap
+        // back and forth forever (same length, same targets, still failing).
         for i in 0..current.len() - 1 {
             let mut candidate = current.to_vec();
             candidate.swap(i, i + 1);
             if fails(&candidate) {
-                return Some(candidate);
+                let new_key = sequence_order_key(&candidate);
+                if new_key < old_key {
+                    return Some(candidate);
+                }
             }
         }
 
@@ -584,6 +591,24 @@ impl SequenceShrinker {
 
         None
     }
+}
+
+/// Deterministic encoding for comparing transaction sequences (reorder pass).
+fn sequence_order_key(seq: &[Transaction]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for t in seq {
+        out.extend_from_slice(t.sender.as_slice());
+        match t.to {
+            Some(addr) => {
+                out.push(1);
+                out.extend_from_slice(addr.as_slice());
+            }
+            None => out.push(0),
+        }
+        out.extend_from_slice(t.data.as_ref());
+        out.extend_from_slice(&t.value.to_be_bytes::<32>());
+    }
+    out
 }
 
 fn dedup_addresses(values: &mut Vec<Address>) {

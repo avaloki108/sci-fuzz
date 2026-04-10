@@ -1,9 +1,9 @@
-//! sci-fuzz configuration file support.
+//! chimerafuzz configuration file support.
 //!
-//! Loads campaign settings from `sci-fuzz.toml` in the project root or from
+//! Loads campaign settings from `chimerafuzz.toml` in the project root or from
 //! a path specified via `--config <path>`.  CLI flags override file values.
 //!
-//! ## Example `sci-fuzz.toml`
+//! ## Example `chimerafuzz.toml`
 //!
 //! ```toml
 //! [campaign]
@@ -46,9 +46,9 @@ use crate::types::{Address, TestMode};
 // Config file schema
 // ---------------------------------------------------------------------------
 
-/// Top-level sci-fuzz config file.
+/// Top-level chimerafuzz config file.
 #[derive(Debug, Default, Serialize, Deserialize)]
-pub struct SciFuzzConfig {
+pub struct ChimeraFuzzConfig {
     #[serde(default)]
     pub campaign: CampaignSection,
     #[serde(default)]
@@ -108,17 +108,17 @@ pub struct OutputSection {
 // Loading
 // ---------------------------------------------------------------------------
 
-const CONFIG_FILENAME: &str = "sci-fuzz.toml";
+const CONFIG_FILENAME: &str = "chimerafuzz.toml";
 
 /// Try to load config from:
 /// 1. `--config <path>` if provided
-/// 2. `<project>/sci-fuzz.toml`
-/// 3. CWD `sci-fuzz.toml`
-pub fn load_config(explicit_path: Option<&str>, project_dir: &Path) -> anyhow::Result<SciFuzzConfig> {
+/// 2. `<project>/chimerafuzz.toml`
+/// 3. CWD `chimerafuzz.toml`
+pub fn load_config(explicit_path: Option<&str>, project_dir: &Path) -> anyhow::Result<ChimeraFuzzConfig> {
     if let Some(path) = explicit_path {
         let content = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("Failed to read config file '{}': {}", path, e))?;
-        let config: SciFuzzConfig = toml::from_str(&content)
+        let config: ChimeraFuzzConfig = toml::from_str(&content)
             .map_err(|e| anyhow::anyhow!("Failed to parse config file '{}': {}", path, e))?;
         return Ok(config);
     }
@@ -128,14 +128,14 @@ pub fn load_config(explicit_path: Option<&str>, project_dir: &Path) -> anyhow::R
         let path = dir.join(CONFIG_FILENAME);
         if path.exists() {
             let content = std::fs::read_to_string(&path)?;
-            let config: SciFuzzConfig = toml::from_str(&content)
+            let config: ChimeraFuzzConfig = toml::from_str(&content)
                 .map_err(|e| anyhow::anyhow!("Failed to parse {}: {}", path.display(), e))?;
             eprintln!("[config] loaded {}", path.display());
             return Ok(config);
         }
     }
 
-    Ok(SciFuzzConfig::default())
+    Ok(ChimeraFuzzConfig::default())
 }
 
 // ---------------------------------------------------------------------------
@@ -192,7 +192,7 @@ impl std::str::FromStr for OutputFormat {
 
 impl ResolvedCampaignSettings {
     /// Resolve settings by layering CLI args over config file.
-    pub fn from_cli_and_file(args: &ForgeArgs, config: &SciFuzzConfig) -> Self {
+    pub fn from_cli_and_file(args: &ForgeArgs, config: &ChimeraFuzzConfig) -> Self {
         let mode = args.mode; // CLI always wins for mode
         let timeout = args.timeout;
         let depth = args.depth;
@@ -311,7 +311,7 @@ mod tests {
 
     #[test]
     fn parse_empty_config() {
-        let config: SciFuzzConfig = toml::from_str("").unwrap();
+        let config: ChimeraFuzzConfig = toml::from_str("").unwrap();
         assert!(config.campaign.mode.is_none());
         assert!(config.output.format.is_none());
     }
@@ -346,7 +346,7 @@ format = "json"
 save_report = true
 replay = true
 "#;
-        let config: SciFuzzConfig = toml::from_str(toml_str).unwrap();
+        let config: ChimeraFuzzConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.campaign.mode.as_deref(), Some("assertion"));
         assert_eq!(config.campaign.timeout, Some(1800));
         assert_eq!(config.campaign.workers, Some(8));

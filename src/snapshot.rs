@@ -1,4 +1,4 @@
-//! Snapshot corpus for sci-fuzz.
+//! Snapshot corpus for chimerafuzz.
 //!
 //! Manages a bounded collection of [`StateSnapshot`]s, each representing a
 //! point-in-time EVM world state. Snapshots are weighted by coverage

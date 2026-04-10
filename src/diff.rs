@@ -1,4 +1,4 @@
-//! Differential fuzzing module for sci-fuzz.
+//! Differential fuzzing module for chimerafuzz.
 //!
 //! Compares two Foundry-project contract implementations by replaying identical
 //! generated call sequences and reporting reproducible divergences. This is
@@ -75,6 +75,16 @@ pub struct DiffResult {
     pub reproducer: Option<Vec<Transaction>>,
     /// Wall-clock seconds elapsed.
     pub elapsed_secs: f64,
+}
+
+/// Split calldata into the 4-byte selector and remaining ABI payload (diff++ helper).
+pub fn calldata_selector_and_body(data: &[u8]) -> Option<([u8; 4], &[u8])> {
+    if data.len() < 4 {
+        return None;
+    }
+    let mut sel = [0u8; 4];
+    sel.copy_from_slice(&data[..4]);
+    Some((sel, &data[4..]))
 }
 
 // ── Diff Runner ──────────────────────────────────────────────────────────────
@@ -667,7 +677,7 @@ fn simple_shrink(
 
 /// Format and print a DiffResult to stdout.
 pub fn print_diff_result(result: &DiffResult) {
-    println!("⚡ sci-fuzz diff — results");
+    println!("⚡ chimerafuzz diff — results");
     println!();
     println!("  impl-a       : {}", result.impl_a);
     println!("  impl-b       : {}", result.impl_b);
