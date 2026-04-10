@@ -25,6 +25,9 @@ pub use observer::{EvmCoverageObserver, LibAflEvmExecutor, SharedCoverageMap, MA
 pub mod mutators;
 pub use mutators::{AbiCalldataMutator, SenderValueMutator, SequenceStructureMutator, SpliceMutator, HavocMutator};
 
+pub mod cmplog;
+pub use cmplog::CmpLogMutator;
+
 // pub mod scheduler;  // Phase 5
 // pub mod campaign;   // Phase 6
 // pub mod concolic;   // Phase 7
