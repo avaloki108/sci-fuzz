@@ -39,7 +39,7 @@ use crate::{
         cmplog::CmpLogMutator,
         input::EvmInput,
         mutators::HavocMutator,
-        observer::{EvmCoverageObserver, LibAflEvmExecutor, SharedCoverageMap},
+        observer::{LibAflEvmExecutor, SharedCoverageMap},
         scheduler::make_rand,
     },
     mutator::TxMutator,
@@ -77,17 +77,35 @@ impl LibAflCampaign {
 
     /// Run the LibAFL-backed fuzzing campaign.
     pub fn run(mut self) -> Result<LibAflCampaignResult, Error> {
+        use libafl::{
+            feedbacks::MaxMapFeedback,
+            observers::{CanTrack, HitcountsMapObserver, StdMapObserver},
+            schedulers::{IndexesLenTimeMinimizerScheduler, QueueScheduler},
+        };
+        use libafl_bolts::ownedref::OwnedMutSlice;
+        use crate::libafl_adapter::observer::MAP_SIZE;
+
         let start = Instant::now();
 
-        // Shared coverage bitmap (written by executor, read by observer).
+        // Shared coverage bitmap.
         let shared_map = SharedCoverageMap::new();
 
-        // Coverage pipeline: observer + feedback.
-        // SAFETY: shared_map Arc is kept alive for the duration of the run.
-        let (observer, mut feedback) = unsafe { build_coverage_pipeline!(shared_map) };
+        // Build the ONE observer that both feedback and executor see.
+        // We use from_mut_ptr so the raw pointer is shared by both sides.
+        // SAFETY: shared_map Arc lives for the entire run.
+        let observer = unsafe {
+            HitcountsMapObserver::new(
+                StdMapObserver::from_mut_ptr(
+                    "chimera_edges",
+                    shared_map.as_mut_ptr(),
+                    MAP_SIZE,
+                )
+            ).track_indices()
+        };
+
+        let mut feedback = MaxMapFeedback::new(&observer);
         let mut objective = ConstFeedback::new(false);
 
-        // State.
         let rand = make_rand(self.seed);
         let mut state = StdState::new(
             rand,
@@ -97,38 +115,26 @@ impl LibAflCampaign {
             &mut objective,
         )?;
 
-        // Scheduler.
         let scheduler = IndexesLenTimeMinimizerScheduler::new(
             &observer,
             QueueScheduler::new(),
         );
 
-        // Inner EVM executor.
+        // Executor + the SAME observer in WithObservers.
         let inner_exec = LibAflEvmExecutor::new(
             self.evm,
             Arc::clone(&shared_map),
             self.attacker,
         );
+        let mut executor = WithObservers::new(inner_exec, tuple_list!(observer));
 
-        // Coverage observer for WithObservers wrapper.
-        let cov_observer = EvmCoverageObserver::new("evm_coverage", Arc::clone(&shared_map));
-
-        // Wrap executor with observer tuple so LibAFL can call pre/post hooks.
-        let mut executor = WithObservers::new(
-            inner_exec,
-            tuple_list!(cov_observer),
-        );
-
-        // Mutator: use our HavocMutator as the primary driver.
+        // Mutators + stages.
         let tx_mutator = TxMutator::new(self.targets.clone());
         let mutator = HavocMutator::new(tx_mutator, 8);
         let stage = StdMutationalStage::new(mutator);
         let mut stages = tuple_list!(stage);
 
-        // Event manager (nop — single process).
         let mut mgr = NopEventManager::new();
-
-        // Fuzzer.
         let mut fuzzer: StdFuzzer<_, _, _, _, _> = StdFuzzer::new(scheduler, feedback, objective);
 
         // Seed corpus.
@@ -145,7 +151,6 @@ impl LibAflCampaign {
             }
         }
 
-        // Main loop.
         fuzzer.fuzz_loop_for(
             &mut stages,
             &mut executor,
@@ -156,10 +161,7 @@ impl LibAflCampaign {
 
         let corpus_size = state.corpus().count();
         let executions = *state.executions();
-        // Recover the inner executor to drain findings.
-        // WithObservers doesn't expose inner directly, so we can't drain here.
-        // Findings are returned as part of the executor (Phase 6 TODO: expose via observer).
-        let findings: Vec<Finding> = vec![]; // TODO: wire through WithObservers in Phase 6b
+        let findings: Vec<Finding> = vec![]; // TODO: expose from WithObservers inner
 
         Ok(LibAflCampaignResult {
             findings,

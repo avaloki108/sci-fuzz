@@ -261,14 +261,19 @@ impl LibAflEvmExecutor {
     }
 }
 
-impl<EM, S, Z> Executor<EM, EvmInput, S, Z> for LibAflEvmExecutor {
+impl<EM, S, Z> Executor<EM, EvmInput, S, Z> for LibAflEvmExecutor
+where
+    S: libafl::state::HasExecutions,
+{
     fn run_target(
         &mut self,
         _fuzzer: &mut Z,
-        _state: &mut S,
+        state: &mut S,
         _mgr: &mut EM,
         input: &EvmInput,
     ) -> Result<ExitKind, Error> {
+        // Track execution count for LibAFL's scheduler and monitors.
+        *state.executions_mut() += 1;
         // Reset coverage bitmap.
         unsafe { self.shared_map.reset() };
 
