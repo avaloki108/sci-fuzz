@@ -1031,7 +1031,7 @@ impl TxMutator {
 
     /// Pick a random sender — biased toward the address pool but
     /// occasionally fully random.
-    fn random_sender(&self, rng: &mut impl Rng) -> Address {
+    pub fn random_sender(&self, rng: &mut impl Rng) -> Address {
         if !self.address_pool.is_empty() && rng.gen_bool(0.7) {
             self.address_pool[rng.gen_range(0..self.address_pool.len())]
         } else {

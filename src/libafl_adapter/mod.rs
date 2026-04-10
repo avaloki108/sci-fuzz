@@ -22,7 +22,9 @@ pub use input::EvmInput;
 pub mod observer;
 pub use observer::{EvmCoverageObserver, LibAflEvmExecutor, SharedCoverageMap, MAP_SIZE};
 
-// pub mod mutators;   // Phase 3
+pub mod mutators;
+pub use mutators::{AbiCalldataMutator, SenderValueMutator, SequenceStructureMutator, SpliceMutator, HavocMutator};
+
 // pub mod scheduler;  // Phase 5
 // pub mod campaign;   // Phase 6
 // pub mod concolic;   // Phase 7
