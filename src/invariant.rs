@@ -732,6 +732,9 @@ static PRIVILEGED_FN_NAMES: &[&str] = &[
     "emergencyexit",
     "initialize",
     "reinitialize",
+    // Delegatecall-pattern: update_lib is a privileged function
+    "updatelib",
+    "update_lib",
 ];
 
 fn is_privileged_fn(name: &str) -> bool {

@@ -43,6 +43,7 @@ use crate::{
         scheduler::make_rand,
     },
     mutator::TxMutator,
+    oracle::OracleEngine,
     types::{Address, ContractInfo, Finding},
     evm::EvmExecutor,
 };
@@ -65,9 +66,12 @@ pub struct LibAflCampaign {
     evm: EvmExecutor,
     targets: Vec<ContractInfo>,
     attacker: Address,
+    /// Deployer/owner address for access-control oracle (defaults to attacker).
+    deployer: Address,
     seed: u64,
     max_iters: u64,
     initial_inputs: Vec<EvmInput>,
+    test_mode: crate::types::TestMode,
 }
 
 impl LibAflCampaign {
@@ -121,14 +125,41 @@ impl LibAflCampaign {
         );
 
         // Executor + the SAME observer in WithObservers.
-        // Shared findings sink — Arc allows reading findings after fuzz_loop_for.
         let findings_sink: Arc<Mutex<Vec<Finding>>> = Arc::new(Mutex::new(Vec::new()));
 
-        let inner_exec = LibAflEvmExecutor::new_with_sink(
+        // Build oracle based on test mode.
+        let oracle = match self.test_mode {
+            crate::types::TestMode::Assertion =>
+                OracleEngine::new_assertion_mode(self.attacker),
+            crate::types::TestMode::Exploration =>
+                OracleEngine::empty(self.attacker),
+            // Property + default: full oracle (economic + property + reverts)
+            _ => OracleEngine::new(self.attacker),
+        };
+
+        // Build Echidna property callers for all targets that have echidna_* functions.
+        let property_callers: Vec<crate::invariant::EchidnaPropertyCaller> = self.targets.iter()
+            .filter_map(|t| t.abi.as_ref()
+                .and_then(|a| crate::invariant::EchidnaPropertyCaller::from_abi(t.address, a)))
+            .collect();
+
+        // Build access control oracles for all targets that have privileged functions.
+        let access_oracles: Vec<crate::invariant::AccessControlOracle> = self.targets.iter()
+            .filter_map(|t| t.abi.as_ref()
+                .and_then(|a| crate::invariant::AccessControlOracle::from_abi(
+                    self.deployer, self.attacker, a)))
+            .collect();
+        eprintln!("[campaign] {} property callers, {} access oracles",
+                  property_callers.len(), access_oracles.len());
+
+        let inner_exec = LibAflEvmExecutor::new_full(
             self.evm,
             Arc::clone(&shared_map),
             self.attacker,
             Arc::clone(&findings_sink),
+            oracle,
+            property_callers,
+            access_oracles,
         );
         let mut executor = WithObservers::new(inner_exec, tuple_list!(observer));
 
@@ -187,9 +218,11 @@ pub struct LibAflCampaignBuilder {
     evm: Option<EvmExecutor>,
     targets: Vec<ContractInfo>,
     attacker: Option<Address>,
+    deployer: Option<Address>,
     seed: u64,
     max_iters: u64,
     initial_inputs: Vec<EvmInput>,
+    test_mode: crate::types::TestMode,
 }
 
 impl LibAflCampaignBuilder {
@@ -197,18 +230,23 @@ impl LibAflCampaignBuilder {
     pub fn evm(mut self, evm: EvmExecutor) -> Self { self.evm = Some(evm); self }
     pub fn targets(mut self, t: Vec<ContractInfo>) -> Self { self.targets = t; self }
     pub fn attacker(mut self, a: Address) -> Self { self.attacker = Some(a); self }
+    pub fn deployer(mut self, d: Address) -> Self { self.deployer = Some(d); self }
     pub fn seed(mut self, s: u64) -> Self { self.seed = s; self }
     pub fn max_iters(mut self, n: u64) -> Self { self.max_iters = n; self }
     pub fn initial_inputs(mut self, i: Vec<EvmInput>) -> Self { self.initial_inputs = i; self }
+    pub fn test_mode(mut self, m: crate::types::TestMode) -> Self { self.test_mode = m; self }
 
     pub fn build(self) -> Result<LibAflCampaign, String> {
+        let attacker = self.attacker.unwrap_or(Address::with_last_byte(0xfe));
         Ok(LibAflCampaign {
             evm: self.evm.ok_or("evm is required")?,
             targets: self.targets,
-            attacker: self.attacker.unwrap_or(Address::with_last_byte(0xfe)),
+            attacker,
+            deployer: self.deployer.unwrap_or(attacker),
             seed: self.seed,
             max_iters: if self.max_iters == 0 { 10_000 } else { self.max_iters },
             initial_inputs: self.initial_inputs,
+            test_mode: self.test_mode,
         })
     }
 }

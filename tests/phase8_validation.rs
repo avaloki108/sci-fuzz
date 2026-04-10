@@ -6,7 +6,7 @@ use std::time::Instant;
 use chimera_fuzz::{
     evm::EvmExecutor,
     libafl_adapter::campaign::LibAflCampaign,
-    types::{Address, Bytes, ContractInfo, U256},
+    types::{Address, Bytes, ContractInfo, TestMode, U256},
 };
 
 const COMPILED: &str = "tests/contracts/efcf-compiled";
@@ -69,11 +69,9 @@ fn make_simpledao_campaign(max_iters: u64) -> Option<LibAflCampaign> {
     let mut evm = EvmExecutor::new();
     evm.set_balance(ATTACKER, U256::from(100_000_000_000_000_000_000_u128));
 
-    // Deploy SimpleDAO, seed with 10 ETH.
     let dao_addr = deploy(&mut evm, dao_bin, Address::repeat_byte(0xd0))?;
     evm.set_balance(dao_addr, U256::from(10_000_000_000_000_000_000_u128));
 
-    // Deploy attacker — constructor arg: dao_addr (ABI-encoded as 32 bytes).
     let mut atk_init = atk_bin;
     let mut arg = [0u8; 32];
     arg[12..].copy_from_slice(dao_addr.as_slice());
@@ -111,13 +109,24 @@ fn phase8_simpledao_with_attacker() {
 
 #[test]
 fn phase8_harvey_baz() {
-    let campaign = match make_campaign("harvey_baz", MAX_ITERS) {
-        Some(c) => c,
+    let name = "harvey_baz";
+    let bytecode = match read_bin(name) {
+        Some(b) => b,
         None => { eprintln!("SKIP"); return; }
     };
+    let abi = read_abi(name);
+    let mut evm = EvmExecutor::new();
+    evm.set_balance(ATTACKER, U256::from(100_000_000_000_000_000_000_u128));
+    let addr = deploy(&mut evm, bytecode, Address::repeat_byte(0xde)).unwrap();
+    let target = make_target(&evm, addr, name, abi);
+    let campaign = LibAflCampaign::builder()
+        .evm(evm).targets(vec![target])
+        .attacker(ATTACKER).seed(SEED).max_iters(MAX_ITERS)
+        .test_mode(TestMode::Assertion)  // Echidna property mode for echidna_all_states
+        .build().expect("build");
     let result = campaign.run().expect("campaign failed");
     eprintln!(
-        "\n[Phase 8] harvey_baz: {} execs, {} corpus, {} findings",
+        "\n[Phase 8] harvey_baz (Assertion mode): {} execs, {} corpus, {} findings",
         result.executions, result.corpus_size, result.findings.len()
     );
     assert!(result.executions > 0);
@@ -125,13 +134,25 @@ fn phase8_harvey_baz() {
 
 #[test]
 fn phase8_delegatecall() {
-    let campaign = match make_campaign("Delegatecall", MAX_ITERS) {
-        Some(c) => c,
+    let name = "Delegatecall";
+    let bytecode = match read_bin(name) {
+        Some(b) => b,
         None => { eprintln!("SKIP"); return; }
     };
+    let abi = read_abi(name);
+    let deployer = Address::repeat_byte(0xde);
+    let mut evm = EvmExecutor::new();
+    evm.set_balance(ATTACKER, U256::from(100_000_000_000_000_000_000_u128));
+    let addr = deploy(&mut evm, bytecode, deployer).unwrap();
+    let target = make_target(&evm, addr, name, abi);
+    let campaign = LibAflCampaign::builder()
+        .evm(evm).targets(vec![target])
+        .attacker(ATTACKER).deployer(deployer)  // deployer != attacker for AC oracle
+        .seed(SEED).max_iters(MAX_ITERS)
+        .build().expect("build");
     let result = campaign.run().expect("campaign failed");
     eprintln!(
-        "\n[Phase 8] Delegatecall: {} execs, {} corpus, {} findings",
+        "\n[Phase 8] Delegatecall (access-control): {} execs, {} corpus, {} findings",
         result.executions, result.corpus_size, result.findings.len()
     );
     assert!(result.executions > 0);
@@ -150,6 +171,45 @@ fn phase8_summary() {
     for (name, use_dao) in targets {
         let campaign = if *use_dao {
             make_simpledao_campaign(MAX_ITERS)
+        } else if *name == "harvey_baz" {
+            // Assertion mode for echidna property
+            let bytecode = match read_bin(name) {
+                Some(b) => b,
+                None => continue,
+            };
+            let abi = read_abi(name);
+            let mut evm = EvmExecutor::new();
+            evm.set_balance(ATTACKER, U256::from(100_000_000_000_000_000_000_u128));
+            let addr = match deploy(&mut evm, bytecode, Address::repeat_byte(0xde)) {
+                Some(a) => a,
+                None => continue,
+            };
+            let target = make_target(&evm, addr, name, abi);
+            LibAflCampaign::builder()
+                .evm(evm).targets(vec![target])
+                .attacker(ATTACKER).seed(SEED).max_iters(MAX_ITERS)
+                .test_mode(TestMode::Assertion)
+                .build().ok()
+        } else if *name == "Delegatecall" {
+            // Access control mode — deployer != attacker
+            let bytecode = match read_bin(name) {
+                Some(b) => b,
+                None => continue,
+            };
+            let abi = read_abi(name);
+            let deployer = Address::repeat_byte(0xde);
+            let mut evm = EvmExecutor::new();
+            evm.set_balance(ATTACKER, U256::from(100_000_000_000_000_000_000_u128));
+            let addr = match deploy(&mut evm, bytecode, deployer) {
+                Some(a) => a,
+                None => continue,
+            };
+            let target = make_target(&evm, addr, name, abi);
+            LibAflCampaign::builder()
+                .evm(evm).targets(vec![target])
+                .attacker(ATTACKER).deployer(deployer)
+                .seed(SEED).max_iters(MAX_ITERS)
+                .build().ok()
         } else {
             make_campaign(name, MAX_ITERS)
         };

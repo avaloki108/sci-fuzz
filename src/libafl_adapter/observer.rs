@@ -226,20 +226,32 @@ impl<I, S> Observer<I, S> for EvmCoverageObserver {
 ///   6. return ExitKind::Ok/Crash
 /// ```
 pub struct LibAflEvmExecutor {
-    /// Chimerafuzz EVM executor.
     pub evm: EvmExecutor,
-    /// Shared coverage bitmap (written here, read by observer).
     pub shared_map: Arc<SharedCoverageMap>,
-    /// Oracle engine for invariant checking.
     pub oracle: OracleEngine,
-    /// Shared findings sink — Arc lets campaign read findings outside WithObservers.
     pub findings_sink: Arc<Mutex<Vec<Finding>>>,
-    /// Attacker address for profit oracle baseline.
     pub attacker: Address,
+    /// Echidna property callers (for Assertion/Property mode).
+    pub property_callers: Vec<crate::invariant::EchidnaPropertyCaller>,
+    /// Access control oracles (for detecting missing auth checks).
+    pub access_oracles: Vec<crate::invariant::AccessControlOracle>,
 }
 
 impl LibAflEvmExecutor {
-    /// Create a new executor with a shared findings sink.
+    /// Full constructor with all oracles configured.
+    pub fn new_full(
+        evm: EvmExecutor,
+        shared_map: Arc<SharedCoverageMap>,
+        attacker: Address,
+        findings_sink: Arc<Mutex<Vec<Finding>>>,
+        oracle: OracleEngine,
+        property_callers: Vec<crate::invariant::EchidnaPropertyCaller>,
+        access_oracles: Vec<crate::invariant::AccessControlOracle>,
+    ) -> Self {
+        Self { evm, shared_map, oracle, findings_sink, attacker, property_callers, access_oracles }
+    }
+
+    /// Create with shared findings sink and default economic oracle.
     pub fn new_with_sink(
         evm: EvmExecutor,
         shared_map: Arc<SharedCoverageMap>,
@@ -248,15 +260,13 @@ impl LibAflEvmExecutor {
     ) -> Self {
         let oracle = OracleEngine::new(attacker);
         Self {
-            evm,
-            shared_map,
-            oracle,
-            findings_sink,
-            attacker,
+            evm, shared_map, oracle, findings_sink, attacker,
+            property_callers: vec![],
+            access_oracles: vec![],
         }
     }
 
-    /// Create a new executor (auto-creates a private findings sink).
+    /// Convenience constructor (private sink, default oracle).
     pub fn new(
         evm: EvmExecutor,
         shared_map: Arc<SharedCoverageMap>,
@@ -265,7 +275,6 @@ impl LibAflEvmExecutor {
         Self::new_with_sink(evm, shared_map, attacker, Arc::new(Mutex::new(Vec::new())))
     }
 
-    /// Drain findings from the shared sink.
     pub fn drain_findings(&self) -> Vec<Finding> {
         let mut sink = self.findings_sink.lock().unwrap();
         std::mem::take(&mut *sink)
@@ -325,8 +334,27 @@ where
             if !findings.is_empty() {
                 let mut sink = self.findings_sink.lock().unwrap();
                 sink.extend(findings);
-                // Signal LibAFL that this is an "objective" (finding).
-                return Ok(ExitKind::Ok);
+            }
+
+            // Echidna property caller checks (Assertion/Property mode).
+            for prop_caller in &self.property_callers {
+                let prop_findings = prop_caller.check_properties(
+                    &self.evm, self.attacker, &input.transactions,
+                );
+                if !prop_findings.is_empty() {
+                    let mut sink = self.findings_sink.lock().unwrap();
+                    sink.extend(prop_findings);
+                }
+            }
+
+            // Access control oracle checks.
+            for ac_oracle in &self.access_oracles {
+                if let Some(finding) = crate::invariant::Invariant::check(
+                    ac_oracle, &pre_balances, &default_probes, result, &input.transactions,
+                ) {
+                    let mut sink = self.findings_sink.lock().unwrap();
+                    sink.push(finding);
+                }
             }
         }
 
