@@ -22,7 +22,7 @@ use std::{
     cell::UnsafeCell,
     hash::{Hash, Hasher},
     collections::hash_map::DefaultHasher,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use libafl::{
@@ -232,32 +232,43 @@ pub struct LibAflEvmExecutor {
     pub shared_map: Arc<SharedCoverageMap>,
     /// Oracle engine for invariant checking.
     pub oracle: OracleEngine,
-    /// Findings accumulated during this campaign.
-    pub findings: Vec<Finding>,
+    /// Shared findings sink — Arc lets campaign read findings outside WithObservers.
+    pub findings_sink: Arc<Mutex<Vec<Finding>>>,
     /// Attacker address for profit oracle baseline.
     pub attacker: Address,
 }
 
 impl LibAflEvmExecutor {
-    /// Create a new executor.
-    pub fn new(
+    /// Create a new executor with a shared findings sink.
+    pub fn new_with_sink(
         evm: EvmExecutor,
         shared_map: Arc<SharedCoverageMap>,
         attacker: Address,
+        findings_sink: Arc<Mutex<Vec<Finding>>>,
     ) -> Self {
         let oracle = OracleEngine::new(attacker);
         Self {
             evm,
             shared_map,
             oracle,
-            findings: Vec::new(),
+            findings_sink,
             attacker,
         }
     }
 
-    /// Drain and return all findings collected so far.
-    pub fn drain_findings(&mut self) -> Vec<Finding> {
-        std::mem::take(&mut self.findings)
+    /// Create a new executor (auto-creates a private findings sink).
+    pub fn new(
+        evm: EvmExecutor,
+        shared_map: Arc<SharedCoverageMap>,
+        attacker: Address,
+    ) -> Self {
+        Self::new_with_sink(evm, shared_map, attacker, Arc::new(Mutex::new(Vec::new())))
+    }
+
+    /// Drain findings from the shared sink.
+    pub fn drain_findings(&self) -> Vec<Finding> {
+        let mut sink = self.findings_sink.lock().unwrap();
+        std::mem::take(&mut *sink)
     }
 }
 
@@ -312,7 +323,8 @@ where
                 &input.transactions,
             );
             if !findings.is_empty() {
-                self.findings.extend(findings);
+                let mut sink = self.findings_sink.lock().unwrap();
+                sink.extend(findings);
                 // Signal LibAFL that this is an "objective" (finding).
                 return Ok(ExitKind::Ok);
             }

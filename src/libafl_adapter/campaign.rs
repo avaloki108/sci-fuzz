@@ -17,7 +17,7 @@
 //!   └── runs OracleEngine, accumulates findings
 //! ```
 
-use std::{sync::Arc, time::{Duration, Instant}};
+use std::{sync::{Arc, Mutex}, time::{Duration, Instant}};
 
 use libafl::{
     corpus::{Corpus, InMemoryCorpus, Testcase},
@@ -121,10 +121,14 @@ impl LibAflCampaign {
         );
 
         // Executor + the SAME observer in WithObservers.
-        let inner_exec = LibAflEvmExecutor::new(
+        // Shared findings sink — Arc allows reading findings after fuzz_loop_for.
+        let findings_sink: Arc<Mutex<Vec<Finding>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let inner_exec = LibAflEvmExecutor::new_with_sink(
             self.evm,
             Arc::clone(&shared_map),
             self.attacker,
+            Arc::clone(&findings_sink),
         );
         let mut executor = WithObservers::new(inner_exec, tuple_list!(observer));
 
@@ -161,7 +165,11 @@ impl LibAflCampaign {
 
         let corpus_size = state.corpus().count();
         let executions = *state.executions();
-        let findings: Vec<Finding> = vec![]; // TODO: expose from WithObservers inner
+        // Drain findings from the shared Arc sink.
+        let findings = {
+            let mut sink = findings_sink.lock().unwrap();
+            std::mem::take(&mut *sink)
+        };
 
         Ok(LibAflCampaignResult {
             findings,
