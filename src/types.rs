@@ -142,7 +142,7 @@ pub fn strip_abi_functions_named(
 // ── Transaction ──────────────────────────────────────────────────────────────
 
 /// A transaction to execute against the EVM.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Hash, Serialize, Deserialize)]
 pub struct Transaction {
     /// The `msg.sender` for this call.
     pub sender: Address,
@@ -1034,6 +1034,11 @@ pub struct CampaignConfig {
     /// Probability (0..1) to start a sequence from a template vs random generation.
     #[serde(default = "default_template_mix")]
     pub sequence_template_mix: f64,
+    /// Probability (0..1) to use CmpLog-guided mutation when comparison events are available.
+    /// When 0.0, CmpLog guidance is disabled. When 1.0, all eligible mutations use CmpLog guidance.
+    /// Recommended: 0.15 (15% of mutations).
+    #[serde(default)]
+    pub cmp_log_ratio: Option<f64>,
     /// Use [`crate::target_rank`] scores to fill `target_weights` when non-empty ranking.
     #[serde(default)]
     pub auto_rank_targets: bool,
@@ -1107,6 +1112,7 @@ impl Default for CampaignConfig {
             fork_fund_addresses: Vec::new(),
             sequence_template_weights: std::collections::HashMap::new(),
             sequence_template_mix: default_template_mix(),
+            cmp_log_ratio: None,
             auto_rank_targets: false,
             protocol_semantic_oracles: true,
         }

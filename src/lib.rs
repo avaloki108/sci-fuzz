@@ -45,9 +45,12 @@ pub mod snapshot;
 
 // ── Feedback & guidance ─────────────────────────────────────────────────
 
+pub mod adaptive_scheduler;
 pub mod feedback;
 pub mod flashloan;
+pub mod focused;
 pub mod mutator;
+pub mod role_aware;
 pub mod shrinker;
 
 // ── Invariant / oracle system ───────────────────────────────────────────
@@ -126,6 +129,11 @@ pub mod source_map;
 
 pub mod diff;
 pub mod config;
+
+// ── LibAFL integration layer ────────────────────────────────────────────
+
+pub mod libafl_adapter;
+pub use libafl_adapter::EvmInput;
 
 // ── CLI (feature-gated) ─────────────────────────────────────────────────
 

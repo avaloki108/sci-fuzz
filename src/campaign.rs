@@ -67,6 +67,9 @@ struct SharedCampaignInner {
     first_hit_execs: Option<u64>,
     first_hit_time_ms: Option<u64>,
     seq_corpus: Vec<CorpusEntry>,
+    /// Ring buffer of recent comparison events for CmpLog-guided mutation.
+    /// Stores up to 1000 events; oldest are discarded when capacity is reached.
+    cmp_events: Vec<crate::types::ComparisonEvent>,
 }
 
 // ---------------------------------------------------------------------------
@@ -648,6 +651,7 @@ impl Campaign {
                 first_hit_execs: None,
                 first_hit_time_ms: None,
                 seq_corpus,
+                cmp_events: Vec::new(),
             };
             let fork_block_env = executor.block_env().clone();
             return run_parallel_campaign(
@@ -684,6 +688,17 @@ impl Campaign {
         let progress_interval = std::time::Duration::from_secs(5);
         let mut last_progress = start;
         let timeout_s = self.config.timeout.as_secs();
+
+        // --- CmpLog-guided mutation setup -------------------------------
+        // Ring buffer of recent comparison events for constraint-directed input derivation.
+        // Stores up to 1000 events; oldest are discarded when capacity is reached.
+        let mut cmp_events: Vec<crate::types::ComparisonEvent> = Vec::new();
+        let cmp_log_ratio = self.config.cmp_log_ratio.unwrap_or(0.15); // 15% by default
+
+        // --- Adaptive scheduler setup -----------------------------------
+        // UCB-based mutation strategy selection to automatically discover
+        // which mutations work best for this contract.
+        let mut scheduler = crate::adaptive_scheduler::AdaptiveScheduler::new();
 
         // Print initial "started" banner so the user knows the campaign is live.
         eprintln!(
@@ -742,38 +757,65 @@ impl Campaign {
             // 10% of the time splice two corpus sequences for crossover coverage.
             let do_splice = !seq_corpus.is_empty() && rng.gen_bool(0.10);
             let seq_len: u32 = rng.gen_range(1..=self.config.max_depth);
-            let raw_sequence: Vec<Transaction> = if do_splice {
+            let (raw_sequence, strategies_used): (Vec<Transaction>, Vec<crate::adaptive_scheduler::MutationStrategy>) = if do_splice {
                 // Coverage-weighted parent selection: bias toward
                 // entries with fewer edges (rarer paths more valuable to mix).
                 let (a_idx, b_idx) = coverage_weighted_pair(&seq_corpus, &mut rng);
-                TxMutator::splice(
+                (TxMutator::splice(
                     &seq_corpus[a_idx].sequence,
                     &seq_corpus[b_idx].sequence,
                     &mut rng,
-                )
+                ), Vec::new()) // No strategies used for splice
             } else if rng.gen_bool(self.config.sequence_template_mix) {
                 let tmpl = crate::sequence_templates::pick_template(
                     &mut rng,
                     &self.config.sequence_template_weights,
                 );
-                crate::sequence_templates::build_sequence(
+                (crate::sequence_templates::build_sequence(
                     tmpl,
                     &mutator,
                     self.config.max_depth,
                     &mut rng,
-                )
+                ), Vec::new()) // No strategies used for templates
             } else {
                 let mut seq: Vec<Transaction> = Vec::with_capacity(seq_len as usize);
+                let mut strategies_used: Vec<crate::adaptive_scheduler::MutationStrategy> = Vec::new();
                 for _ in 0..seq_len {
                     let tx = if seq.is_empty() || rng.gen_bool(0.3) {
                         let prev_sender = seq.last().map(|t: &Transaction| t.sender);
                         mutator.generate_in_sequence(prev_sender, &mut rng)
                     } else {
-                        mutator.mutate(seq.last().unwrap(), &mut rng)
+                        // Use adaptive scheduler to select mutation strategy
+                        let strategy = scheduler.select_strategy(&mut rng);
+                        strategies_used.push(strategy);
+                        mutator.mutate_with_strategy(seq.last().unwrap(), &mut rng, strategy)
                     };
                     seq.push(tx);
                 }
-                seq
+                (seq, strategies_used)
+            };
+
+            // CmpLog-guided mutation: apply constraint-directed input derivation
+            // to a percentage of transactions based on comparison events from recent executions.
+            let use_cmp_log_guidance = !cmp_events.is_empty() && rng.gen_bool(cmp_log_ratio);
+            let cmp_sequence = if use_cmp_log_guidance {
+                // Create a temporary CmpLog mutator (avoids lifetime issues with flashloan mutator)
+                let mut cmp_log_mutator = crate::mutator::CmpLogGuidedMutator::new(&mutator);
+                cmp_log_mutator.feed_comparisons(cmp_events.clone());
+
+                // Apply CmpLog-guided mutation to the sequence
+                let mut guided_seq = Vec::with_capacity(raw_sequence.len());
+                for tx in raw_sequence {
+                    // Try to apply CmpLog guidance; fall back to original if no guidance available
+                    if let Some(guided_tx) = cmp_log_mutator.guided_mutate_tx(&tx, &mut rng) {
+                        guided_seq.push(guided_tx);
+                    } else {
+                        guided_seq.push(tx);
+                    }
+                }
+                guided_seq
+            } else {
+                raw_sequence
             };
 
             // Wrap a small percentage (e.g. 5%) of sequences in a flashloan to enable
@@ -782,9 +824,9 @@ impl Campaign {
             let final_sequence = if wrap_flashloan {
                 let flashloan_mutator =
                     crate::flashloan::FlashloanMutator::new(&mutator, &mutator.dict);
-                flashloan_mutator.wrap_sequence(raw_sequence, &mut rng)
+                flashloan_mutator.wrap_sequence(cmp_sequence, &mut rng)
             } else {
-                raw_sequence
+                cmp_sequence
             };
 
             // Save the executor state so we can roll back after the sequence.
@@ -819,6 +861,17 @@ impl Campaign {
                     total_reverts += 1;
                 }
                 sequence.push(tx.clone());
+
+                // --- CmpLog: feed comparison events -----------------------
+                // Add comparison events from this execution to the ring buffer.
+                // Keep only the most recent 1000 events to focus on current path constraints.
+                if !result.cmp_events.is_empty() {
+                    cmp_events.extend(result.cmp_events.iter().cloned());
+                    if cmp_events.len() > 1000 {
+                        let drain_count = cmp_events.len() - 1000;
+                        cmp_events.drain(0..drain_count);
+                    }
+                }
 
                 // vm.assume(false) → treat as precondition rejection, skip
                 // invariant checks and snapshot saving for this sequence.
@@ -1025,6 +1078,8 @@ impl Campaign {
                 }
             }
 
+            let finding_count_before = findings.len();
+
             for caller_entry in &property_callers {
                 let prop_findings = caller_entry.check_properties(&executor, attacker, &sequence);
                 if !prop_findings.is_empty() {
@@ -1066,6 +1121,18 @@ impl Campaign {
                             first_observed_time_ms: start.elapsed().as_millis() as u64,
                         });
                     }
+                }
+            }
+
+            // --- Adaptive scheduler: record success/failure ---------------
+            // Record success if we found any findings in this sequence.
+            let had_finding = findings.len() > finding_count_before;
+
+            for strategy in strategies_used {
+                if had_finding {
+                    scheduler.record_success(strategy);
+                } else {
+                    scheduler.record_failure(strategy);
                 }
             }
 
