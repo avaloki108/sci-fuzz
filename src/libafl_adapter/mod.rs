@@ -35,6 +35,7 @@ pub use scheduler::{make_rand, CorpusStats};
 pub mod campaign;
 pub use campaign::{LibAflCampaign, LibAflCampaignBuilder, LibAflCampaignResult};
 
-// pub mod concolic;   // Phase 7
+pub mod concolic;
+pub use concolic::{ConcolicStage, Z3SolverAdapter, build_constraint, parse_model_value};
 // pub mod campaign;   // Phase 6
 // pub mod concolic;   // Phase 7
