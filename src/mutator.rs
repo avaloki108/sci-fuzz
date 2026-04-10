@@ -620,6 +620,12 @@ impl TxMutator {
                 if let Some(entries) = abi.as_array() {
                     for entry in entries {
                         if entry.get("type").and_then(|t| t.as_str()) == Some("function") {
+                            // Skip echidna_* / invariant_* property functions — they're view-only
+                            // and should only be called by the EchidnaPropertyCaller.
+                            let is_property_fn = entry.get("name")
+                                .and_then(|n| n.as_str())
+                                .is_some_and(|n| n.starts_with("echidna_") || n.starts_with("invariant_"));
+                            if is_property_fn { continue; }
                             if let Some(sel) = selector_from_abi_entry(entry) {
                                 selectors.push(sel);
                                 if let Some(fname) = entry.get("name").and_then(|n| n.as_str()) {

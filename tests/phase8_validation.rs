@@ -118,7 +118,7 @@ fn phase8_harvey_baz() {
     let mut evm = EvmExecutor::new();
     evm.set_balance(ATTACKER, U256::from(100_000_000_000_000_000_000_u128));
     let addr = deploy(&mut evm, bytecode, Address::repeat_byte(0xde)).unwrap();
-    let target = make_target(&evm, addr, name, abi);
+    let target = make_target(&evm, addr, name, abi.clone());
     let campaign = LibAflCampaign::builder()
         .evm(evm).targets(vec![target])
         .attacker(ATTACKER).seed(SEED).max_iters(MAX_ITERS)
@@ -130,6 +130,11 @@ fn phase8_harvey_baz() {
         result.executions, result.corpus_size, result.findings.len()
     );
     assert!(result.executions > 0);
+    // If no findings, it's a known limitation — not a test failure.
+    // The fuzzer needs specific value combinations to hit all 5 branches.
+    if result.findings.is_empty() {
+        eprintln!("NOTE: harvey_baz needs targeted multi-step sequences to trigger all 5 states.");
+    }
 }
 
 #[test]
@@ -239,4 +244,82 @@ fn phase8_summary() {
     eprintln!("NEW:  {}/{} found ({} total findings, {} execs)", improved, targets.len(), total_finds, total_execs);
 
     assert!(total_execs > 0);
+}
+
+/// Verify that echidna_all_states can be violated via accumulated state.
+/// Calls baz() with 5 different inputs hitting all branches, then checks the property.
+#[test]
+fn phase8_harvey_baz_property_violation_manual() {
+    let name = "harvey_baz";
+    let bytecode = match read_bin(name) {
+        Some(b) => b,
+        None => { eprintln!("SKIP"); return; }
+    };
+    let abi = read_abi(name).unwrap();
+    let mut evm = EvmExecutor::new();
+    let atk = ATTACKER;
+    evm.set_balance(atk, U256::from(1_000_000));
+    let addr = deploy(&mut evm, bytecode, Address::repeat_byte(0xde)).unwrap();
+
+    let baz_sel: [u8; 4] = hex::decode("43e3f838").unwrap().try_into().unwrap(); // baz(int256,int256,int256)
+
+    fn call_baz(evm: &mut EvmExecutor, atk: Address, addr: Address, sel: [u8; 4], a: i64, b: i64, c: i64) -> bool {
+        let mut data = sel.to_vec();
+        // ABI-encode int256: sign-extend i64 to 256 bits (32 bytes)
+        let encode_int256 = |v: i64| -> [u8; 32] {
+            let mut buf = [0u8; 32];
+            let bytes = v.to_be_bytes();
+            let sign_byte = if v < 0 { 0xff } else { 0x00 };
+            buf[..24].fill(sign_byte);
+            buf[24..].copy_from_slice(&bytes);
+            buf
+        };
+        data.extend_from_slice(&encode_int256(a));
+        data.extend_from_slice(&encode_int256(b));
+        data.extend_from_slice(&encode_int256(c));
+        match evm.execute(&chimera_fuzz::types::Transaction {
+            sender: atk,
+            to: Some(addr),
+            value: U256::ZERO,
+            data: data.into(),
+            gas_limit: 1_000_000,
+        }) {
+            Ok(r) => {
+                eprintln!("baz({},{},{}) success={} output={:?}", a, b, c, r.success, hex::encode(&r.output[..r.output.len().min(4)]));
+                r.success
+            }
+            Err(e) => {
+                eprintln!("baz({},{},{}) ERROR: {}", a, b, c, e);
+                false
+            }
+        }
+    }
+
+    // Hit all 5 branches:
+    call_baz(&mut evm, atk, addr, baz_sel, 0, 0, 0);      // state1: d=0<1, b=0<3
+    call_baz(&mut evm, atk, addr, baz_sel, 42, 3, -10);    // state2: d=-7<1, b=3>=3, a=42
+    call_baz(&mut evm, atk, addr, baz_sel, 99, 3, -10);    // state3: d=-7<1, b=3>=3, a!=42
+    call_baz(&mut evm, atk, addr, baz_sel, 0, 0, 1);       // state4: d=1>=1, c=1<42
+    call_baz(&mut evm, atk, addr, baz_sel, 0, 0, 100);     // state5: d=100>=1, c=100>=42
+
+    // Debug: check the static_call output directly
+    let echidna_sel: [u8; 4] = hex::decode("eee30647").unwrap().try_into().unwrap(); // echidna_all_states()
+    let result = evm.static_call(atk, addr, chimera_fuzz::types::Bytes::from(echidna_sel.to_vec()));
+    eprintln!("echidna_all_states() raw result: {:?}", result);
+    if let Ok((true, output)) = &result {
+        eprintln!("  output len={}, bytes={}", output.len(), hex::encode(&output[..output.len().min(32)]));
+        if output.len() >= 32 {
+            eprintln!("  output[31] = {} (0x{:02x})", output[31], output[31]);
+        }
+    }
+
+    // Now check echidna_all_states via the EchidnaPropertyCaller
+    let caller = chimera_fuzz::invariant::EchidnaPropertyCaller::from_abi(addr, &abi).unwrap();
+    eprintln!("Property caller target={}, properties={:?}", caller.target, caller.properties);
+    let findings = caller.check_properties(&evm, atk, &[]);
+    eprintln!("Findings after 5 calls: {}", findings.len());
+    for f in &findings {
+        eprintln!("  {}", f.title);
+    }
+    assert!(!findings.is_empty(), "echidna_all_states should return false after all 5 branches hit");
 }

@@ -307,18 +307,12 @@ where
         for tx in &input.transactions {
             match self.evm.execute(tx) {
                 Ok(result) => {
-                    // Project coverage into shared bitmap.
                     unsafe {
                         project_coverage(&result.coverage, self.shared_map.as_mut_ptr());
                     }
-                    // Merge results for oracle check.
                     combined_result = Some(result);
                 }
-                Err(_) => {
-                    // Execution error — revert is normal in EVM fuzzing.
-                    // Continue to next tx rather than aborting the sequence.
-                    continue;
-                }
+                Err(_) => continue,
             }
         }
 
